@@ -33,7 +33,7 @@ GaudiInfer（代码里叫 `g2e`）在单张 Gaudi2 上运行 **Qwen3.8-27B（FP8
 
 ## 性能
 
-用 **[TokenSpeed](https://github.com/1CatAI/TokenSpeed)** 的全场景顺序测试，在一张 Gaudi2 上实测：Qwen3.8-27B FP8 加 DSpine-b16 草稿模型，通过 OpenAI 兼容 API 一次跑一个请求，6 类任务 × 9 种 prompt 长度（512 到 131,072 token）。**54 组全部成功。**
+用 **[llm_speedtest](https://github.com/gengchaogit/llm_speedtest)** 的全场景顺序测试，在一张 Gaudi2 上实测：Qwen3.8-27B FP8 加 DSpine-b16 草稿模型，通过 OpenAI 兼容 API 一次跑一个请求，6 类任务 × 9 种 prompt 长度（512 到 131,072 token）。**54 组全部成功。**
 
 | 单路解码 | 出字间隔（P50） | prefill 峰值 | 128K prompt 首 token |
 |:---:|:---:|:---:|:---:|

@@ -33,7 +33,7 @@ GaudiInfer (`g2e` in the code) serves **Qwen3.8-27B (FP8)** from a single Gaudi2
 
 ## Performance
 
-Measured with **[TokenSpeed](https://github.com/1CatAI/TokenSpeed)**'s all-workloads sequence test on one Gaudi2 card: Qwen3.8-27B FP8 with the DSpine-b16 drafter, one request at a time over the OpenAI-compatible API, 6 workloads × 9 prompt lengths from 512 to 131,072 tokens. **All 54 runs succeeded.**
+Measured with the all-workloads sequence test of **[llm_speedtest](https://github.com/gengchaogit/llm_speedtest)** on one Gaudi2 card: Qwen3.8-27B FP8 with the DSpine-b16 drafter, one request at a time over the OpenAI-compatible API, 6 workloads × 9 prompt lengths from 512 to 131,072 tokens. **All 54 runs succeeded.**
 
 | Decode, single stream | Inter-token latency (P50) | Peak prefill | 128K-token prompt, first token |
 |:---:|:---:|:---:|:---:|

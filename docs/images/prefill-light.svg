@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 330" width="760" height="330" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
 <rect width="760" height="330" rx="8" fill="#ffffff"/>
 <text x="24" y="30" font-size="16" font-weight="600" fill="#0b0b0b">Prefill throughput by prompt length</text>
-<text x="24" y="50" font-size="12" fill="#52514e">Mean of 6 workloads; shaded band = lowest to highest workload. Single request, TokenSpeed.</text>
+<text x="24" y="50" font-size="12" fill="#52514e">Mean of 6 workloads; shaded band = lowest to highest workload. Single request, llm_speedtest.</text>
 <line x1="64" x2="736" y1="282.0" y2="282.0" stroke="#e6e5e0" stroke-width="1"/>
 <text x="56" y="286.0" font-size="11" text-anchor="end" fill="#8a8984">0</text>
 <line x1="64" x2="736" y1="251.7" y2="251.7" stroke="#e6e5e0" stroke-width="1"/>
