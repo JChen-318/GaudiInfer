@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 330" width="760" height="330" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+<rect width="760" height="330" rx="8" fill="#ffffff"/>
+<text x="24" y="30" font-size="16" font-weight="600" fill="#0b0b0b">Decode throughput by prompt length</text>
+<text x="24" y="50" font-size="12" fill="#52514e">Median of 6 workloads; shaded band = lowest to highest workload. Single request, speculative decoding.</text>
+<line x1="64" x2="736" y1="282.0" y2="282.0" stroke="#e6e5e0" stroke-width="1"/>
+<text x="56" y="286.0" font-size="11" text-anchor="end" fill="#8a8984">0</text>
+<line x1="64" x2="736" y1="251.7" y2="251.7" stroke="#e6e5e0" stroke-width="1"/>
+<text x="56" y="255.7" font-size="11" text-anchor="end" fill="#8a8984">50</text>
+<line x1="64" x2="736" y1="221.4" y2="221.4" stroke="#e6e5e0" stroke-width="1"/>
+<text x="56" y="225.4" font-size="11" text-anchor="end" fill="#8a8984">100</text>
+<line x1="64" x2="736" y1="191.1" y2="191.1" stroke="#e6e5e0" stroke-width="1"/>
+<text x="56" y="195.1" font-size="11" text-anchor="end" fill="#8a8984">150</text>
+<line x1="64" x2="736" y1="160.9" y2="160.9" stroke="#e6e5e0" stroke-width="1"/>
+<text x="56" y="164.9" font-size="11" text-anchor="end" fill="#8a8984">200</text>
+<line x1="64" x2="736" y1="130.6" y2="130.6" stroke="#e6e5e0" stroke-width="1"/>
+<text x="56" y="134.6" font-size="11" text-anchor="end" fill="#8a8984">250</text>
+<line x1="64" x2="736" y1="100.3" y2="100.3" stroke="#e6e5e0" stroke-width="1"/>
+<text x="56" y="104.3" font-size="11" text-anchor="end" fill="#8a8984">300</text>
+<line x1="64" x2="736" y1="70.0" y2="70.0" stroke="#e6e5e0" stroke-width="1"/>
+<text x="56" y="74.0" font-size="11" text-anchor="end" fill="#8a8984">350</text>
+<text x="64.0" y="300" font-size="11" text-anchor="middle" fill="#8a8984">512</text>
+<text x="148.0" y="300" font-size="11" text-anchor="middle" fill="#8a8984">1K</text>
+<text x="232.0" y="300" font-size="11" text-anchor="middle" fill="#8a8984">2K</text>
+<text x="316.0" y="300" font-size="11" text-anchor="middle" fill="#8a8984">4K</text>
+<text x="400.0" y="300" font-size="11" text-anchor="middle" fill="#8a8984">8K</text>
+<text x="484.0" y="300" font-size="11" text-anchor="middle" fill="#8a8984">16K</text>
+<text x="568.0" y="300" font-size="11" text-anchor="middle" fill="#8a8984">32K</text>
+<text x="652.0" y="300" font-size="11" text-anchor="middle" fill="#8a8984">64K</text>
+<text x="736.0" y="300" font-size="11" text-anchor="middle" fill="#8a8984">128K</text>
+<text x="400.0" y="322" font-size="11" text-anchor="middle" fill="#52514e">prompt length (tokens)</text>
+<text x="14" y="176.0" font-size="11" text-anchor="middle" fill="#52514e" transform="rotate(-90 14 176.0)">tokens/s</text>
+<polygon points="64.0,129.5 148.0,96.0 232.0,116.9 316.0,116.8 400.0,124.2 484.0,130.9 568.0,133.2 652.0,162.5 736.0,172.6 736.0,237.4 652.0,210.6 568.0,183.9 484.0,222.7 400.0,189.8 316.0,155.5 232.0,155.5 148.0,172.6 64.0,165.5" fill="#2a78d6" fill-opacity="0.16"/>
+<path d="M64.0,145.5 L148.0,144.7 L232.0,143.6 L316.0,137.4 L400.0,154.9 L484.0,163.6 L568.0,166.8 L652.0,176.0 L736.0,183.8" fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="64.0" cy="145.5" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2"><title>512: 225 (range 192–252)</title></circle>
+<circle cx="148.0" cy="144.7" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2"><title>1K: 227 (range 181–307)</title></circle>
+<circle cx="232.0" cy="143.6" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2"><title>2K: 229 (range 209–273)</title></circle>
+<circle cx="316.0" cy="137.4" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2"><title>4K: 239 (range 209–273)</title></circle>
+<circle cx="400.0" cy="154.9" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2"><title>8K: 210 (range 152–261)</title></circle>
+<circle cx="484.0" cy="163.6" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2"><title>16K: 195 (range 98–250)</title></circle>
+<circle cx="568.0" cy="166.8" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2"><title>32K: 190 (range 162–246)</title></circle>
+<circle cx="652.0" cy="176.0" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2"><title>64K: 175 (range 118–197)</title></circle>
+<circle cx="736.0" cy="183.8" r="4" fill="#2a78d6" stroke="#ffffff" stroke-width="2"><title>128K: 162 (range 74–181)</title></circle>
+<text x="68.0" y="133.5" font-size="12" font-weight="600" text-anchor="start" fill="#0b0b0b">225</text>
+<text x="400.0" y="142.9" font-size="12" font-weight="600" text-anchor="middle" fill="#0b0b0b">210</text>
+<text x="732.0" y="171.8" font-size="12" font-weight="600" text-anchor="end" fill="#0b0b0b">162</text>
+</svg>
