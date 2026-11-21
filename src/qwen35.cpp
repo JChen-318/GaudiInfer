@@ -2026,6 +2026,7 @@ void Qwen35::precompile(const std::function<void(size_t, size_t)>& progress) {
             }
         }
     }
+    ensure_direct_b1(max_ctx_);
 }
 
 Recipe& Qwen35::commit_recipe(uint32_t T) {
@@ -2070,7 +2071,7 @@ void Qwen35::set_capture(std::vector<uint32_t> layers) {
     capture_ = std::move(layers);
     if (!capture_.empty()) feats_ = DeviceBuffer(dev_, capture_.size() * feature_stride());
     direct_b8_.reset();
-    direct_b1_cache_.clear();
+    direct_b1_.reset();
 }
 
 std::vector<float> Qwen35::prefill(std::span<const int32_t> tokens, const std::function<void(uint32_t, uint32_t)>& on_chunk) {
@@ -2467,11 +2468,8 @@ void Qwen35::accept(uint32_t a) {
     bool same_sides = !ssm_side_.empty();
     for (size_t i = 1; i < ssm_side_.size() && same_sides; ++i)
         if (ssm_side_[i] != ssm_side_[0] || conv_side_[i] != conv_side_[0]) same_sides = false;
-    DirectBatchState* b1_st = nullptr;
-    if (auto it = direct_b1_cache_.find(cap_); it != direct_b1_cache_.end()) b1_st = it->second.get();
-    else if (!direct_b1_cache_.empty()) b1_st = direct_b1_cache_.begin()->second.get();
-    if (T == 16 && dc && same_sides && direct_shared_ && !direct_shared_->failed &&
-        b1_st && !b1_st->failed && num_gdn_ > 0 && cfg_.conv_kernel == 4) {
+    if (T == 16 && dc && last_used_direct_b1_ && same_sides && direct_shared_ && !direct_shared_->failed &&
+        direct_b1_ && !direct_b1_->failed && num_gdn_ > 0 && cfg_.conv_kernel == 4) {
         stream_.synchronize();
         DirectGdnCommitArgs cargs{};
         const uint64_t NG = std::max(num_gdn_, 1u);
@@ -2483,8 +2481,8 @@ void Qwen35::accept(uint32_t a) {
         cargs.seq[0] = spec_stash_.address() + L.base[5] + uint64_t(stash_b_) * NG * L.size[5];
         cargs.acc[0] = spec_ctl_.address() + ctl + 1024;
         cargs.rows[0] = spec_ctl_.address() + ctl + 2048;
-        auto& cm = b1_st->commits[1];
-        if (!cm) cm = std::make_unique<DirectGdnCommit>(*direct_shared_->rt, b1_st->assets, num_gdn_, T, cargs, 0xa, 1);
+        auto& cm = direct_b1_->commits[1];
+        if (!cm) cm = std::make_unique<DirectGdnCommit>(*direct_shared_->rt, direct_b1_->assets, num_gdn_, T, cargs, 0xa, 1);
         else cm->update_args(cargs);
         cm->run();
         pending_T_ = 0;
@@ -3419,7 +3417,7 @@ bool Qwen35::ensure_direct_shared(uint32_t nl) {
 bool Qwen35::ensure_direct_plan(std::unique_ptr<DirectBatchState>& dst, uint32_t B, std::array<uint32_t, 8> slot_caps) {
     const uint32_t nl = layer_limit_ ? std::min(layer_limit_, cfg_.layers) : cfg_.layers;
     if (!ensure_direct_shared(nl)) return false;
-    if (dst && dst->built_limit == nl && dst->built_caps == slot_caps) return !dst->failed;
+    if (dst && dst->built_limit == nl && (B == 1 || dst->built_caps == slot_caps)) return !dst->failed;
     dst = std::make_unique<DirectBatchState>();
     dst->built_limit = nl;
     dst->built_caps = slot_caps;
@@ -3557,13 +3555,16 @@ bool Qwen35::ensure_direct_plan(std::unique_ptr<DirectBatchState>& dst, uint32_t
             sp.args.st_g.resize(ng);
             sp.args.st_seq.resize(ng);
             sp.args.apre_kv_cap = slot_caps;
+            sp.args.apre_k_dst.fill(res_[0].address());
+            sp.args.apre_v_dst.fill(res_[0].address());
             if (B == 1 && sp.next_attn_layer >= 0 && !k_cache_.empty()) {
                 const int s_attn = slot_[uint32_t(sp.next_attn_layer)];
-                sp.args.apre_k_dst.fill(k_cache_[s_attn].address());
-                sp.args.apre_v_dst.fill(v_cache_[s_attn].address());
-            } else {
-                sp.args.apre_k_dst.fill(res_[0].address());
-                sp.args.apre_v_dst.fill(res_[0].address());
+                const uint64_t D_h = cfg_.head_dim, KV_h = cfg_.kv_heads;
+                for (uint64_t h = 0; h < KV_h; ++h) {
+                    const uint64_t head = h * uint64_t(cap_) * D_h * kv_es();
+                    sp.args.apre_k_dst[h] = k_cache_[s_attn].address() + head;
+                    sp.args.apre_v_dst[h] = v_cache_[s_attn].address() + head;
+                }
             }
 
             std::vector<DirectGdnLayerWeights> gws(ng);
@@ -3607,11 +3608,23 @@ bool Qwen35::ensure_direct_plan(std::unique_ptr<DirectBatchState>& dst, uint32_t
     }
 }
 
+void Qwen35::clear_direct_attn_caches() {
+    auto clear_state = [](DirectBatchState* st) {
+        if (!st) return;
+        for (auto& sp : st->spans) {
+            sp.active_attn = nullptr;
+            sp.attn_cache.clear();
+        }
+    };
+    clear_state(direct_b1_.get());
+    clear_state(direct_b8_.get());
+}
+
 bool Qwen35::ensure_direct_b8(std::array<uint32_t, 8> slot_caps) {
     return ensure_direct_plan(direct_b8_, 8, slot_caps);
 }
 
-Qwen35::DirectBatchState* Qwen35::ensure_direct_b1(uint32_t slot_cap, uint32_t cur_pos) {
+Qwen35::DirectBatchState* Qwen35::ensure_direct_b1(uint32_t cur_pos) {
     static const bool off = std::getenv("G2E_NO_DIRECT_B1") != nullptr;
     if (off) return nullptr;
     static const uint32_t min_pos = [] {
@@ -3620,13 +3633,8 @@ Qwen35::DirectBatchState* Qwen35::ensure_direct_b1(uint32_t slot_cap, uint32_t c
         return 16384u;  // default on for long contexts where chained Direct B=1 beats Synapse cleanly
     }();
     if (cur_pos < min_pos) return nullptr;
-    auto it = direct_b1_cache_.find(slot_cap);
-    if (it != direct_b1_cache_.end()) return (it->second && !it->second->failed) ? it->second.get() : nullptr;
-    if (direct_b1_cache_.size() >= 4) direct_b1_cache_.erase(direct_b1_cache_.begin());
     std::array<uint32_t, 8> caps{};
-    caps[0] = slot_cap;
-    auto& ptr = direct_b1_cache_[slot_cap];
-    return ensure_direct_plan(ptr, 1, caps) ? ptr.get() : nullptr;
+    return ensure_direct_plan(direct_b1_, 1, caps) ? direct_b1_.get() : nullptr;
 }
 
 Qwen35::BatchOut Qwen35::batch_verify(std::span<const uint32_t> slots, std::span<const std::vector<int32_t>> blocks,
@@ -3676,7 +3684,7 @@ Qwen35::BatchOut Qwen35::batch_verify(std::span<const uint32_t> slots, std::span
     std::array<uint32_t, 8> slot_caps{};
     if (B == 8 && T == 16)
         for (uint32_t b = 0; b < 8; ++b) slot_caps[b] = sq[b]->cap;
-    const bool use_direct = (B == 8 && T == 16 && ensure_direct_b8(slot_caps));
+    bool use_direct = (B == 8 && T == 16 && ensure_direct_b8(slot_caps));
     if (stage_ev_ && stage_ev_->recorded()) stage_ev_->synchronize();
     {
         auto* ids = reinterpret_cast<int32_t*>(staging_.as<uint8_t>() + kIdsStage);
@@ -3688,16 +3696,6 @@ Qwen35::BatchOut Qwen35::batch_verify(std::span<const uint32_t> slots, std::span
                 last[b * 32 + t] = int32_t(sq[b]->pos + t);  // 128-byte aligned per slot (a binding's alignment)
                 rpos[b * T + t] = int32_t(sq[b]->pos + t);   // RoPE rows (text: rope_delta 0)
             }
-    }
-    if (!use_direct) {
-        stream_.upload(staging_, kIdsStage, ids_, 0, kIdsRopePos + uint64_t(R) * 4);
-        const Binding eb[] = {{"ids", &ids_, 0}, w_.bind("embed", "embed"), {"res", &res_[0], 0}};
-        embed_recipe(R).enqueue(stream_, eb);
-        mark(0);
-        if (!stage_ev_) stage_ev_ = std::make_unique<Event>(dev_);
-        stage_ev_->record(stream_);
-    } else {
-        mark(0);
     }
     auto bind_w = [&](std::vector<Binding>& v, const std::string& name, const std::string& weight) {
         v.push_back(w_.bind(P(0, name), weight));
@@ -3718,88 +3716,116 @@ Qwen35::BatchOut Qwen35::batch_verify(std::span<const uint32_t> slots, std::span
         // 1. Update dynamic HBM addresses & per-slot positions across ALL 17 spans + 16 attention cores.
         std::vector<DirectPlan*> all_plans;
         all_plans.reserve(64);
-        for (auto& sp : direct_b8_->spans) {
-            for (size_t j = 0; j < sp.gdn_layers.size(); ++j) {
-                const uint32_t s = uint32_t(slot_[sp.gdn_layers[j]]);
-                for (uint32_t b = 0; b < 8; ++b) {
-                    const Seq& q = *sq[b < B ? b : 0u];
-                    sp.args.conv_in[j][b] = q.conv[q.conv_side[s]].address() + uint64_t(s) * conv_bytes_;
-                    sp.args.ssm_in[j][b] = q.ssm[q.ssm_side[s]].address() + uint64_t(s) * ssm_bytes_;
-                }
-            }
-            if (sp.next_attn_layer >= 0) {
-                const int s = slot_[uint32_t(sp.next_attn_layer)];
-                DirectAttnRunArgs aargs{};
-                aargs.q_in = sram_base + kDirectSramQOff;
-                aargs.att_out = sram_base + kDirectSramAttOff;
-                aargs.last_tab = ids_.address() + kIdsLast;
-                for (uint32_t b = 0; b < 8; ++b) {
-                    const Seq& q = *sq[b < B ? b : 0u];
-                    sp.args.apre_k_dst[b] = q.k[s].address();
-                    sp.args.apre_v_dst[b] = q.v[s].address();
-                    if (b < B) {
-                        for (uint64_t h = 0; h < KV; ++h) {
-                            const uint64_t head = h * uint64_t(q.cap) * D * kv_es();
-                            aargs.k_cache[b][h] = q.k[s].address() + head;
-                            aargs.v_cache[b][h] = q.v[s].address() + head;
+        bool b8_ok = false;
+        for (int attempt = 0; attempt < 2 && !b8_ok; ++attempt) {
+            all_plans.clear();
+            try {
+                for (auto& sp : direct_b8_->spans) {
+                    for (size_t j = 0; j < sp.gdn_layers.size(); ++j) {
+                        const uint32_t s = uint32_t(slot_[sp.gdn_layers[j]]);
+                        for (uint32_t b = 0; b < 8; ++b) {
+                            const Seq& q = *sq[b < B ? b : 0u];
+                            sp.args.conv_in[j][b] = q.conv[q.conv_side[s]].address() + uint64_t(s) * conv_bytes_;
+                            sp.args.ssm_in[j][b] = q.ssm[q.ssm_side[s]].address() + uint64_t(s) * ssm_bytes_;
                         }
                     }
-                }
-                DirectAttnCore* core = nullptr;
-                for (auto& entry : sp.attn_cache) {
-                    if (entry.first == need_rows) {
-                        core = entry.second.get();
-                        break;
+                    if (sp.next_attn_layer >= 0) {
+                        const int s = slot_[uint32_t(sp.next_attn_layer)];
+                        DirectAttnRunArgs aargs{};
+                        aargs.q_in = sram_base + kDirectSramQOff;
+                        aargs.att_out = sram_base + kDirectSramAttOff;
+                        aargs.last_tab = ids_.address() + kIdsLast;
+                        for (uint32_t b = 0; b < 8; ++b) {
+                            const Seq& q = *sq[b < B ? b : 0u];
+                            sp.args.apre_k_dst[b] = q.k[s].address();
+                            sp.args.apre_v_dst[b] = q.v[s].address();
+                            if (b < B) {
+                                for (uint64_t h = 0; h < KV; ++h) {
+                                    const uint64_t head = h * uint64_t(q.cap) * D * kv_es();
+                                    aargs.k_cache[b][h] = q.k[s].address() + head;
+                                    aargs.v_cache[b][h] = q.v[s].address() + head;
+                                }
+                            }
+                        }
+                        DirectAttnCore* core = nullptr;
+                        for (auto& entry : sp.attn_cache) {
+                            if (entry.first == need_rows) {
+                                core = entry.second.get();
+                                break;
+                            }
+                        }
+                        if (!core) {
+                            if (sp.attn_cache.size() >= 2) {
+                                sp.active_attn = nullptr;
+                                sp.attn_cache.erase(sp.attn_cache.begin());
+                            }
+                            auto created = std::make_unique<DirectAttnCore>(*direct_shared_->rt, direct_shared_->attn_assets, kv8_,
+                                                                            /*pack_q_from_hbm=*/false, need_rows, aargs,
+                                                                            kDirectSramWorkOff, 0xa);
+                            core = created.get();
+                            sp.attn_cache.emplace_back(need_rows, std::move(created));
+                        } else {
+                            core->update_args(aargs);
+                        }
+                        sp.active_attn = core;
+                        core->collect_plans(all_plans);
                     }
+                    sp.block->update_args(sp.args);
+                    all_plans.push_back(sp.block->plan());
                 }
-                if (!core) {
-                    if (sp.attn_cache.size() >= 2) sp.attn_cache.erase(sp.attn_cache.begin());
-                    auto created = std::make_unique<DirectAttnCore>(*direct_shared_->rt, direct_shared_->attn_assets, kv8_,
-                                                                    /*pack_q_from_hbm=*/false, need_rows, aargs,
-                                                                    kDirectSramWorkOff, 0xa);
-                    core = created.get();
-                    sp.attn_cache.emplace_back(need_rows, std::move(created));
-                } else {
-                    core->update_args(aargs);
+                b8_ok = true;
+            } catch (const std::exception& e) {
+                clear_direct_attn_caches();
+                if (attempt == 1) {
+                    std::fprintf(stderr, "[g2e] Direct B=8 attn_core fallback to Synapse (%s)\n", e.what());
                 }
-                sp.active_attn = core;
-                core->collect_plans(all_plans);
             }
-            sp.block->update_args(sp.args);
-            all_plans.push_back(sp.block->plan());
         }
-        // Upload ALL dirty patched ECBs + ids_ control block in ONE batched PDMA sync (zero Synapse embed launch / sync)!
-        direct_shared_->rt->flush_patches_and_upload(all_plans, ids_.address(),
-                                                     staging_.as<uint8_t>() + kIdsStage,
-                                                     kIdsRopePos + uint64_t(R) * 4);
-        const double patch_ms = std::chrono::duration<double, std::milli>(clk::now() - td0).count();
+        if (b8_ok) {
+            mark(0);
+            // Upload ALL dirty patched ECBs + ids_ control block in ONE batched PDMA sync (zero Synapse embed launch / sync)!
+            direct_shared_->rt->flush_patches_and_upload(all_plans, ids_.address(),
+                                                         staging_.as<uint8_t>() + kIdsStage,
+                                                         kIdsRopePos + uint64_t(R) * 4);
+            const double patch_ms = std::chrono::duration<double, std::milli>(clk::now() - td0).count();
 
-        // Execute ALL 64 layers back-to-back on Direct SCAL with on-device SOB chaining (ZERO inter-plan host waits)!
-        double gdn_ms = 0.0, attn_ms = 0.0, exec_ms = 0.0;
-        if (direct_shared_->rt->chain_enabled()) {
-            std::vector<DirectPlan*> exec_plans;
-            exec_plans.reserve(64);
-            for (auto& sp : direct_b8_->spans) {
-                exec_plans.push_back(sp.block->plan());
-                if (sp.active_attn) sp.active_attn->collect_plans(exec_plans);
+            // Execute ALL 64 layers back-to-back on Direct SCAL with on-device SOB chaining (ZERO inter-plan host waits)!
+            double gdn_ms = 0.0, attn_ms = 0.0, exec_ms = 0.0;
+            if (direct_shared_->rt->chain_enabled()) {
+                std::vector<DirectPlan*> exec_plans;
+                exec_plans.reserve(64);
+                for (auto& sp : direct_b8_->spans) {
+                    exec_plans.push_back(sp.block->plan());
+                    if (sp.active_attn) sp.active_attn->collect_plans(exec_plans);
+                }
+                exec_ms = direct_shared_->rt->run_chain(exec_plans) * 1e-3;
+            } else {
+                for (auto& sp : direct_b8_->spans) {
+                    gdn_ms += sp.block->run() * 1e-3;
+                    if (sp.active_attn) attn_ms += sp.active_attn->run() * 1e-3;
+                }
+                exec_ms = gdn_ms + attn_ms;
             }
-            exec_ms = direct_shared_->rt->run_chain(exec_plans) * 1e-3;
+            if (prof) {
+                if (direct_shared_->rt->chain_enabled())
+                    std::fprintf(stderr, "verify_direct (64L chained): patch %.2f ms  exec %.2f ms  total %.2f ms\n",
+                                 patch_ms, exec_ms, patch_ms + exec_ms);
+                else
+                    std::fprintf(stderr, "verify_direct (64L): patch %.2f ms  gdn+apre+apost %.2f ms  attn_core %.2f ms  total %.2f ms\n",
+                                 patch_ms, gdn_ms, attn_ms, patch_ms + gdn_ms + attn_ms);
+            }
+            cur = 1;
         } else {
-            for (auto& sp : direct_b8_->spans) {
-                gdn_ms += sp.block->run() * 1e-3;
-                if (sp.active_attn) attn_ms += sp.active_attn->run() * 1e-3;
-            }
-            exec_ms = gdn_ms + attn_ms;
+            use_direct = false;
         }
-        if (prof) {
-            if (direct_shared_->rt->chain_enabled())
-                std::fprintf(stderr, "verify_direct (64L chained): patch %.2f ms  exec %.2f ms  total %.2f ms\n",
-                             patch_ms, exec_ms, patch_ms + exec_ms);
-            else
-                std::fprintf(stderr, "verify_direct (64L): patch %.2f ms  gdn+apre+apost %.2f ms  attn_core %.2f ms  total %.2f ms\n",
-                             patch_ms, gdn_ms, attn_ms, patch_ms + gdn_ms + attn_ms);
-        }
-        cur = 1;
+    }
+    if (!use_direct) {
+        stream_.upload(staging_, kIdsStage, ids_, 0, kIdsRopePos + uint64_t(R) * 4);
+        const Binding eb[] = {{"ids", &ids_, 0}, w_.bind("embed", "embed"), {"res", &res_[0], 0}};
+        embed_recipe(R).enqueue(stream_, eb);
+        mark(0);
+        if (!stage_ev_) stage_ev_ = std::make_unique<Event>(dev_);
+        stage_ev_->record(stream_);
     }
     for (uint32_t i = 0; i < (use_direct ? 0u : cfg_.layers); ++i) {
         const int s = slot_[i];
@@ -4012,15 +4038,15 @@ void Qwen35::run_layers(std::span<const int32_t> tokens, bool spec, std::vector<
         return e ? uint32_t(std::atoi(e)) : 262144u;
     }();
     const uint32_t need_raw_b1 = pos_ + T;
-    const uint32_t b1_step = need_raw_b1 <= 4096 ? 1024u : (need_raw_b1 <= 32768 ? 4096u : 8192u);
+    const uint32_t b1_step = need_raw_b1 <= 16384 ? 1024u : 2048u;
     uint32_t need_rows_b1 = ((need_raw_b1 + b1_step - 1u) / b1_step) * b1_step;
     if (need_rows_b1 > cap_) need_rows_b1 = ((need_raw_b1 + 1023u) / 1024u) * 1024u;
     DirectBatchState* b1_state = (spec && T == kSpecMaxT && !dump && !rope_explicit_ && inject_.empty() &&
                                   !trace_path_early && debug_layer_ < 0 && block_ == 1 && !k_cache_.empty() &&
                                   cap_ >= 1024 && need_rows_b1 <= cap_ && need_rows_b1 <= b1_max_rows)
-                                     ? ensure_direct_b1(cap_, pos_)
+                                     ? ensure_direct_b1(pos_)
                                      : nullptr;
-    const bool use_direct_b1 = (b1_state != nullptr);
+    bool use_direct_b1 = (b1_state != nullptr);
     // the previous forward's uploads read the same staging regions
     if (stage_ev_ && stage_ev_->recorded()) stage_ev_->synchronize();
     // embeddings: one gather launch (a DMA per row cost ~30 us of host time each)
@@ -4054,78 +4080,99 @@ void Qwen35::run_layers(std::span<const int32_t> tokens, bool spec, std::vector<
         const uint64_t sram_base = direct_shared_->rt->sram_base();
         std::vector<DirectPlan*> all_plans;
         all_plans.reserve(64);
-        for (auto& sp : b1_state->spans) {
-            for (size_t j = 0; j < sp.gdn_layers.size(); ++j) {
-                const uint32_t s = uint32_t(slot_[sp.gdn_layers[j]]);
-                sp.args.conv_in[j][0] = conv_all_[conv_side_[s]].address() + uint64_t(s) * conv_bytes_;
-                sp.args.ssm_in[j][0] = ssm_all_[ssm_side_[s]].address() + uint64_t(s) * ssm_bytes_;
-            }
-            if (sp.next_attn_layer >= 0) {
-                const int s = slot_[uint32_t(sp.next_attn_layer)];
-                DirectAttnRunArgs aargs{};
-                aargs.q_in = sram_base + kDirectSramQOff;
-                aargs.att_out = sram_base + kDirectSramAttOff;
-                aargs.last_tab = ids_.address() + kIdsLast;
-                sp.args.apre_k_dst[0] = k_cache_[s].address();
-                sp.args.apre_v_dst[0] = v_cache_[s].address();
-                for (uint64_t h = 0; h < KV; ++h) {
-                    const uint64_t head = h * uint64_t(cap_) * D * kv_es();
-                    aargs.k_cache[0][h] = k_cache_[s].address() + head;
-                    aargs.v_cache[0][h] = v_cache_[s].address() + head;
-                }
-                DirectAttnCore* core = nullptr;
-                for (auto& entry : sp.attn_cache) {
-                    if (entry.first == need_rows) {
-                        core = entry.second.get();
-                        break;
+        bool b1_ok = false;
+        for (int attempt = 0; attempt < 2 && !b1_ok; ++attempt) {
+            all_plans.clear();
+            try {
+                for (auto& sp : b1_state->spans) {
+                    for (size_t j = 0; j < sp.gdn_layers.size(); ++j) {
+                        const uint32_t s = uint32_t(slot_[sp.gdn_layers[j]]);
+                        sp.args.conv_in[j][0] = conv_all_[conv_side_[s]].address() + uint64_t(s) * conv_bytes_;
+                        sp.args.ssm_in[j][0] = ssm_all_[ssm_side_[s]].address() + uint64_t(s) * ssm_bytes_;
                     }
+                    if (sp.next_attn_layer >= 0) {
+                        const int s = slot_[uint32_t(sp.next_attn_layer)];
+                        DirectAttnRunArgs aargs{};
+                        aargs.q_in = sram_base + kDirectSramQOff;
+                        aargs.att_out = sram_base + kDirectSramAttOff;
+                        aargs.last_tab = ids_.address() + kIdsLast;
+                        for (uint64_t h = 0; h < KV; ++h) {
+                            const uint64_t head = h * uint64_t(cap_) * D * kv_es();
+                            const uint64_t ka = k_cache_[s].address() + head;
+                            const uint64_t va = v_cache_[s].address() + head;
+                            sp.args.apre_k_dst[h] = ka;
+                            sp.args.apre_v_dst[h] = va;
+                            aargs.k_cache[0][h] = ka;
+                            aargs.v_cache[0][h] = va;
+                        }
+                        DirectAttnCore* core = nullptr;
+                        for (auto& entry : sp.attn_cache) {
+                            if (entry.first == need_rows) {
+                                core = entry.second.get();
+                                break;
+                            }
+                        }
+                        if (!core) {
+                            // Keep at most 1 active DirectAttnCore per span to stay well within SCAL 256 MiB hbm_shared!
+                            sp.active_attn = nullptr;
+                            sp.attn_cache.clear();
+                            auto created = std::make_unique<DirectAttnCore>(*direct_shared_->rt, direct_shared_->attn_assets, kv8_,
+                                                                            /*pack_q_from_hbm=*/false, need_rows, aargs,
+                                                                            kDirectSramWorkOff, 0xa);
+                            core = created.get();
+                            sp.attn_cache.emplace_back(need_rows, std::move(created));
+                        } else {
+                            core->update_args(aargs);
+                        }
+                        sp.active_attn = core;
+                        core->collect_plans(all_plans);
+                    }
+                    sp.block->update_args(sp.args);
+                    all_plans.push_back(sp.block->plan());
                 }
-                if (!core) {
-                    if (sp.attn_cache.size() >= 4) sp.attn_cache.erase(sp.attn_cache.begin());
-                    auto created = std::make_unique<DirectAttnCore>(*direct_shared_->rt, direct_shared_->attn_assets, kv8_,
-                                                                    /*pack_q_from_hbm=*/false, need_rows, aargs,
-                                                                    kDirectSramWorkOff, 0xa);
-                    core = created.get();
-                    sp.attn_cache.emplace_back(need_rows, std::move(created));
-                } else {
-                    core->update_args(aargs);
+                b1_ok = true;
+            } catch (const std::exception& e) {
+                clear_direct_attn_caches();
+                if (attempt == 1) {
+                    std::fprintf(stderr, "[g2e] Direct B=1 attn_core fallback to Synapse (rows=%u: %s)\n", need_rows_b1, e.what());
                 }
-                sp.active_attn = core;
-                core->collect_plans(all_plans);
             }
-            sp.block->update_args(sp.args);
-            all_plans.push_back(sp.block->plan());
         }
-        direct_shared_->rt->flush_patches_and_upload(all_plans, ids_.address(),
-                                                     staging_.as<uint8_t>() + kIdsStage, ids_up);
-        const double patch_ms = std::chrono::duration<double, std::milli>(clk::now() - td0).count();
-        double gdn_ms = 0.0, attn_ms = 0.0, exec_ms = 0.0;
-        if (direct_shared_->rt->chain_enabled()) {
-            std::vector<DirectPlan*> exec_plans;
-            exec_plans.reserve(64);
-            for (auto& sp : b1_state->spans) {
-                exec_plans.push_back(sp.block->plan());
-                if (sp.active_attn) sp.active_attn->collect_plans(exec_plans);
+        if (b1_ok) {
+            direct_shared_->rt->flush_patches_and_upload(all_plans, ids_.address(),
+                                                         staging_.as<uint8_t>() + kIdsStage, ids_up);
+            const double patch_ms = std::chrono::duration<double, std::milli>(clk::now() - td0).count();
+            double gdn_ms = 0.0, attn_ms = 0.0, exec_ms = 0.0;
+            if (direct_shared_->rt->chain_enabled()) {
+                std::vector<DirectPlan*> exec_plans;
+                exec_plans.reserve(64);
+                for (auto& sp : b1_state->spans) {
+                    exec_plans.push_back(sp.block->plan());
+                    if (sp.active_attn) sp.active_attn->collect_plans(exec_plans);
+                }
+                exec_ms = direct_shared_->rt->run_chain(exec_plans) * 1e-3;
+            } else {
+                for (auto& sp : b1_state->spans) {
+                    gdn_ms += sp.block->run() * 1e-3;
+                    if (sp.active_attn) attn_ms += sp.active_attn->run() * 1e-3;
+                }
+                exec_ms = gdn_ms + attn_ms;
             }
-            exec_ms = direct_shared_->rt->run_chain(exec_plans) * 1e-3;
-        } else {
-            for (auto& sp : b1_state->spans) {
-                gdn_ms += sp.block->run() * 1e-3;
-                if (sp.active_attn) attn_ms += sp.active_attn->run() * 1e-3;
+            if (prof_b1) {
+                if (direct_shared_->rt->chain_enabled())
+                    std::fprintf(stderr, "verify_direct_b1 (64L chained, rows=%u): patch %.2f ms  exec %.2f ms  total %.2f ms\n",
+                                 need_rows_b1, patch_ms, exec_ms, patch_ms + exec_ms);
+                else
+                    std::fprintf(stderr, "verify_direct_b1 (64L, rows=%u): patch %.2f ms  gdn+apre+apost %.2f ms  attn_core %.2f ms  total %.2f ms\n",
+                                 need_rows_b1, patch_ms, gdn_ms, attn_ms, patch_ms + gdn_ms + attn_ms);
             }
-            exec_ms = gdn_ms + attn_ms;
+            cur_ = 1;
+            last_used_direct_b1_ = true;
+            return;
         }
-        if (prof_b1) {
-            if (direct_shared_->rt->chain_enabled())
-                std::fprintf(stderr, "verify_direct_b1 (64L chained, rows=%u): patch %.2f ms  exec %.2f ms  total %.2f ms\n",
-                             need_rows_b1, patch_ms, exec_ms, patch_ms + exec_ms);
-            else
-                std::fprintf(stderr, "verify_direct_b1 (64L, rows=%u): patch %.2f ms  gdn+apre+apost %.2f ms  attn_core %.2f ms  total %.2f ms\n",
-                             need_rows_b1, patch_ms, gdn_ms, attn_ms, patch_ms + gdn_ms + attn_ms);
-        }
-        cur_ = 1;
-        return;
+        use_direct_b1 = false;
     }
+    last_used_direct_b1_ = false;
     stream_.upload(staging_, kIdsStage, ids_, 0, ids_up);
     {
         const Binding eb2[] = {{"ids", &ids_, 0}, w_.bind("embed", "embed"), {"res", &res_[0], 0}};

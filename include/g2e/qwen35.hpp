@@ -349,11 +349,13 @@ private:
     struct DirectBatchState;
     std::unique_ptr<DirectShared> direct_shared_;
     std::unique_ptr<DirectBatchState> direct_b8_;
-    std::map<uint32_t, std::unique_ptr<DirectBatchState>> direct_b1_cache_;
+    std::unique_ptr<DirectBatchState> direct_b1_;
+    bool last_used_direct_b1_ = false;
     bool ensure_direct_shared(uint32_t nl);
     bool ensure_direct_plan(std::unique_ptr<DirectBatchState>& dst, uint32_t B, std::array<uint32_t, 8> slot_caps);
     bool ensure_direct_b8(std::array<uint32_t, 8> slot_caps);
-    DirectBatchState* ensure_direct_b1(uint32_t slot_cap, uint32_t cur_pos);
+    DirectBatchState* ensure_direct_b1(uint32_t cur_pos);
+    void clear_direct_attn_caches();
 };
 
 }  // namespace g2e

@@ -461,31 +461,48 @@ DirectGdnBlock::DirectGdnBlock(DirectRuntime& rt, const DirectGdnAssets& assets,
         }
 
         const uint64_t isa_scat = apre->kv8 ? assets.isa_kv_scatter_f8 : assets.isa_kv_scatter_bf16;
-        const uint32_t halves = (B <= 4) ? 1u : 2u;
-        for (uint32_t half = 0; half < halves; ++half) {
-            const uint32_t sb = half * 4u;
-            const uint32_t cnt = std::min<uint32_t>(4u, B - sb);
-            const uint32_t items = cnt * 64u;
+        if (B == 1) {
+            // B=1 cap-independent head-addressed scatter: k0..k3 / v0..v3 are heads 0..3 of slot 0 ([256, 262144]).
             DirectTpcTensor t[11];
-            t[0] = {s_k_sram, kv_dt, 4, {256, kT, 4, B, 1}};
-            t[1] = {s_v_sram, kv_dt, 4, {256, kT, 4, B, 1}};
+            t[0] = {s_k_sram, kv_dt, 4, {256, kT, 4, 1, 1}};
+            t[1] = {s_v_sram, kv_dt, 4, {256, kT, 4, 1, 1}};
             int tags[11] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
-            for (uint32_t s = 0; s < 4; ++s) {
-                const uint32_t b = (s < cnt) ? (sb + s) : 0u;
-                const uint32_t cap = init_args.apre_kv_cap[b];
-                const uint32_t h_stride = cap * 256u;
-                t[2 + s] = {init_args.apre_k_dst[b], kv_dt, 3, {256, cap, 4, 1, 1}, {0, 0, h_stride, 0, 0}};
-                t[6 + s] = {init_args.apre_v_dst[b], kv_dt, 3, {256, cap, 4, 1, 1}, {0, 0, h_stride, 0, 0}};
-                if (s < cnt) {
-                    tags[2 + s] = tag_apre_k(b);
-                    tags[6 + s] = tag_apre_v(b);
-                }
+            for (uint32_t h = 0; h < 4; ++h) {
+                t[2 + h] = {init_args.apre_k_dst[h], kv_dt, 2, {256, 262144u, 1, 1, 1}};
+                t[6 + h] = {init_args.apre_v_dst[h], kv_dt, 2, {256, 262144u, 1, 1, 1}};
+                tags[2 + h] = tag_apre_k(h);
+                tags[6 + h] = tag_apre_v(h);
             }
             t[10] = {apre->last_tab, DType::I32, 2, {32, 8, 1, 1, 1}};
-            const uint32_t sb_srf[1] = {sb};
-            const int sig = (half + 1 == halves) ? -1 : 2;
-            plan_->add_tpc(isa_scat, t, sb_srf, items, kTpcs, 2, s2, sig, tpc_cmd, tags);
-            if (sig == 2) s2 += std::min(kTpcs, items);
+            const uint32_t sb_srf[1] = {0xffffffffu};  // slot_base = -1 -> B=1 head-addressed mode
+            plan_->add_tpc(isa_scat, t, sb_srf, 64u, kTpcs, 2, s2, -1, tpc_cmd, tags);
+        } else {
+            const uint32_t halves = (B <= 4) ? 1u : 2u;
+            for (uint32_t half = 0; half < halves; ++half) {
+                const uint32_t sb = half * 4u;
+                const uint32_t cnt = std::min<uint32_t>(4u, B - sb);
+                const uint32_t items = cnt * 64u;
+                DirectTpcTensor t[11];
+                t[0] = {s_k_sram, kv_dt, 4, {256, kT, 4, B, 1}};
+                t[1] = {s_v_sram, kv_dt, 4, {256, kT, 4, B, 1}};
+                int tags[11] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+                for (uint32_t s = 0; s < 4; ++s) {
+                    const uint32_t b = (s < cnt) ? (sb + s) : 0u;
+                    const uint32_t cap = init_args.apre_kv_cap[b];
+                    const uint32_t h_stride = cap * 256u;
+                    t[2 + s] = {init_args.apre_k_dst[b], kv_dt, 3, {256, cap, 4, 1, 1}, {0, 0, h_stride, 0, 0}};
+                    t[6 + s] = {init_args.apre_v_dst[b], kv_dt, 3, {256, cap, 4, 1, 1}, {0, 0, h_stride, 0, 0}};
+                    if (s < cnt) {
+                        tags[2 + s] = tag_apre_k(b);
+                        tags[6 + s] = tag_apre_v(b);
+                    }
+                }
+                t[10] = {apre->last_tab, DType::I32, 2, {32, 8, 1, 1, 1}};
+                const uint32_t sb_srf[1] = {sb};
+                const int sig = (half + 1 == halves) ? -1 : 2;
+                plan_->add_tpc(isa_scat, t, sb_srf, items, kTpcs, 2, s2, sig, tpc_cmd, tags);
+                if (sig == 2) s2 += std::min(kTpcs, items);
+            }
         }
     }
 
@@ -519,7 +536,8 @@ void DirectGdnBlock::update_args(const DirectGdnRunArgs& args) {
         if (args.st_seq[j] != cur_.st_seq[j]) { plan_->patch_addr(tag_st_seq(j), args.st_seq[j]); cur_.st_seq[j] = args.st_seq[j]; }
     }
     if (has_apre_) {
-        for (uint32_t b = 0; b < batch_; ++b) {
+        const uint32_t kv_cnt = (batch_ == 1) ? 4u : batch_;
+        for (uint32_t b = 0; b < kv_cnt; ++b) {
             if (args.apre_k_dst[b] != cur_.apre_k_dst[b]) {
                 plan_->patch_addr(tag_apre_k(b), args.apre_k_dst[b]);
                 cur_.apre_k_dst[b] = args.apre_k_dst[b];
