@@ -13,7 +13,7 @@
 namespace g2e {
 
 namespace {
-constexpr float kF32Tiny = 1.1754943508222875e-38f;
+[[maybe_unused]] constexpr float kF32Tiny = 1.1754943508222875e-38f;
 void output(GraphBuilder& g, const std::string& name, TensorId src) {
     const auto& d = g.desc(src);
     const DType dt = d.dtype;
@@ -78,6 +78,7 @@ DSpine::DSpine(const Device& device, const Stream& stream, const WeightPack& dra
     }
     tg_ = DeviceBuffer(dev_, uint64_t(vocab_) * rank_ * 2);
     tsv_ = DeviceBuffer(dev_, uint64_t(vocab_) * 2 * rank_ * 2);
+    wtw_ = DeviceBuffer(dev_, uint64_t(rank_) * rank_ * 4);
     {   // RoPE tables for every position (a launch binds the rows of its positions) and the block's causal mask
         const uint64_t R2 = head_dim_ / 2, rows = uint64_t(max_ctx_) + kBlock;
         if ((R2 * 4) % 128) throw std::runtime_error("dspine: head_dim/2 * 4 bytes must be a multiple of 128");
@@ -134,9 +135,10 @@ void DSpine::precompile(const std::function<void(size_t, size_t)>& progress) {
         append_recipe(n);
         if (progress) progress(++done, total);
     }
-    for (uint32_t B = 2; B <= kMaxBatch; ++B) {  // batched drafting (draft_batch, draft_batch_full)
+    for (uint32_t B = 2; B <= kMaxBatch; ++B) {  // batched drafting (draft_batch, draft_batch_full, append_context_batch)
         block_batch_recipe(B, false);
         block_batch_recipe(B, true);
+        append_batch_recipe(B, kBlock);
         if (progress) progress(++done, total);
     }
 }
@@ -248,11 +250,41 @@ void DSpine::build_tables() {
                                   {"tsv", &tsv_, start * 2 * R * 2}};
         r->enqueue(stream_, b);
     }
+    {   // W^T W [R, R] f32 for the algebraic sampled refinement tail (norm of raw + rms * m @ W^T)
+        GraphBuilder gw(dev_);
+        Ops ow(gw);
+        const auto wf = ow.cast(gw.input("ww", DType::BF16, {H, R}), DType::F32, "wf");
+        const auto wt = ow.temp("wtw_v", DType::F32, {R, R});
+        gw.gemm(wf, wf, wt, true, false);
+        output(gw, "wtw", wt);
+        auto rw = gw.compile("dspine_wtw_" + std::to_string(H) + "x" + std::to_string(R));
+        const Binding bw[] = {w_.bind("ww", "bridge.write." + std::to_string(layers_ - 1)), {"wtw", &wtw_, 0}};
+        rw->enqueue(stream_, bw);
+    }
+    {   // Pack per-layer QKV [(NH + 2*KV)*D, H] and Gate+Up [2*F, H] weights for single-GEMM launch
+        const uint64_t NH = heads_, KV = kv_heads_, D = head_dim_, F = inter_;
+        const uint64_t q_bytes = NH * D * H * 2, kv_bytes = KV * D * H * 2, qkv_layer = q_bytes + 2 * kv_bytes;
+        const uint64_t f_bytes = F * H * 2, gu_layer = 2 * f_bytes;
+        qkv_w_ = DeviceBuffer(dev_, layers_ * qkv_layer);
+        gu_w_ = DeviceBuffer(dev_, layers_ * gu_layer);
+        for (uint32_t L = 0; L < layers_; ++L) {
+            const auto& qw = w_.at(Lw(L, "self_attn.q_proj.weight"));
+            const auto& kw = w_.at(Lw(L, "self_attn.k_proj.weight"));
+            const auto& vw = w_.at(Lw(L, "self_attn.v_proj.weight"));
+            stream_.copy(w_.arena(), qw.offset, qkv_w_, L * qkv_layer, q_bytes);
+            stream_.copy(w_.arena(), kw.offset, qkv_w_, L * qkv_layer + q_bytes, kv_bytes);
+            stream_.copy(w_.arena(), vw.offset, qkv_w_, L * qkv_layer + q_bytes + kv_bytes, kv_bytes);
+            const auto& gw = w_.at(Lw(L, "mlp.gate_proj.weight"));
+            const auto& uw = w_.at(Lw(L, "mlp.up_proj.weight"));
+            stream_.copy(w_.arena(), gw.offset, gu_w_, L * gu_layer, f_bytes);
+            stream_.copy(w_.arena(), uw.offset, gu_w_, L * gu_layer + f_bytes, f_bytes);
+        }
+    }
     stream_.synchronize();
 }
 
 Recipe& DSpine::append_recipe(uint32_t n) {
-    const std::string key = "dspine_append_n" + std::to_string(n) + (w8_on_ ? "_w8" : "");
+    const std::string key = "dspine_append_n" + std::to_string(n) + (w8_on_ ? "_w8" : "_fkv");
     if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
     const uint64_t H = hidden_, KV = kv_heads_, D = head_dim_;
     GraphBuilder g(dev_);
@@ -272,10 +304,20 @@ Recipe& DSpine::append_recipe(uint32_t n) {
     };
     for (uint32_t L = 0; L < layers_; ++L) {
         const std::string p = "L" + std::to_string(L) + ".";
-        const auto kraw = o.reshape(LIN(ctx, Lw(L, "self_attn.k_proj.weight"), KV * D, H, p + "k"), {n, KV, D}, p + "k3");
-        const auto k = rope_full(o, o.rms_norm(kraw, in(Lw(L, "self_attn.k_norm.weight"), DType::BF16, {D}), eps_, false, p + "kn"),
+        TensorId kraw, vraw;
+        if (w8_on_) {
+            kraw = LIN(ctx, Lw(L, "self_attn.k_proj.weight"), KV * D, H, p + "k");
+            vraw = LIN(ctx, Lw(L, "self_attn.v_proj.weight"), KV * D, H, p + "v");
+        } else {
+            const auto kv = o.linear_bf16(ctx, in(p + "kv_w", DType::BF16, {2 * KV * D, H}), p + "kv");
+            const auto kvs = o.split(kv, 1, {KV * D, KV * D}, p + "kvs");
+            kraw = kvs[0];
+            vraw = kvs[1];
+        }
+        const auto k = rope_full(o, o.rms_norm(o.reshape(kraw, {n, KV, D}, p + "k3"),
+                                               in(Lw(L, "self_attn.k_norm.weight"), DType::BF16, {D}), eps_, false, p + "kn"),
                                  cosv, sinv, D, p + "kr");
-        const auto v = o.reshape(LIN(ctx, Lw(L, "self_attn.v_proj.weight"), KV * D, H, p + "v"), {n, KV, D}, p + "v3");
+        const auto v = o.reshape(vraw, {n, KV, D}, p + "v3");
         auto heads = [&](TensorId t3, const std::string& nm) {
             auto parts = o.split(o.transpose(t3, {1, 0, 2}, nm + "_t"), 0, std::vector<uint64_t>(KV, 1), nm + "_h");
             for (uint64_t h = 0; h < KV; ++h) parts[h] = o.reshape(parts[h], {n, D}, nm + std::to_string(h));
@@ -289,6 +331,137 @@ Recipe& DSpine::append_recipe(uint32_t n) {
     }
     auto r = g.compile(key);
     return *(recipes_[key] = std::move(r));
+}
+
+Recipe& DSpine::append_batch_recipe(uint32_t B, uint32_t n) {
+    const std::string key = "dspine_appendb_B" + std::to_string(B) + "_n" + std::to_string(n) + (w8_on_ ? "_w8" : "_fkv");
+    if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
+    const uint64_t H = hidden_, KV = kv_heads_, D = head_dim_, BN = uint64_t(B) * n, tab = uint64_t(max_ctx_) + kBlock;
+    GraphBuilder g(dev_);
+    Ops o(g);
+    Inputs in{g, {}};
+    const auto rpos = in("rope_pos", DType::I32, {BN});
+    const auto cosv = o.reshape(o.gather_rows(in("cos_tab", DType::F32, {tab, D / 2}), rpos, "cosg"), {BN, 1, D / 2}, "cos3");
+    const auto sinv = o.reshape(o.gather_rows(in("sin_tab", DType::F32, {tab, D / 2}), rpos, "sing"), {BN, 1, D / 2}, "sin3");
+    TensorId acc = kNoTensor;
+    for (uint32_t k = 0; k < kFeatures; ++k) {
+        const auto part = o.linear_bf16(in("feat" + std::to_string(k), DType::BF16, {BN, H}),
+                                        in("fc." + std::to_string(k), DType::BF16, {H, H}), "fc" + std::to_string(k), DType::F32);
+        acc = acc == kNoTensor ? part : o.add(acc, part, "fcs" + std::to_string(k));
+    }
+    const auto ctx = o.rms_norm(o.cast(acc, DType::BF16, "fcb"), in("hidden_norm.weight", DType::BF16, {H}), eps_, false, "ctx");
+    auto LIN = [&](TensorId x, const std::string& wn, uint64_t N, uint64_t K, const std::string& nm) {
+        if (w8_on_) return o.fp8_linear(x, in(wn + ".f8", DType::F8, {N, K}), in(wn + ".s8", DType::F32, {N}), nm);
+        return o.linear_bf16(x, in(wn, DType::BF16, {N, K}), nm);
+    };
+    const std::vector<uint64_t> bsz(B, n);
+    for (uint32_t L = 0; L < layers_; ++L) {
+        const std::string p = "L" + std::to_string(L) + ".";
+        TensorId kraw, vraw;
+        if (w8_on_) {
+            kraw = LIN(ctx, Lw(L, "self_attn.k_proj.weight"), KV * D, H, p + "k");
+            vraw = LIN(ctx, Lw(L, "self_attn.v_proj.weight"), KV * D, H, p + "v");
+        } else {
+            const auto kv = o.linear_bf16(ctx, in(p + "kv_w", DType::BF16, {2 * KV * D, H}), p + "kv");
+            const auto kvs = o.split(kv, 1, {KV * D, KV * D}, p + "kvs");
+            kraw = kvs[0];
+            vraw = kvs[1];
+        }
+        const auto k = rope_full(o, o.rms_norm(o.reshape(kraw, {BN, KV, D}, p + "k3"),
+                                               in(Lw(L, "self_attn.k_norm.weight"), DType::BF16, {D}), eps_, false, p + "kn"),
+                                 cosv, sinv, D, p + "kr");
+        const auto v = o.reshape(vraw, {BN, KV, D}, p + "v3");
+        const auto kh = o.split(o.transpose(k, {1, 0, 2}, p + "kt"), 0, std::vector<uint64_t>(KV, 1), p + "kh");
+        const auto vh = o.split(o.transpose(v, {1, 0, 2}, p + "vt"), 0, std::vector<uint64_t>(KV, 1), p + "vh");
+        for (uint64_t h = 0; h < KV; ++h) {
+            const auto hs = std::to_string(h);
+            const auto kb = o.split(o.reshape(kh[h], {BN, D}, p + "k2_" + hs), 0, bsz, p + "kb_" + hs);
+            const auto vb = o.split(o.reshape(vh[h], {BN, D}, p + "v2_" + hs), 0, bsz, p + "vb_" + hs);
+            for (uint32_t b = 0; b < B; ++b) {
+                const auto x = std::to_string(b) + "_" + hs;
+                output(g, p + "kout" + x, kb[b]);
+                output(g, p + "vout" + x, vb[b]);
+            }
+        }
+    }
+    auto r = g.compile(key);
+    return *(recipes_[key] = std::move(r));
+}
+
+void DSpine::append_context_batch(std::span<const uint32_t> slots, const DeviceBuffer& feats, uint64_t slot_stride,
+                                  uint32_t n, std::span<const uint32_t> pos, uint32_t marked) {
+    const uint32_t B = uint32_t(slots.size());
+    if (!B || !n) return;
+    if (pos.size() != B) throw std::invalid_argument("dspine: append_context_batch sizes");
+    static const bool serial = std::getenv("G2E_APPEND_SERIAL") != nullptr;
+    bool ok = !serial && B >= 2 && B <= kMaxBatch && (n == kBlock || n == 8);
+    for (uint32_t b = 0; b < B && ok; ++b) {
+        if (slots[b] >= seqs_.size() || pos[b] + n > max_ctx_ || (pos[b] % ring_) + n > ring_) ok = false;
+        for (uint32_t c = 0; c < b && ok; ++c)
+            if (slots[c] == slots[b]) ok = false;
+    }
+    if (!ok) {
+        const uint32_t keep = active_;
+        for (uint32_t b = 0; b < B; ++b) {
+            select_slot(slots[b]);
+            append_context(feats, slot_stride, n, pos[b], marked, b * n);
+        }
+        select_slot(keep);
+        return;
+    }
+    auto swap = [&](Seq& q) {
+        std::swap(k_cache_, q.k);
+        std::swap(v_cache_, q.v);
+        std::swap(slot_pos_, q.slot_pos);
+    };
+    swap(seqs_[active_]);
+    struct Unpark {
+        std::function<void()> f;
+        ~Unpark() { f(); }
+    } unpark{[&] { swap(seqs_[active_]); }};
+    const uint64_t D = head_dim_, KV = kv_heads_, BN = uint64_t(B) * n;
+    constexpr uint64_t kAppendStage = 4u << 20;  // disjoint from draft / run_block staging [0, 1 MiB)
+    if (!append_rpos_.size()) append_rpos_ = DeviceBuffer(dev_, uint64_t(kMaxBatch) * kBlock * 4);
+    auto* rp = reinterpret_cast<int32_t*>(staging_.as<uint8_t>() + kAppendStage);
+    for (uint32_t b = 0; b < B; ++b)
+        for (uint32_t t = 0; t < n; ++t) rp[b * n + t] = int32_t(pos[b] + t);
+    stream_.upload(staging_, kAppendStage, append_rpos_, 0, BN * 4);
+    std::vector<Binding> bnd = {{"rope_pos", &append_rpos_, 0}, {"cos_tab", &cos_tab_, 0}, {"sin_tab", &sin_tab_, 0},
+                                w_.bind("hidden_norm.weight", "hidden_norm.weight")};
+    for (uint32_t k = 0; k < kFeatures; ++k) {
+        bnd.push_back({"feat" + std::to_string(k), &feats, k * slot_stride});
+        bnd.push_back(w_.bind("fc." + std::to_string(k), "fc." + std::to_string(k)));
+    }
+    const uint64_t q_bytes = uint64_t(heads_) * D * hidden_ * 2;
+    const uint64_t qkv_layer = (uint64_t(heads_) + 2 * KV) * D * hidden_ * 2;
+    for (uint32_t L = 0; L < layers_; ++L) {
+        const std::string p = "L" + std::to_string(L) + ".";
+        if (w8_on_) {
+            bind_proj(bnd, Lw(L, "self_attn.k_proj.weight"));
+            bind_proj(bnd, Lw(L, "self_attn.v_proj.weight"));
+        } else {
+            bnd.push_back({p + "kv_w", &qkv_w_, L * qkv_layer + q_bytes});
+        }
+        bnd.push_back(w_.bind(Lw(L, "self_attn.k_norm.weight"), Lw(L, "self_attn.k_norm.weight")));
+        for (uint32_t b = 0; b < B; ++b) {
+            const Seq& q = seqs_[slots[b]];
+            const uint32_t slot = pos[b] % ring_;
+            const auto bs = std::to_string(b);
+            for (uint64_t h = 0; h < KV; ++h) {
+                const uint64_t at = (h * uint64_t(ring_) + slot) * D * 2;
+                const auto x = bs + "_" + std::to_string(h);
+                bnd.push_back({p + "kout" + x, &q.k[L], at});
+                bnd.push_back({p + "vout" + x, &q.v[L], at});
+            }
+        }
+    }
+    append_batch_recipe(B, n).enqueue(stream_, bnd);
+    for (uint32_t b = 0; b < B; ++b) {
+        auto& sp = seqs_[slots[b]].slot_pos;
+        const uint32_t slot = pos[b] % ring_;
+        for (uint32_t t = 0; t < n; ++t)
+            if (t < marked) sp[slot + t] = int64_t(pos[b] + t);
+    }
 }
 
 void DSpine::mark(uint32_t pos, uint32_t n) {
@@ -317,10 +490,16 @@ void DSpine::append_context(const DeviceBuffer& feats, uint64_t slot_stride, uin
             b.push_back({"feat" + std::to_string(k), &feats, k * slot_stride + uint64_t(src_row + done) * H * 2});
             b.push_back(w_.bind("fc." + std::to_string(k), "fc." + std::to_string(k)));
         }
+        const uint64_t q_bytes = uint64_t(heads_) * D * H * 2;
+        const uint64_t qkv_layer = (uint64_t(heads_) + 2 * KV) * D * H * 2;
         for (uint32_t L = 0; L < layers_; ++L) {
             const std::string p = "L" + std::to_string(L) + ".";
-            bind_proj(b, Lw(L, "self_attn.k_proj.weight"));
-            bind_proj(b, Lw(L, "self_attn.v_proj.weight"));
+            if (w8_on_) {
+                bind_proj(b, Lw(L, "self_attn.k_proj.weight"));
+                bind_proj(b, Lw(L, "self_attn.v_proj.weight"));
+            } else {
+                b.push_back({p + "kv_w", &qkv_w_, L * qkv_layer + q_bytes});
+            }
             b.push_back(w_.bind(Lw(L, "self_attn.k_norm.weight"), Lw(L, "self_attn.k_norm.weight")));
             for (uint64_t h = 0; h < KV; ++h) {
                 const uint64_t at = (h * uint64_t(ring_) + slot) * D * 2;
@@ -413,7 +592,10 @@ void DSpine::quantize_lm_head() {
 }
 
 Recipe& DSpine::block_recipe(bool sampled) {
-    const std::string key = "dspine_block_ring" + std::to_string(ring_) + (sampled ? "_sampled" : "") + "_tk3" + (lm8_on_ ? "_l8" : "") + (w8_on_ ? "_w8" : "") + "_eg_mg_sm2";
+    static const bool exact_table = std::getenv("G2E_DRAFT_EXACT_TABLE") != nullptr;
+    const std::string key = "dspine_block_ring" + std::to_string(ring_) + (sampled ? "_sampled" : "") + "_tk3" +
+                            (lm8_on_ ? "_l8" : "") + (w8_on_ ? "_w8" : "_fqkv") + "_eg_mg_sm2" +
+                            (exact_table ? "" : "_alg2") + "_br3";
     const uint64_t Sb = ring_;
     if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
     const uint64_t T = kBlock, H = hidden_, NH = heads_, KV = kv_heads_, D = head_dim_, G = NH / KV, F = inter_,
@@ -423,6 +605,7 @@ Recipe& DSpine::block_recipe(bool sampled) {
     Inputs in{g, {}};
     auto W = [&](const std::string& name, Shape s) { return in(name, DType::BF16, std::move(s)); };
     const auto cosv = in("cos", DType::F32, {T, 1, D / 2}), sinv = in("sin", DType::F32, {T, 1, D / 2});
+    const auto cos2 = o.reshape(cosv, {T, D / 2}, "cos2"), sin2 = o.reshape(sinv, {T, D / 2}, "sin2");
     // additive mask [T, Sb + T]: slot c (holding position sp[c], -1 if empty) is visible to row t iff
     // lo[t] <= sp[c] <= pos - 1 (lo[t] = max(0, pos + t - window + 1)); the block's rows see each other causally
     const auto sp = in("sp", DType::F32, {1, Sb});
@@ -433,12 +616,12 @@ Recipe& DSpine::block_recipe(bool sampled) {
     const auto ring_mask = o.reshape(o.cast(o.mul(o.add(mk_lo, mk_hi, "mk_s"), o.constant(1e30f, {1, 1}, "mk_big"), "mk_c"),
                                             DType::BF16, "mk_b"), {1, 1, T, Sb}, "mk_4");
     const auto causal4 = o.reshape(in("causal", DType::F32, {T, T}), {1, 1, T, T}, "causal4");
-    const auto notanchor = in("notanchor", DType::F32, {T, 1});
     const auto anchor = in("anchor", DType::I32, {1});
     const auto anchor16 = in("anchor16", DType::I32, {1, K});
     const auto codebook = W("bridge.codebook", {V, C});
     const auto packed_w = W("bridge.packed", {3 * R, C});
-    const auto gate_b = o.cast(W("bridge.gate.bias", {R}), DType::F32, "gateb");
+    const auto gate_b_bf = W("bridge.gate.bias", {R});
+    const auto gate_b = o.cast(gate_b_bf, DType::F32, "gateb");
     const float sqrt_c = float(std::sqrt(double(C)));
     const auto anchor_codes = o.cast(o.mul(o.cast(o.gather_rows(codebook, anchor, "acb"), DType::F32, "acf"),
                                            o.constant(sqrt_c, {1}, "sqc"), "acs"), DType::BF16, "acodes");  // [1, C]
@@ -446,7 +629,7 @@ Recipe& DSpine::block_recipe(bool sampled) {
     const auto x0 = o.gather_rows(in("embed", DType::BF16, {V, H}), in("ids", DType::I32, {T}), "x0");
     TensorId residual = x0;
     TensorId x_in = o.rms_norm(x0, W(Lw(0, "input_layernorm.weight"), {H}), eps_, false, "in0");
-    TensorId st_raw = kNoTensor, st_rms = kNoTensor, st_packed = kNoTensor;
+    TensorId st_raw = kNoTensor, st_rms = kNoTensor, st_ms = kNoTensor, st_packed = kNoTensor;
     const auto scale = o.constant(float(1.0 / std::sqrt(double(D))), {1}, "scale");
     auto LIN = [&](TensorId x, const std::string& wn, uint64_t Nw, uint64_t Kw, const std::string& nm) {
         if (w8_on_) return o.fp8_linear(x, in(wn + ".f8", DType::F8, {Nw, Kw}), in(wn + ".s8", DType::F32, {Nw}), nm);
@@ -455,22 +638,44 @@ Recipe& DSpine::block_recipe(bool sampled) {
     for (uint32_t L = 0; L < layers_; ++L) {
         const std::string p = "L" + std::to_string(L) + ".";
         // ---- attention: context cache [Sb] + the block (causal), per kv head
-        const auto q = rope_full(o, o.rms_norm(o.reshape(LIN(x_in, Lw(L, "self_attn.q_proj.weight"), NH * D, H, p + "q"),
-                                                         {T, NH, D}, p + "q3"),
-                                               W(Lw(L, "self_attn.q_norm.weight"), {D}), eps_, false, p + "qn"),
-                                 cosv, sinv, D, p + "qr");
-        const auto k = rope_full(o, o.rms_norm(o.reshape(LIN(x_in, Lw(L, "self_attn.k_proj.weight"), KV * D, H, p + "k"),
-                                                         {T, KV, D}, p + "k3"),
-                                               W(Lw(L, "self_attn.k_norm.weight"), {D}), eps_, false, p + "kn"),
-                                 cosv, sinv, D, p + "kr");
-        const auto v = o.reshape(LIN(x_in, Lw(L, "self_attn.v_proj.weight"), KV * D, H, p + "v"), {T, KV, D}, p + "v3");
+        TensorId qsc, kb, vb;
+        if (!w8_on_ && D == 128) {
+            const auto qkv = o.linear_bf16(x_in, W(p + "qkv_w", {(NH + 2 * KV) * D, H}), p + "qkv");
+            qsc = o.temp(p + "qsb", DType::BF16, {KV, G * T, D});
+            kb = o.temp(p + "kt", DType::BF16, {KV, T, D});
+            vb = o.temp(p + "vt", DType::BF16, {KV, T, D});
+            const float qp[2] = {eps_, float(1.0 / std::sqrt(double(D)))};
+            g.op("flashinfer_gaudi_dspine_qkv_prep_bf16_gaudi2",
+                 {qkv, W(Lw(L, "self_attn.q_norm.weight"), {D}), W(Lw(L, "self_attn.k_norm.weight"), {D}), cos2, sin2},
+                 {qsc, kb, vb}, qp, sizeof(qp));
+        } else {
+            TensorId qraw, kraw, vraw;
+            if (w8_on_) {
+                qraw = LIN(x_in, Lw(L, "self_attn.q_proj.weight"), NH * D, H, p + "q");
+                kraw = LIN(x_in, Lw(L, "self_attn.k_proj.weight"), KV * D, H, p + "k");
+                vraw = LIN(x_in, Lw(L, "self_attn.v_proj.weight"), KV * D, H, p + "v");
+            } else {
+                const auto qkv = o.linear_bf16(x_in, W(p + "qkv_w", {(NH + 2 * KV) * D, H}), p + "qkv");
+                const auto qkvs = o.split(qkv, 1, {NH * D, KV * D, KV * D}, p + "qkvs");
+                qraw = qkvs[0];
+                kraw = qkvs[1];
+                vraw = qkvs[2];
+            }
+            const auto q = rope_full(o, o.rms_norm(o.reshape(qraw, {T, NH, D}, p + "q3"),
+                                                   W(Lw(L, "self_attn.q_norm.weight"), {D}), eps_, false, p + "qn"),
+                                     cosv, sinv, D, p + "qr");
+            const auto k = rope_full(o, o.rms_norm(o.reshape(kraw, {T, KV, D}, p + "k3"),
+                                                   W(Lw(L, "self_attn.k_norm.weight"), {D}), eps_, false, p + "kn"),
+                                     cosv, sinv, D, p + "kr");
+            const auto v = o.reshape(vraw, {T, KV, D}, p + "v3");
+            const auto q4 = o.reshape(o.transpose(q, {1, 0, 2}, p + "qt"), {KV, G * T, D}, p + "q4");
+            kb = o.transpose(k, {1, 0, 2}, p + "kt");
+            vb = o.transpose(v, {1, 0, 2}, p + "vt");
+            qsc = o.cast(o.mul(o.cast(q4, DType::F32, p + "qf"), scale, p + "qm"), DType::BF16, p + "qsb");
+        }
         // all kv heads at once against the whole ring (stale and future slots are masked)
-        const auto q4 = o.reshape(o.transpose(q, {1, 0, 2}, p + "qt"), {KV, G * T, D}, p + "q4");  // heads h*G.. -> kv h
-        const auto kb = o.transpose(k, {1, 0, 2}, p + "kt");                                      // [KV, T, D]
-        const auto vb = o.transpose(v, {1, 0, 2}, p + "vt");
         const auto kc = in(p + "kc", DType::BF16, {KV, Sb, D});
         const auto vc = in(p + "vc", DType::BF16, {KV, Sb, D});
-        const auto qsc = o.cast(o.mul(o.cast(q4, DType::F32, p + "qf"), scale, p + "qm"), DType::BF16, p + "qsb");
         const auto s1 = o.add(o.reshape(o.batch_gemm(qsc, kc, p + "sc", false, true, DType::BF16), {KV, G, T, Sb}, p + "s14"),
                               ring_mask, p + "s1m");
         const auto s2 = o.add(o.reshape(o.batch_gemm(qsc, kb, p + "sn", false, true, DType::F32), {KV, G, T, T}, p + "s24"),
@@ -491,41 +696,45 @@ Recipe& DSpine::block_recipe(bool sampled) {
         const auto hsum = o.add(residual, attn, p + "h");
         // ---- MLP
         const auto x2 = o.rms_norm(hsum, W(Lw(L, "post_attention_layernorm.weight"), {H}), eps_, false, p + "x2");
-        const auto gt = LIN(x2, Lw(L, "mlp.gate_proj.weight"), F, H, p + "gt");
-        const auto up = LIN(x2, Lw(L, "mlp.up_proj.weight"), F, H, p + "up");
-        const auto gs = o.temp(p + "gs", DType::BF16, {T, F});
-        g.op("silu_fwd_bf16", {gt}, {gs});
-        const auto mlp = LIN(o.mul(gs, up, p + "act"), Lw(L, "mlp.down_proj.weight"), H, F, p + "dn");
-        const auto out = o.add(hsum, mlp, p + "out");  // BF16
-        // ---- code bridge (dspine_mlx bridge.py, rounding point by rounding point)
-        const auto f = o.cast(out, DType::F32, p + "bf");
-        const auto ms = o.mul(o.reduce("sum", o.mul(f, f, p + "f2"), 1, p + "fs"), o.constant(1.0f / float(H), {1}, p + "invh"), p + "ms");
-        const auto rms = o.unary("sqrt", o.binary("max", ms, o.constant(kF32Tiny, {1}, p + "tiny"), p + "msc"), p + "rms");  // [T,1]
-        const auto beps = o.constant(bridge_eps_, {1}, p + "beps");
-        const auto normalized = o.cast(o.div(f, o.add(rms, beps, p + "re"), p + "nf"), DType::BF16, p + "nb");
-        const auto projected = o.cast(o.linear_bf16(normalized, W("bridge.read." + std::to_string(L), {C, H}), p + "pj"),
-                                      DType::F32, p + "pjf");
-        const auto pn = o.unary("sqrt", o.reduce("sum", o.mul(projected, projected, p + "pj2"), 1, p + "pjs"), p + "pn");
-        const auto codes_all = o.cast(o.div(o.mul(projected, o.constant(sqrt_c, {1}, p + "sqc"), p + "pjc"),
-                                            o.add(pn, beps, p + "pne"), p + "cd"), DType::BF16, p + "cdb");
-        const auto codes = o.concat({anchor_codes, o.split(codes_all, 0, {1, T - 1}, p + "cs")[1]}, 0, p + "codes");
+        TensorId act;
+        if (w8_on_) {
+            const auto gt = LIN(x2, Lw(L, "mlp.gate_proj.weight"), F, H, p + "gt");
+            const auto up = LIN(x2, Lw(L, "mlp.up_proj.weight"), F, H, p + "up");
+            const auto gs = o.temp(p + "gs", DType::BF16, {T, F});
+            g.op("silu_fwd_bf16", {gt}, {gs});
+            act = o.mul(gs, up, p + "act");
+        } else {
+            const auto gu = o.linear_bf16(x2, W(p + "gu_w", {2 * F, H}), p + "gu");
+            act = o.temp(p + "act", DType::BF16, {T, F});
+            g.op("flashinfer_gaudi_silu_and_mul_bf16_gaudi2", {gu}, {act});
+        }
+        const auto mlp = LIN(act, Lw(L, "mlp.down_proj.weight"), H, F, p + "dn");
+        // ---- fused code bridge (4 custom 24-TPC kernels replace ~40 tiny Synapse TPC ops/layer)
+        const auto out = o.temp(p + "out", DType::BF16, {T, H});
+        const auto normalized = o.temp(p + "nb", DType::BF16, {T, H});
+        const auto rms = o.temp(p + "rms", DType::F32, {T, 1});
+        const auto ms = o.temp(p + "ms", DType::F32, {T, 1});
+        const float norm_p[2] = {1.0f / float(H), bridge_eps_};
+        g.op("flashinfer_gaudi_dspine_bridge_norm_bf16_gaudi2", {hsum, mlp}, {out, normalized, rms, ms}, norm_p, sizeof(norm_p));
+        const auto projected = o.linear_bf16(normalized, W("bridge.read." + std::to_string(L), {C, H}), p + "pj");
+        const auto codes = o.temp(p + "codes", DType::BF16, {T, C});
+        const float code_p[2] = {sqrt_c, bridge_eps_};
+        g.op("flashinfer_gaudi_dspine_bridge_codes_bf16_gaudi2", {projected, anchor_codes}, {codes}, code_p, sizeof(code_p));
         const auto packed = o.linear_bf16(codes, packed_w, p + "pk", DType::BF16);  // [T, 3R]
         if (L + 1 == layers_) {
             st_raw = out;
             st_rms = rms;
+            st_ms = ms;
             st_packed = packed;
         }
-        const auto qsv = o.split(o.cast(packed, DType::F32, p + "pkf"), 1, {R, R, R}, p + "qsv");
-        const auto q_next = o.split(qsv[0], 0, {1, T - 1}, p + "qn1")[1];
-        const auto s_prev = o.split(qsv[1], 0, {T - 1, 1}, p + "sp1")[0];
-        const auto v_prev = o.split(qsv[2], 0, {T - 1, 1}, p + "vp1")[0];
-        const auto gate = o.unary("sigmoid", o.add(o.add(q_next, s_prev, p + "gqs"), gate_b, p + "gqb"), p + "gate");
-        const auto message = o.cast(o.concat({o.constant(0.0f, {1, R}, p + "z"), o.mul(gate, v_prev, p + "gv")}, 0, p + "msg"),
-                                    DType::BF16, p + "msgb");
-        const auto delta = o.cast(o.linear_bf16(message, W("bridge.write." + std::to_string(L), {H, R}), p + "dl"), DType::F32, p + "dlf");
-        const auto out2 = o.cast(o.add(f, o.mul(o.mul(delta, rms, p + "dr"), notanchor, p + "dm"), p + "o2f"), DType::BF16, p + "o2");
+        const auto message = o.temp(p + "msgb", DType::BF16, {T, R});
+        g.op("flashinfer_gaudi_dspine_bridge_gate_bf16_gaudi2", {packed, gate_b_bf}, {message});
+        const auto delta = o.linear_bf16(message, W("bridge.write." + std::to_string(L), {H, R}), p + "dl");
         const auto next_w = L + 1 < layers_ ? W(Lw(L + 1, "input_layernorm.weight"), {H}) : W("norm.weight", {H});
-        x_in = o.rms_norm(out2, next_w, eps_, false, p + "next");
+        const auto out2 = o.temp(p + "o2", DType::BF16, {T, H});
+        x_in = o.temp(p + "next", DType::BF16, {T, H});
+        const float post_p[2] = {1.0f / float(H), eps_};
+        g.op("flashinfer_gaudi_dspine_bridge_post_bf16_gaudi2", {out, delta, rms, next_w}, {out2, x_in}, post_p, sizeof(post_p));
         residual = out2;
     }
     // ---- refinement tail (greedy): rows 1..15
@@ -541,11 +750,19 @@ Recipe& DSpine::block_recipe(bool sampled) {
     const auto cand = o.topk2(logits, uint32_t(K), kTopkChunk,
                               in("tk_consts", DType::I32, {V + 2 * N}), "tk").second;  // [N, K]
     const auto cand_flat = o.reshape(cand, {N * K}, "cflat");
-    const auto head_rows = o.reshape(o.cast(o.gather_rows(lm, cand_flat, "hr"), DType::F32, "hrf"), {N, K, H}, "hr3");
-    const auto raw_n = o.cast(o.split(st_raw, 0, {1, N}, "rawn")[1], DType::F32, "rawf");
+    const auto raw_nb = o.split(st_raw, 0, {1, N}, "rawn")[1];  // [N, H] BF16
+    const auto raw_n = o.cast(raw_nb, DType::F32, "rawf");
     const auto rms_n = o.reshape(o.split(st_rms, 0, {1, N}, "rmsn")[1], {N, 1, 1}, "rms3");
-    const auto rnw = o.reshape(o.mul(raw_n, o.cast(W("norm.weight", {H}), DType::F32, "nwf"), "rnw"), {N, 1, H}, "rnw3");
-    const auto base = o.batch_gemm(rnw, head_rows, "base", false, true, DType::F32);           // [N, 1, K]
+    const auto rnw = o.mul(raw_n, o.cast(W("norm.weight", {H}), DType::F32, "nwf"), "rnw");
+    TensorId head_rows = kNoTensor, base = kNoTensor;
+    if (exact_table) {
+        head_rows = o.reshape(o.cast(o.gather_rows(lm, cand_flat, "hr"), DType::F32, "hrf"), {N, K, H}, "hr3");
+        base = o.batch_gemm(o.reshape(rnw, {N, 1, H}, "rnw3"), head_rows, "base", false, true, DType::F32);
+    } else {
+        const auto head_rows_b = o.reshape(o.gather_rows(lm, cand_flat, "hr"), {N, K, H}, "hr3b");
+        base = o.batch_gemm(o.reshape(o.cast(rnw, DType::BF16, "rnwb"), {N, 1, H}, "rnw3"), head_rows_b, "base", false,
+                            true, DType::F32);
+    }
     const auto sid = o.reshape(o.concat({anchor16, o.split(cand, 0, {N - 1, 1}, "cprev")[0]}, 0, "sid"), {N * K}, "sidf");
     const auto tsv = o.reshape(o.cast(o.gather_rows(in("tsv", DType::BF16, {V, 2 * R}), sid, "tsvg"), DType::F32, "tsvf"),
                                {N, K, 2 * R}, "tsv3");
@@ -555,7 +772,7 @@ Recipe& DSpine::block_recipe(bool sampled) {
     const auto m = o.mul(o.unary("sigmoid", o.add(o.add(qn, tv[0], "mq"), gate_b, "mqb"), "msig"), tv[1], "m");  // [N, K, R]
     const auto tgc = o.reshape(o.cast(o.gather_rows(in("tg", DType::BF16, {V, R}), cand_flat, "tgg"), DType::F32, "tgf"), {N, K, R}, "tg3");
     output(g, "cand", cand);
-    if (sampled) {
+    if (sampled && exact_table) {
         // refined[n,k] = raw[n] + rms[n] * (m[n,k] @ write^T), final-normed, against the candidates' head rows
         const auto wf = o.cast(W("bridge.write." + std::to_string(layers_ - 1), {H, R}), DType::F32, "wlf");
         const auto upd = o.temp("upd", DType::F32, {N * K, H});
@@ -568,7 +785,24 @@ Recipe& DSpine::block_recipe(bool sampled) {
     } else {
         const auto s = o.batch_gemm(m, tgc, "s", false, true, DType::F32);                     // [N, K(sender), K(cand)]
         const auto score = o.add(base, o.mul(rms_n, s, "rs"), "score");
-        output(g, "idx", o.argmax(score, "best"));                                             // [N, K, 1]
+        if (!sampled) {
+            output(g, "idx", o.argmax(score, "best"));                                         // [N, K, 1]
+        } else {
+            // table[n, s, c] = score[n, s, c] / sqrt(mean((raw + rms * m @ W^T)^2) + eps)
+            const auto ms_n = o.reshape(o.split(st_ms, 0, {1, N}, "msn")[1], {N, 1, 1}, "ms3");
+            const auto rw = o.temp("rw", DType::F32, {N, R});
+            g.gemm(raw_nb, W("bridge.write." + std::to_string(layers_ - 1), {H, R}), rw);
+            const auto cross = o.reduce("sum", o.mul(m, o.reshape(rw, {N, 1, R}, "rw3"), "mc"), 2, "cross");
+            const auto mw = o.temp("mw", DType::F32, {N * K, R});
+            g.gemm(o.reshape(m, {N * K, R}, "mflat"), in("wtw", DType::F32, {R, R}), mw);
+            const auto quad = o.reduce("sum", o.mul(m, o.reshape(mw, {N, K, R}, "mw3"), "mqd"), 2, "quad");
+            const auto t1 = o.mul(o.mul(rms_n, cross, "rc"), o.constant(2.0f / float(H), {1}, "twoh"), "t1");
+            const auto t2 = o.mul(o.mul(o.mul(rms_n, rms_n, "r2"), quad, "r2q"), o.constant(1.0f / float(H), {1}, "oneh"), "t2");
+            const auto ms_ref = o.add(o.add(ms_n, t1, "m1"), t2, "mref");
+            const auto inv_norm = o.unary("rsqrt", o.add(o.binary("max", ms_ref, o.constant(0.0f, {1}, "z0"), "mpos"),
+                                                         o.constant(eps_, {1}, "neps"), "mep"), "inrm");
+            output(g, "table", o.mul(score, inv_norm, "table_v"));                             // [N, K, K]
+        }
     }
     (void)T;
     auto r = g.compile(key);
@@ -584,11 +818,13 @@ constexpr uint64_t kBIds = 0, kBRope = 512, kBAnchor = 1024, kBAnchor16 = 1152, 
 }
 
 Recipe& DSpine::block_batch_recipe(uint32_t B, bool sampled) {
+    static const bool exact_table = std::getenv("G2E_DRAFT_EXACT_TABLE") != nullptr;
     const std::string key = "dspine_blockb_B" + std::to_string(B) + "_ring" + std::to_string(ring_) + (lm8_on_ ? "_l8" : "") +
-                            (w8_on_ ? "_w8" : "") + (sampled ? "_sampled" : "") + "_sm2";
+                            (w8_on_ ? "_w8" : "_fqkv") + (sampled ? "_sampled" : "") + "_sm3" + (exact_table ? "" : "_alg2") + "_br3";
     if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
     const uint64_t T = kBlock, H = hidden_, NH = heads_, KV = kv_heads_, D = head_dim_, G = NH / KV, F = inter_,
-                   C = code_, R = rank_, V = vocab_, K = kBlock, N = kBlock - 1, Sb = ring_, BT = B * T, BN = B * N;
+                   C = code_, R = rank_, V = vocab_, K = kBlock, N = kBlock - 1, Sb = ring_, BT = B * T, BN = B * N,
+                   BKV = uint64_t(B) * KV;
     const uint64_t spr = (Sb * 4 + 127) / 128 * 128 / 4;  // slot-position row stride (f32)
     GraphBuilder g(dev_);
     Ops o(g);
@@ -601,39 +837,37 @@ Recipe& DSpine::block_batch_recipe(uint32_t B, bool sampled) {
     // RoPE rows gathered by position (per-slot bindings of the tables could overlap)
     const uint64_t tab = uint64_t(max_ctx_) + kBlock;
     const auto rpos = in("rope_pos", DType::I32, {BT});
-    const auto cosv = o.reshape(o.gather_rows(in("cos_tab", DType::F32, {tab, D / 2}), rpos, "cosg"), {BT, 1, D / 2}, "cos3");
-    const auto sinv = o.reshape(o.gather_rows(in("sin_tab", DType::F32, {tab, D / 2}), rpos, "sing"), {BT, 1, D / 2}, "sin3");
-    // per slot: the additive mask [T, Sb + T] as block_recipe (its slot positions, pos - 1, lowest visible positions)
+    const auto cos2 = o.gather_rows(in("cos_tab", DType::F32, {tab, D / 2}), rpos, "cosg");
+    const auto sin2 = o.gather_rows(in("sin_tab", DType::F32, {tab, D / 2}), rpos, "sing");
+    const auto cosv = o.reshape(cos2, {BT, 1, D / 2}, "cos3");
+    const auto sinv = o.reshape(sin2, {BT, 1, D / 2}, "sin3");
+    // Batched ring masks [B, T, Sb] computed in one 3D pass, then split per slot [1, 1, T, Sb]
     const auto sp_in = in("sp", DType::F32, {B, spr});
-    const auto sp_all = rows_of(spr == Sb ? sp_in : o.split(sp_in, 1, {Sb, spr - Sb}, "spcut")[0], 1, "sps");
-    const auto posm1_all = rows_of(in("posm1", DType::F32, {B, 1}), 1, "pms");
-    const auto lo_all = rows_of(in("lo", DType::F32, {BT, 1}), T, "los");
-    const auto causal = in("causal", DType::F32, {T, T});
-    // the ring part of each slot's mask (BF16, as its scores) and the block's causal part, kept apart: the two
-    // parts of the softmax are merged by their maxima and sums instead of concatenating the scores (a copy of
-    // [KV, G*T, ring] per slot and layer)
+    const auto sp_3 = o.reshape(spr == Sb ? sp_in : o.split(sp_in, 1, {Sb, spr - Sb}, "spcut")[0], {B, 1, Sb}, "sp3");
+    const auto posm1_3 = o.reshape(in("posm1", DType::F32, {B, 1}), {B, 1, 1}, "pms3");
+    const auto lo_3 = o.reshape(in("lo", DType::F32, {BT, 1}), {B, T, 1}, "lo3");
+    const auto mk_hi = o.binary("min", o.sub(posm1_3, sp_3, "mk_h"), o.constant(0.f, {1, 1, 1}, "mk_z"), "mk_hm");
+    const auto mk_lo = o.binary("min", o.sub(sp_3, lo_3, "mk_l"), o.constant(0.f, {1, 1, 1}, "mk_z2"), "mk_lm");
+    const auto rm_all = o.cast(o.mul(o.add(mk_lo, mk_hi, "mk_s"), o.constant(1e30f, {1, 1, 1}, "mk_big"), "mk_c"),
+                               DType::BF16, "mk_b");
+    const auto rm_parts = rows_of(rm_all, 1, "rm_sl");
     std::vector<TensorId> ring_masks;
-    for (uint32_t b = 0; b < B; ++b) {
-        const auto bs = std::to_string(b);
-        const auto mk_hi = o.binary("min", o.sub(posm1_all[b], sp_all[b], "mk_h" + bs), o.constant(0.f, {1, 1}, "mk_z" + bs), "mk_hm" + bs);
-        const auto mk_lo = o.binary("min", o.sub(sp_all[b], lo_all[b], "mk_l" + bs), o.constant(0.f, {1, 1}, "mk_z2" + bs), "mk_lm" + bs);
-        ring_masks.push_back(o.reshape(o.cast(o.mul(o.add(mk_lo, mk_hi, "mk_s" + bs), o.constant(1e30f, {1, 1}, "mk_big" + bs), "mk_c" + bs),
-                                              DType::BF16, "mk_b" + bs), {1, 1, T, Sb}, "mk_4" + bs));
-    }
+    for (uint32_t b = 0; b < B; ++b)
+        ring_masks.push_back(o.reshape(rm_parts[b], {1, 1, T, Sb}, "mk_4" + std::to_string(b)));
+    const auto causal = in("causal", DType::F32, {T, T});
     const auto causal4 = o.reshape(causal, {1, 1, T, T}, "causal4");
-    const auto notanchor = in("notanchor", DType::F32, {BT, 1});
     const auto anchors = in("anchor", DType::I32, {B});
-    const auto anchor16_all = rows_of(in("anchor16", DType::I32, {B, K}), 1, "a16s");
     const auto codebook = W("bridge.codebook", {V, C});
     const auto packed_w = W("bridge.packed", {3 * R, C});
-    const auto gate_b = o.cast(W("bridge.gate.bias", {R}), DType::F32, "gateb");
+    const auto gate_b_bf = W("bridge.gate.bias", {R});
+    const auto gate_b = o.cast(gate_b_bf, DType::F32, "gateb");
     const float sqrt_c = float(std::sqrt(double(C)));
-    const auto anchor_codes = rows_of(o.cast(o.mul(o.cast(o.gather_rows(codebook, anchors, "acb"), DType::F32, "acf"),
-                                                   o.constant(sqrt_c, {1}, "sqc"), "acs"), DType::BF16, "acodes"), 1, "acsl");  // B x [1, C]
+    const auto anchor_codes = o.cast(o.mul(o.cast(o.gather_rows(codebook, anchors, "acb"), DType::F32, "acf"),
+                                           o.constant(sqrt_c, {1}, "sqc"), "acs"), DType::BF16, "acodes");  // [B, C]
     const auto x0 = o.gather_rows(in("embed", DType::BF16, {V, H}), in("ids", DType::I32, {BT}), "x0");
     TensorId residual = x0;
     TensorId x_in = o.rms_norm(x0, W(Lw(0, "input_layernorm.weight"), {H}), eps_, false, "in0");
-    TensorId st_raw = kNoTensor, st_rms = kNoTensor, st_packed = kNoTensor;
+    TensorId st_raw = kNoTensor, st_rms = kNoTensor, st_ms = kNoTensor, st_packed = kNoTensor;
     const auto scale = o.constant(float(1.0 / std::sqrt(double(D))), {1}, "scale");
     auto LIN = [&](TensorId x, const std::string& wn, uint64_t Nw, uint64_t Kw, const std::string& nm) {
         if (w8_on_) return o.fp8_linear(x, in(wn + ".f8", DType::F8, {Nw, Kw}), in(wn + ".s8", DType::F32, {Nw}), nm);
@@ -641,97 +875,128 @@ Recipe& DSpine::block_batch_recipe(uint32_t B, bool sampled) {
     };
     for (uint32_t L = 0; L < layers_; ++L) {
         const std::string p = "L" + std::to_string(L) + ".";
-        const auto q = rope_full(o, o.rms_norm(o.reshape(LIN(x_in, Lw(L, "self_attn.q_proj.weight"), NH * D, H, p + "q"),
-                                                         {BT, NH, D}, p + "q3"),
-                                               W(Lw(L, "self_attn.q_norm.weight"), {D}), eps_, false, p + "qn"),
-                                 cosv, sinv, D, p + "qr");
-        const auto k = rope_full(o, o.rms_norm(o.reshape(LIN(x_in, Lw(L, "self_attn.k_proj.weight"), KV * D, H, p + "k"),
-                                                         {BT, KV, D}, p + "k3"),
-                                               W(Lw(L, "self_attn.k_norm.weight"), {D}), eps_, false, p + "kn"),
-                                 cosv, sinv, D, p + "kr");
-        const auto v = o.reshape(LIN(x_in, Lw(L, "self_attn.v_proj.weight"), KV * D, H, p + "v"), {BT, KV, D}, p + "v3");
-        const auto qs = rows_of(q, T, p + "qsl"), ks = rows_of(k, T, p + "ksl"), vs = rows_of(v, T, p + "vsl");
-        std::vector<TensorId> atts;
-        for (uint32_t b = 0; b < B; ++b) {  // as block_recipe, against slot b's ring
-            const std::string pb = p + "b" + std::to_string(b) + ".";
-            const auto q4 = o.reshape(o.transpose(qs[b], {1, 0, 2}, pb + "qt"), {KV, G * T, D}, pb + "q4");
-            const auto kb = o.transpose(ks[b], {1, 0, 2}, pb + "kt");
-            const auto vb = o.transpose(vs[b], {1, 0, 2}, pb + "vt");
-            const auto kc = in(p + "kc" + std::to_string(b), DType::BF16, {KV, Sb, D});
-            const auto vc = in(p + "vc" + std::to_string(b), DType::BF16, {KV, Sb, D});
-            const auto qsc = o.cast(o.mul(o.cast(q4, DType::F32, pb + "qf"), scale, pb + "qm"), DType::BF16, pb + "qsb");
-            // ring part in BF16 (scores, mask, exp), the block's 16 columns in F32
-            const auto s1 = o.add(o.reshape(o.batch_gemm(qsc, kc, pb + "sc", false, true, DType::BF16), {KV, G, T, Sb}, pb + "s14"),
-                                  ring_masks[b], pb + "s1m");
-            const auto s2 = o.add(o.reshape(o.batch_gemm(qsc, kb, pb + "sn", false, true, DType::F32), {KV, G, T, T}, pb + "s24"),
-                                  causal4, pb + "s2m");
-            const auto m = o.binary("max", o.cast(o.reduce("max", s1, 3, pb + "m1"), DType::F32, pb + "m1f"),
-                                    o.reduce("max", s2, 3, pb + "m2"), pb + "mm");                       // [KV, G, T, 1]
-            const auto p1 = o.unary("exp", o.sub(s1, o.cast(m, DType::BF16, pb + "mb"), pb + "d1"), pb + "p1");  // BF16
-            const auto p2 = o.unary("exp", o.sub(s2, m, pb + "d2"), pb + "p2");
-            const auto l = o.add(o.cast(o.reduce("sum", p1, 3, pb + "l1"), DType::F32, pb + "l1f"), o.reduce("sum", p2, 3, pb + "l2"),
-                                 pb + "l");
-            const auto o1 = o.batch_gemm(o.reshape(p1, {KV, G * T, Sb}, pb + "p13"), vc, pb + "oc", false, false, DType::F32);
-            const auto o2 = o.batch_gemm(o.cast(o.reshape(p2, {KV, G * T, T}, pb + "p23"), DType::BF16, pb + "p2b"), vb, pb + "on", false,
-                                         false, DType::F32);
-            const auto att3 = o.div(o.add(o1, o2, pb + "ao"), o.reshape(l, {KV, G * T, 1}, pb + "l3"), pb + "an");
-            atts.push_back(o.reshape(o.transpose(o.reshape(o.cast(att3, DType::BF16, pb + "attb"), {NH, T, D}, pb + "a3"), {1, 0, 2},
-                                                 pb + "at"), {T, NH * D}, pb + "a2"));
+        TensorId qsc_all, kb_all, vb_all;
+        if (!w8_on_ && D == 128) {
+            const auto qkv = o.linear_bf16(x_in, W(p + "qkv_w", {(NH + 2 * KV) * D, H}), p + "qkv");
+            qsc_all = o.temp(p + "qsb", DType::BF16, {BKV, G * T, D});
+            kb_all = o.temp(p + "kbk", DType::BF16, {BKV, T, D});
+            vb_all = o.temp(p + "vbk", DType::BF16, {BKV, T, D});
+            const float qp[2] = {eps_, float(1.0 / std::sqrt(double(D)))};
+            g.op("flashinfer_gaudi_dspine_qkv_prep_bf16_gaudi2",
+                 {qkv, W(Lw(L, "self_attn.q_norm.weight"), {D}), W(Lw(L, "self_attn.k_norm.weight"), {D}), cos2, sin2},
+                 {qsc_all, kb_all, vb_all}, qp, sizeof(qp));
+        } else {
+            TensorId qraw, kraw, vraw;
+            if (w8_on_) {
+                qraw = LIN(x_in, Lw(L, "self_attn.q_proj.weight"), NH * D, H, p + "q");
+                kraw = LIN(x_in, Lw(L, "self_attn.k_proj.weight"), KV * D, H, p + "k");
+                vraw = LIN(x_in, Lw(L, "self_attn.v_proj.weight"), KV * D, H, p + "v");
+            } else {
+                const auto qkv = o.linear_bf16(x_in, W(p + "qkv_w", {(NH + 2 * KV) * D, H}), p + "qkv");
+                const auto qkvs = o.split(qkv, 1, {NH * D, KV * D, KV * D}, p + "qkvs");
+                qraw = qkvs[0];
+                kraw = qkvs[1];
+                vraw = qkvs[2];
+            }
+            const auto q = rope_full(o, o.rms_norm(o.reshape(qraw, {BT, NH, D}, p + "q3"),
+                                                   W(Lw(L, "self_attn.q_norm.weight"), {D}), eps_, false, p + "qn"),
+                                     cosv, sinv, D, p + "qr");
+            const auto k = rope_full(o, o.rms_norm(o.reshape(kraw, {BT, KV, D}, p + "k3"),
+                                                   W(Lw(L, "self_attn.k_norm.weight"), {D}), eps_, false, p + "kn"),
+                                     cosv, sinv, D, p + "kr");
+            const auto v = o.reshape(vraw, {BT, KV, D}, p + "v3");
+            const auto q_all = o.reshape(o.transpose(o.reshape(q, {B, T, NH, D}, p + "q4d"), {0, 2, 1, 3}, p + "qt"),
+                                         {BKV, G * T, D}, p + "qbk");
+            kb_all = o.reshape(o.transpose(o.reshape(k, {B, T, KV, D}, p + "k4d"), {0, 2, 1, 3}, p + "kt"),
+                               {BKV, T, D}, p + "kbk");
+            vb_all = o.reshape(o.transpose(o.reshape(v, {B, T, KV, D}, p + "v4d"), {0, 2, 1, 3}, p + "vt"),
+                               {BKV, T, D}, p + "vbk");
+            qsc_all = o.cast(o.mul(o.cast(q_all, DType::F32, p + "qf"), scale, p + "qm"), DType::BF16, p + "qsb");
         }
-        const auto attn = LIN(cat(atts, p + "atc"), Lw(L, "self_attn.o_proj.weight"), H, NH * D, p + "o");
+        // Batched intra-block attention across all B*KV heads; per-slot batch_gemm only for ring kc/vc
+        const auto s2_all = o.add(o.reshape(o.batch_gemm(qsc_all, kb_all, p + "sn", false, true, DType::F32),
+                                            {BKV, G, T, T}, p + "s24"),
+                                  causal4, p + "s2m");
+        const auto m2_all = o.reduce("max", s2_all, 3, p + "m2");
+        const auto qscs = rows_of(qsc_all, KV, p + "qscs");
+        std::vector<TensorId> s1s(B), m1s(B);
+        for (uint32_t b = 0; b < B; ++b) {
+            const std::string pb = p + "b" + std::to_string(b) + ".";
+            const auto kc = in(p + "kc" + std::to_string(b), DType::BF16, {KV, Sb, D});
+            s1s[b] = o.add(o.reshape(o.batch_gemm(qscs[b], kc, pb + "sc", false, true, DType::BF16), {KV, G, T, Sb}, pb + "s14"),
+                           ring_masks[b], pb + "s1m");
+            m1s[b] = o.reduce("max", s1s[b], 3, pb + "m1");
+        }
+        const auto m_all = o.binary("max", o.cast(cat(m1s, p + "m1c"), DType::F32, p + "m1f"), m2_all, p + "mm");
+        const auto mbs = rows_of(o.cast(m_all, DType::BF16, p + "mb"), KV, p + "mbs");
+        std::vector<TensorId> l1s(B), o1s(B);
+        for (uint32_t b = 0; b < B; ++b) {
+            const std::string pb = p + "b" + std::to_string(b) + ".";
+            const auto vc = in(p + "vc" + std::to_string(b), DType::BF16, {KV, Sb, D});
+            const auto p1 = o.unary("exp", o.sub(s1s[b], mbs[b], pb + "d1"), pb + "p1");
+            l1s[b] = o.reduce("sum", p1, 3, pb + "l1");
+            o1s[b] = o.batch_gemm(o.reshape(p1, {KV, G * T, Sb}, pb + "p13"), vc, pb + "oc", false, false, DType::F32);
+        }
+        const auto p2_all = o.unary("exp", o.sub(s2_all, m_all, p + "d2"), p + "p2");
+        const auto l_all = o.add(o.cast(cat(l1s, p + "l1c"), DType::F32, p + "l1f"),
+                                 o.reduce("sum", p2_all, 3, p + "l2"), p + "l");
+        const auto o2_all = o.batch_gemm(o.cast(o.reshape(p2_all, {BKV, G * T, T}, p + "p23"), DType::BF16, p + "p2b"),
+                                         vb_all, p + "on", false, false, DType::F32);
+        const auto att3_all = o.div(o.add(cat(o1s, p + "o1c"), o2_all, p + "ao"),
+                                    o.reshape(l_all, {BKV, G * T, 1}, p + "l3"), p + "an");
+        const auto att_all = o.reshape(o.transpose(o.reshape(o.cast(att3_all, DType::BF16, p + "attb"),
+                                                             {B, NH, T, D}, p + "a4"),
+                                                   {0, 2, 1, 3}, p + "at"),
+                                       {BT, NH * D}, p + "a2");
+        const auto attn = LIN(att_all, Lw(L, "self_attn.o_proj.weight"), H, NH * D, p + "o");
         const auto hsum = o.add(residual, attn, p + "h");
         const auto x2 = o.rms_norm(hsum, W(Lw(L, "post_attention_layernorm.weight"), {H}), eps_, false, p + "x2");
-        const auto gt = LIN(x2, Lw(L, "mlp.gate_proj.weight"), F, H, p + "gt");
-        const auto up = LIN(x2, Lw(L, "mlp.up_proj.weight"), F, H, p + "up");
-        const auto gs = o.temp(p + "gs", DType::BF16, {BT, F});
-        g.op("silu_fwd_bf16", {gt}, {gs});
-        const auto mlp = LIN(o.mul(gs, up, p + "act"), Lw(L, "mlp.down_proj.weight"), H, F, p + "dn");
-        const auto out = o.add(hsum, mlp, p + "out");
-        // ---- code bridge (per row; the anchor / previous-row structure per slot)
-        const auto f = o.cast(out, DType::F32, p + "bf");
-        const auto ms = o.mul(o.reduce("sum", o.mul(f, f, p + "f2"), 1, p + "fs"), o.constant(1.0f / float(H), {1}, p + "invh"), p + "ms");
-        const auto rms = o.unary("sqrt", o.binary("max", ms, o.constant(kF32Tiny, {1}, p + "tiny"), p + "msc"), p + "rms");
-        const auto beps = o.constant(bridge_eps_, {1}, p + "beps");
-        const auto normalized = o.cast(o.div(f, o.add(rms, beps, p + "re"), p + "nf"), DType::BF16, p + "nb");
-        const auto projected = o.cast(o.linear_bf16(normalized, W("bridge.read." + std::to_string(L), {C, H}), p + "pj"),
-                                      DType::F32, p + "pjf");
-        const auto pn = o.unary("sqrt", o.reduce("sum", o.mul(projected, projected, p + "pj2"), 1, p + "pjs"), p + "pn");
-        const auto codes_all = rows_of(o.cast(o.div(o.mul(projected, o.constant(sqrt_c, {1}, p + "sqc"), p + "pjc"),
-                                                    o.add(pn, beps, p + "pne"), p + "cd"), DType::BF16, p + "cdb"), T, p + "cdsl");
-        std::vector<TensorId> codes;
-        for (uint32_t b = 0; b < B; ++b)
-            codes.push_back(o.concat({anchor_codes[b], o.split(codes_all[b], 0, {1, T - 1}, p + "cs" + std::to_string(b))[1]}, 0,
-                                     p + "codes" + std::to_string(b)));
-        const auto packed = o.linear_bf16(cat(codes, p + "codesc"), packed_w, p + "pk", DType::BF16);  // [BT, 3R]
+        TensorId act;
+        if (w8_on_) {
+            const auto gt = LIN(x2, Lw(L, "mlp.gate_proj.weight"), F, H, p + "gt");
+            const auto up = LIN(x2, Lw(L, "mlp.up_proj.weight"), F, H, p + "up");
+            const auto gs = o.temp(p + "gs", DType::BF16, {BT, F});
+            g.op("silu_fwd_bf16", {gt}, {gs});
+            act = o.mul(gs, up, p + "act");
+        } else {
+            const auto gu = o.linear_bf16(x2, W(p + "gu_w", {2 * F, H}), p + "gu");
+            act = o.temp(p + "act", DType::BF16, {BT, F});
+            g.op("flashinfer_gaudi_silu_and_mul_bf16_gaudi2", {gu}, {act});
+        }
+        const auto mlp = LIN(act, Lw(L, "mlp.down_proj.weight"), H, F, p + "dn");
+        // ---- fused code bridge (4 custom 24-TPC kernels replace ~40 tiny Synapse TPC ops/layer)
+        const auto out = o.temp(p + "out", DType::BF16, {BT, H});
+        const auto normalized = o.temp(p + "nb", DType::BF16, {BT, H});
+        const auto rms = o.temp(p + "rms", DType::F32, {BT, 1});
+        const auto ms = o.temp(p + "ms", DType::F32, {BT, 1});
+        const float norm_p[2] = {1.0f / float(H), bridge_eps_};
+        g.op("flashinfer_gaudi_dspine_bridge_norm_bf16_gaudi2", {hsum, mlp}, {out, normalized, rms, ms}, norm_p, sizeof(norm_p));
+        const auto projected = o.linear_bf16(normalized, W("bridge.read." + std::to_string(L), {C, H}), p + "pj");
+        const auto codes = o.temp(p + "codesc", DType::BF16, {BT, C});
+        const float code_p[2] = {sqrt_c, bridge_eps_};
+        g.op("flashinfer_gaudi_dspine_bridge_codes_bf16_gaudi2", {projected, anchor_codes}, {codes}, code_p, sizeof(code_p));
+        const auto packed = o.linear_bf16(codes, packed_w, p + "pk", DType::BF16);  // [BT, 3R]
         if (L + 1 == layers_) {
             st_raw = out;
             st_rms = rms;
+            st_ms = ms;
             st_packed = packed;
         }
-        const auto qsv = o.split(o.cast(packed, DType::F32, p + "pkf"), 1, {R, R, R}, p + "qsv");
-        const auto q_all = rows_of(qsv[0], T, p + "qall"), s_all = rows_of(qsv[1], T, p + "sall"), v_all = rows_of(qsv[2], T, p + "vall");
-        std::vector<TensorId> msgs;
-        for (uint32_t b = 0; b < B; ++b) {
-            const std::string pb = p + "m" + std::to_string(b);
-            const auto q_next = o.split(q_all[b], 0, {1, T - 1}, pb + "qn1")[1];
-            const auto s_prev = o.split(s_all[b], 0, {T - 1, 1}, pb + "sp1")[0];
-            const auto v_prev = o.split(v_all[b], 0, {T - 1, 1}, pb + "vp1")[0];
-            const auto gate = o.unary("sigmoid", o.add(o.add(q_next, s_prev, pb + "gqs"), gate_b, pb + "gqb"), pb + "gate");
-            msgs.push_back(o.concat({o.constant(0.0f, {1, R}, pb + "z"), o.mul(gate, v_prev, pb + "gv")}, 0, pb + "msg"));
-        }
-        const auto message = o.cast(cat(msgs, p + "msgc"), DType::BF16, p + "msgb");
-        const auto delta = o.cast(o.linear_bf16(message, W("bridge.write." + std::to_string(L), {H, R}), p + "dl"), DType::F32, p + "dlf");
-        const auto out2 = o.cast(o.add(f, o.mul(o.mul(delta, rms, p + "dr"), notanchor, p + "dm"), p + "o2f"), DType::BF16, p + "o2");
+        const auto message = o.temp(p + "msgb", DType::BF16, {BT, R});
+        g.op("flashinfer_gaudi_dspine_bridge_gate_bf16_gaudi2", {packed, gate_b_bf}, {message});
+        const auto delta = o.linear_bf16(message, W("bridge.write." + std::to_string(L), {H, R}), p + "dl");
         const auto next_w = L + 1 < layers_ ? W(Lw(L + 1, "input_layernorm.weight"), {H}) : W("norm.weight", {H});
-        x_in = o.rms_norm(out2, next_w, eps_, false, p + "next");
+        const auto out2 = o.temp(p + "o2", DType::BF16, {BT, H});
+        x_in = o.temp(p + "next", DType::BF16, {BT, H});
+        const float post_p[2] = {1.0f / float(H), eps_};
+        g.op("flashinfer_gaudi_dspine_bridge_post_bf16_gaudi2", {out, delta, rms, next_w}, {out2, x_in}, post_p, sizeof(post_p));
         residual = out2;
     }
     // ---- refinement tail (greedy): rows 1..15 of every slot
     auto tail_rows = [&](TensorId x, const std::string& nm) {
-        std::vector<TensorId> v;
-        const auto parts = rows_of(x, T, nm + "sl");
-        for (uint32_t b = 0; b < B; ++b) v.push_back(o.split(parts[b], 0, {1, N}, nm + std::to_string(b))[1]);
-        return cat(v, nm + "c");
+        const uint64_t cols = o.shape(x).at(1);
+        const auto x3 = o.reshape(x, {B, T, cols}, nm + "3");
+        return o.reshape(o.split(x3, 1, {1, N}, nm + "s")[1], {BN, cols}, nm + "c");
     };
     const auto rows = tail_rows(x_in, "rows");  // [BN, H]
     const auto lm = in("lm_head", DType::BF16, {V, H});
@@ -744,19 +1009,23 @@ Recipe& DSpine::block_batch_recipe(uint32_t B, bool sampled) {
     }
     const auto cand = o.topk2(logits, uint32_t(K), kTopkChunk, in("tk_consts", DType::I32, {V + 2 * BN}), "tk").second;  // [BN, K]
     const auto cand_flat = o.reshape(cand, {BN * K}, "cflat");
-    const auto head_rows = o.reshape(o.cast(o.gather_rows(lm, cand_flat, "hr"), DType::F32, "hrf"), {BN, K, H}, "hr3");
-    const auto raw_n = o.cast(tail_rows(st_raw, "rawn"), DType::F32, "rawf");
+    const auto raw_nb = tail_rows(st_raw, "rawn");  // [BN, H] BF16
+    const auto raw_n = o.cast(raw_nb, DType::F32, "rawf");
     const auto rms_n = o.reshape(tail_rows(st_rms, "rmsn"), {BN, 1, 1}, "rms3");
-    const auto rnw = o.reshape(o.mul(raw_n, o.cast(W("norm.weight", {H}), DType::F32, "nwf"), "rnw"), {BN, 1, H}, "rnw3");
-    const auto base = o.batch_gemm(rnw, head_rows, "base", false, true, DType::F32);  // [BN, 1, K]
-    std::vector<TensorId> sids;
-    {
-        const auto cparts = rows_of(cand, N, "cps");
-        for (uint32_t b = 0; b < B; ++b)
-            sids.push_back(o.concat({anchor16_all[b], o.split(cparts[b], 0, {N - 1, 1}, "cprev" + std::to_string(b))[0]}, 0,
-                                    "sid" + std::to_string(b)));
+    const auto rnw = o.mul(raw_n, o.cast(W("norm.weight", {H}), DType::F32, "nwf"), "rnw");
+    TensorId head_rows = kNoTensor, base = kNoTensor;
+    if (exact_table) {
+        head_rows = o.reshape(o.cast(o.gather_rows(lm, cand_flat, "hr"), DType::F32, "hrf"), {BN, K, H}, "hr3");
+        base = o.batch_gemm(o.reshape(rnw, {BN, 1, H}, "rnw3"), head_rows, "base", false, true, DType::F32);
+    } else {
+        const auto head_rows_b = o.reshape(o.gather_rows(lm, cand_flat, "hr"), {BN, K, H}, "hr3b");
+        base = o.batch_gemm(o.reshape(o.cast(rnw, DType::BF16, "rnwb"), {BN, 1, H}, "rnw3"), head_rows_b, "base", false,
+                            true, DType::F32);
     }
-    const auto sid = o.reshape(cat(sids, "sidc"), {BN * K}, "sidf");
+    const auto cand3 = o.reshape(cand, {B, N, K}, "cand3");
+    const auto cprev = o.split(cand3, 1, {N - 1, 1}, "cprev")[0];
+    const auto a16_3 = o.reshape(in("anchor16", DType::I32, {B, K}), {B, 1, K}, "a16_3");
+    const auto sid = o.reshape(o.concat({a16_3, cprev}, 1, "sidc"), {BN * K}, "sidf");
     const auto tsv = o.reshape(o.cast(o.gather_rows(in("tsv", DType::BF16, {V, 2 * R}), sid, "tsvg"), DType::F32, "tsvf"),
                                {BN, K, 2 * R}, "tsv3");
     const auto tv = o.split(tsv, 2, {R, R}, "tv");
@@ -768,7 +1037,7 @@ Recipe& DSpine::block_batch_recipe(uint32_t B, bool sampled) {
     const auto s = o.batch_gemm(m, tgc, "s", false, true, DType::F32);
     const auto score = o.add(base, o.mul(rms_n, s, "rs"), "score");
     output(g, "idx", o.argmax(score, "best"));  // [BN, K, 1]
-    if (sampled) {  // as block_recipe's sampled tail, for every slot's rows
+    if (sampled && exact_table) {  // as block_recipe's sampled tail, for every slot's rows
         const auto wf = o.cast(W("bridge.write." + std::to_string(layers_ - 1), {H, R}), DType::F32, "wlf");
         const auto upd = o.temp("upd", DType::F32, {BN * K, H});
         g.gemm(o.reshape(m, {BN * K, R}, "mflat"), wf, upd, false, true);
@@ -779,6 +1048,21 @@ Recipe& DSpine::block_batch_recipe(uint32_t B, bool sampled) {
         const auto norm = o.unary("sqrt", o.add(ms, o.constant(eps_, {1}, "neps"), "msn"), "nrm");
         const auto normalized = o.mul(o.div(refined, norm, "rn"), o.cast(W("norm.weight", {H}), DType::F32, "nwf2"), "rnw2");
         output(g, "table", o.batch_gemm(normalized, head_rows, "table_v", false, true, DType::F32));  // [BN, K, K]
+    } else if (sampled) {
+        // table[n, s, c] = score[n, s, c] / sqrt(mean((raw + rms * m @ W^T)^2) + eps)
+        const auto ms_n = o.reshape(tail_rows(st_ms, "msn"), {BN, 1, 1}, "ms3");
+        const auto rw = o.temp("rw", DType::F32, {BN, R});
+        g.gemm(raw_nb, W("bridge.write." + std::to_string(layers_ - 1), {H, R}), rw);
+        const auto cross = o.reduce("sum", o.mul(m, o.reshape(rw, {BN, 1, R}, "rw3"), "mc"), 2, "cross");
+        const auto mw = o.temp("mw", DType::F32, {BN * K, R});
+        g.gemm(o.reshape(m, {BN * K, R}, "mflat"), in("wtw", DType::F32, {R, R}), mw);
+        const auto quad = o.reduce("sum", o.mul(m, o.reshape(mw, {BN, K, R}, "mw3"), "mqd"), 2, "quad");
+        const auto t1 = o.mul(o.mul(rms_n, cross, "rc"), o.constant(2.0f / float(H), {1}, "twoh"), "t1");
+        const auto t2 = o.mul(o.mul(o.mul(rms_n, rms_n, "r2"), quad, "r2q"), o.constant(1.0f / float(H), {1}, "oneh"), "t2");
+        const auto ms_ref = o.add(o.add(ms_n, t1, "m1"), t2, "mref");
+        const auto inv_norm = o.unary("rsqrt", o.add(o.binary("max", ms_ref, o.constant(0.0f, {1}, "z0"), "mpos"),
+                                                     o.constant(eps_, {1}, "neps"), "mep"), "inrm");
+        output(g, "table", o.mul(score, inv_norm, "table_v"));  // [BN, K, K]
     }
     auto r = g.compile(key);
     return *(recipes_[key] = std::move(r));
@@ -851,12 +1135,15 @@ std::vector<DSpine::BatchDraft> DSpine::draft_batch_full(std::span<const uint32_
     auto& r = block_batch_recipe(B, tables);
     std::vector<Binding> bnd = {{"ids", &ctlb_, kBIds},     {"rope_pos", &ctlb_, kBRope}, {"anchor", &ctlb_, kBAnchor},
                                 {"anchor16", &ctlb_, kBAnchor16}, {"posm1", &ctlb_, kBPosm1}, {"lo", &ctlb_, kBLo},
-                                {"notanchor", &ctlb_, kBNotAnchor}, {"sp", &ctlb_, kBSp},
+                                {"sp", &ctlb_, kBSp},
                                 {"cos_tab", &cos_tab_, 0},  {"sin_tab", &sin_tab_, 0},  {"causal", &causal_, 0},
                                 tw_.bind("embed", "embed"), {"tg", &tg_, 0},          {"tsv", &tsv_, 0},
                                 tw_.bind("lm_head", "lm_head"), {"cand", &out_idx_, 0}, {"idx", &out_idx_, 8192},
                                 {"tk_consts", &tk, 0}};
-    if (tables) bnd.push_back({"table", &out_idx_, 16384});
+    if (tables) {
+        bnd.push_back({"table", &out_idx_, 16384});
+        if (!std::getenv("G2E_DRAFT_EXACT_TABLE")) bnd.push_back({"wtw", &wtw_, 0});
+    }
     if (lm8_on_) {
         bnd.push_back({"lm8", &lm8_, 0});
         bnd.push_back({"lm8s", &lm8s_, 0});
@@ -865,8 +1152,14 @@ std::vector<DSpine::BatchDraft> DSpine::draft_batch_full(std::span<const uint32_
         if (w_.has(t.name)) bnd.push_back(w_.bind(t.name, t.name));
         else if (auto it = w8_off_.find(t.name); it != w8_off_.end()) bnd.push_back({t.name, &w8_, it->second});
     }
+    const uint64_t qkv_layer = (uint64_t(heads_) + 2 * kv_heads_) * head_dim_ * hidden_ * 2;
+    const uint64_t gu_layer = 2 * uint64_t(inter_) * hidden_ * 2;
     for (uint32_t L = 0; L < layers_; ++L) {
         const std::string p = "L" + std::to_string(L) + ".";
+        if (!w8_on_) {
+            bnd.push_back({p + "qkv_w", &qkv_w_, L * qkv_layer});
+            bnd.push_back({p + "gu_w", &gu_w_, L * gu_layer});
+        }
         for (uint32_t b = 0; b < B; ++b) {
             const Seq& q = seqs_[slots[b]];
             bnd.push_back({p + "kc" + std::to_string(b), &q.k[L], 0});
@@ -962,10 +1255,11 @@ void DSpine::run_block(int32_t anchor, uint32_t pos, bool sampled) {
              tw_.bind("embed", "embed"),
              {"sp", &ctl_, 4096},    {"posm1", &ctl_, 1024},  {"lo", &ctl_, 1152},  {"causal", &causal_, 0},
              {"anchor", &ctl_, 0},   {"anchor16", &ctl_, 128},
-             {"notanchor", &ctl_, 256}, {"tg", &tg_, 0},       {"tsv", &tsv_, 0},
+             {"tg", &tg_, 0},       {"tsv", &tsv_, 0},
              tw_.bind("lm_head", "lm_head"), {"cand", &out_idx_, 0},
              {sampled ? "table" : "idx", &out_idx_, 4096},
              {"tk_consts", &topk_aux_, 0}};
+        if (sampled && !std::getenv("G2E_DRAFT_EXACT_TABLE")) b.push_back({"wtw", &wtw_, 0});
         if (lm8_on_) {
             b.push_back({"lm8", &lm8_, 0});
             b.push_back({"lm8s", &lm8s_, 0});
@@ -974,8 +1268,14 @@ void DSpine::run_block(int32_t anchor, uint32_t pos, bool sampled) {
             if (w_.has(t.name)) b.push_back(w_.bind(t.name, t.name));
             else if (auto it = w8_off_.find(t.name); it != w8_off_.end()) b.push_back({t.name, &w8_, it->second});
         }
+        const uint64_t qkv_layer = (uint64_t(heads_) + 2 * kv_heads_) * head_dim_ * hidden_ * 2;
+        const uint64_t gu_layer = 2 * uint64_t(inter_) * hidden_ * 2;
         for (uint32_t L = 0; L < layers_; ++L) {
             const std::string p = "L" + std::to_string(L) + ".";
+            if (!w8_on_) {
+                b.push_back({p + "qkv_w", &qkv_w_, L * qkv_layer});
+                b.push_back({p + "gu_w", &gu_w_, L * gu_layer});
+            }
             b.push_back({p + "kc", &k_cache_[L], 0});
             b.push_back({p + "vc", &v_cache_[L], 0});
         }

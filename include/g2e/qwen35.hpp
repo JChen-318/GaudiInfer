@@ -84,6 +84,10 @@ public:
     // token) whose accept() commits exactly its rows; the logits of its last row (when wanted) from the verified
     // rows. Replaces the power-of-two pieces (up to 4 forwards, each reading every weight and the whole context).
     std::vector<float> forward_short(std::span<const int32_t> tokens, bool logits = true);
+    // A non-power-of-two prefill piece (17..511 tokens) in one forward padded to T_pad (32..512): GDN rows >= n
+    // get zero beta/decay so recurrent state S is mathematically exact, conv_out is gathered at [n..n+KC-2], and
+    // head_recipe reads row n - 1. Eliminates multiple tail forwards on agent turns and unaligned prompts.
+    std::vector<float> forward_padded(std::span<const int32_t> tokens, uint32_t T_pad, bool logits = true);
     // Speculative verification: run `tokens` (anchor + drafts) at the current position and return each row's
     // greedy next token. Nothing is committed except scratch; accept(a) then commits rows 0..a (a+1 tokens):
     // the GDN states are recomputed for the accepted prefix, the conv windows re-gathered, pos += a + 1.
@@ -122,7 +126,7 @@ public:
     static constexpr uint32_t kTopkChunk = 128;  // Ops::topk2 chunk of the verification top-k
     static constexpr uint64_t kAcceptStage = 512u << 10;  // staging offset of accept()'s controls
     static constexpr uint64_t kIdsStage = 768u << 10;     // token ids of a forward (ids_ layout)
-    static constexpr uint64_t kTempStage = kIdsStage + (64u << 10);  // verify_topk's 1/T
+    static constexpr uint64_t kTempStage = kIdsStage + (128u << 10);  // verify_topk's 1/T
     struct VerifyTop {
         std::vector<int32_t> ids;     // [T, kTopK]
         std::vector<float> values;    // [T, kTopK] scaled logits
@@ -200,6 +204,12 @@ private:
     bool attn_split(uint32_t T) const;
     Recipe& attn_pre_recipe(uint32_t T);
     Recipe& attn_post_recipe(uint32_t T, uint32_t Sb);
+    // Long-context SRAM-tiled FP8 prefill SDPA (Pn = Sb - W > 8192): reusable O(1) chunk recipes (6144/4096/8192)
+    // + one Sb-independent tail+MLP recipe, keeping SDPA tiles inside 48 MiB SRAM (~1.55x faster at 65K-262K).
+    bool fp8_chunked(uint32_t T, uint32_t Sb) const;
+    Recipe& attn_fp8_chunk_recipe(uint32_t T, uint32_t C, bool is_first);
+    Recipe& attn_post_chunked_tail_recipe(uint32_t T);
+    void ensure_fp8_chunk_bufs();
     // batched verification (verify_batch): B slots x kSpecMaxT rows
     Recipe& gdn_batch_recipe(uint32_t B, uint32_t T);
     Recipe& apre_batch_recipe(uint32_t B, uint32_t T);
@@ -221,16 +231,20 @@ private:
     static uint32_t core_bucket(uint32_t rows);  // 1024, 2048, 3072, 4096, 6144, 8192, 12288, ... (x1.5 / x2 steps)
     DeviceBuffer att_;  // batched attention outputs [kMaxBatch * kSpecMaxT, NH * D]
     DeviceBuffer apre_q_, apre_g_, apre_r_;  // scratch between the two launches
+    std::unique_ptr<DeviceBuffer> fp8_q8_, fp8_o_[2], fp8_m_[2], fp8_l_[2];  // lazy ping-pong accumulators for chunked FP8 SDPA
     bool fused_gate_quant() const;
     bool gated_kernel() const;
     uint32_t gdn_chunk() const;
-    void run_layers(std::span<const int32_t> tokens, bool spec, std::vector<std::vector<uint16_t>>* dump);
+    void run_layers(std::span<const int32_t> tokens, bool spec, std::vector<std::vector<uint16_t>>* dump,
+                    uint32_t valid_n = 0);
     // field-major stash: field f of GDN layer s at base[f] + s * size[f] (fields q, k, v, g, b, seq)
     struct StashLayout { uint64_t base[6], size[6]; };
     StashLayout stash_layout(uint32_t T, bool wy) const;  // wy: X = [k; q] in field 0 (the WY verification)  // scratch K/V rows of every attention layer -> caches
     Pair gdn_layer(Ops& o, uint32_t j, uint32_t T, Pair in, uint32_t B = 1);  // B > 1: batched verification
     Pair attention_layer(Ops& o, uint32_t j, uint32_t T, uint32_t bucket, Pair in);
     Pair mlp(Ops& o, uint32_t j, TensorId y, TensorId s);
+    Pair proj_mlp(Ops& o, uint32_t j, TensorId codes, TensorId scale, TensorId w, TensorId ws, TensorId s,
+                  const std::string& proj_name, bool fold_out_dq);
     // Chunked gated delta rule over C (power of two, >= 8) rows; state [HV, DV, DK]; returns core [C, HV, DV] f32.
     // q,k [C,HK,DK], v [C,HV,DV], g/beta [C,HV] f32, state [HV,DV,DK]; HK/HV may cover several layers at once.
     std::pair<TensorId, TensorId> gdn_chunk(Ops& o, const std::string& prefix, uint32_t C, uint64_t HK, uint64_t HV,
@@ -266,10 +280,12 @@ private:
     std::vector<Seq> seqs_;      // seqs_[active_slot_] is empty: its state is in the members
     uint32_t active_slot_ = 0;
     void swap_seq(Seq& s);
-    static constexpr uint32_t kMaxT = 2048;     // tokens per forward (prefill chunk)
+    static constexpr uint32_t kMaxT = 4096;     // tokens per forward (prefill chunk)
     // ids_ layout: token ids [kMaxT] i32 at 0, pos - 1 (f32) at kIdsPosm1, last visible rows [T] i32 at kIdsLast
-    static constexpr uint64_t kIdsPosm1 = uint64_t(kMaxT) * 4, kIdsLast = kIdsPosm1 + 128;
+    static constexpr uint64_t kIdsPosm1 = uint64_t(kMaxT) * 4, kIdsPosm1H1 = kIdsPosm1 + 128, kIdsLast = kIdsPosm1H1 + 128;
     static constexpr uint64_t kIdsRopePos = kIdsLast + uint64_t(kMaxT) * 4;  // batched forwards: every row's RoPE position [rows] i32
+    static constexpr uint64_t kIdsPadMask = kIdsRopePos + uint64_t(kMaxT) * 4;  // padded prefill: [T, 1] f32 mask (1 valid, 0 pad)
+    static constexpr uint64_t kIdsConvRows = kIdsPadMask + uint64_t(kMaxT) * 4; // padded prefill: [KC - 1] i32 gather indices
     static constexpr uint32_t kSpecMaxT = 16;   // verification width
     std::map<std::string, std::unique_ptr<Recipe>> recipes_;
     std::unique_ptr<Recipe> head_;
@@ -320,6 +336,7 @@ private:
     int building_debug_j_ = -1;
     TensorId idx_t_ = kNoTensor, acc_t_ = kNoTensor;
     bool building_spec_ = false;  // block-shared i32 constants while building
+    bool building_padded_ = false;  // masked GDN prefill recipe (pad_mask + conv_rows)
     std::vector<std::string> debug_points_;
     uint32_t layer_limit_ = 0;
     std::map<std::string, DeviceBuffer> dbg_bufs_;
@@ -328,6 +345,15 @@ private:
     bool profile_ = false;
     Profile prof_;
     std::vector<std::unique_ptr<Event>> prof_ev_;
+    struct DirectShared;
+    struct DirectBatchState;
+    std::unique_ptr<DirectShared> direct_shared_;
+    std::unique_ptr<DirectBatchState> direct_b8_;
+    std::map<uint32_t, std::unique_ptr<DirectBatchState>> direct_b1_cache_;
+    bool ensure_direct_shared(uint32_t nl);
+    bool ensure_direct_plan(std::unique_ptr<DirectBatchState>& dst, uint32_t B, std::array<uint32_t, 8> slot_caps);
+    bool ensure_direct_b8(std::array<uint32_t, 8> slot_caps);
+    DirectBatchState* ensure_direct_b1(uint32_t slot_cap, uint32_t cur_pos);
 };
 
 }  // namespace g2e

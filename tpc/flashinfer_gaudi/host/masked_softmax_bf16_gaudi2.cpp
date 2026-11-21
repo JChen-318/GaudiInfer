@@ -9,11 +9,14 @@ extern unsigned char _binary_masked_softmax_bf16_gaudi2_o_start;
 extern unsigned char _binary_masked_softmax_bf16_gaudi2_o_end;
 extern unsigned char _binary_masked_softmax_f16_gaudi2_o_start;
 extern unsigned char _binary_masked_softmax_f16_gaudi2_o_end;
+extern unsigned char _binary_masked_softmax_bf16_f8_gaudi2_o_start;
+extern unsigned char _binary_masked_softmax_bf16_f8_gaudi2_o_end;
 
 namespace {
 tpc_lib_api::GlueCodeReturn masked_softmax_glue(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out,
                                                tpc_lib_api::TensorDataType score_type, unsigned char* elf_start,
-                                               unsigned char* elf_end, bool maxes = false)
+                                               unsigned char* elf_end, bool maxes = false,
+                                               tpc_lib_api::TensorDataType p_type = tpc_lib_api::DATA_BF16)
 {
     using namespace tpc_lib_api;
     const unsigned nout = maxes ? 3 : 2;
@@ -23,7 +26,7 @@ tpc_lib_api::GlueCodeReturn masked_softmax_glue(tpc_lib_api::HabanaKernelParams*
     const auto& last = in->inputTensors[1].geometry;
     const auto& p = in->outputTensors[0].geometry;
     const auto& sum = in->outputTensors[1].geometry;
-    if (s.dataType != score_type || last.dataType != DATA_I32 || p.dataType != DATA_BF16 || sum.dataType != DATA_F32)
+    if (s.dataType != score_type || last.dataType != DATA_I32 || p.dataType != p_type || sum.dataType != DATA_F32)
         return GLUE_INCOMPATIBLE_DATA_TYPE;
     const uint64_t S = s.maxSizes[0], R = s.maxSizes[1], T = last.maxSizes[0];
     if (s.dims != 2 || S % 128 || !R || last.dims != 1 || !T || R % T) return GLUE_INCOMPATIBLE_INPUT_SIZE;
@@ -85,4 +88,11 @@ tpc_lib_api::GlueCodeReturn MaskedSoftmaxF16Gaudi2::GetGcDefinitions(tpc_lib_api
 {
     return masked_softmax_glue(in, out, tpc_lib_api::DATA_F16, &_binary_masked_softmax_f16_gaudi2_o_start,
                                &_binary_masked_softmax_f16_gaudi2_o_end);
+}
+
+tpc_lib_api::GlueCodeReturn MaskedSoftmaxBf16F8Gaudi2::GetGcDefinitions(tpc_lib_api::HabanaKernelParams* in,
+                                                                        tpc_lib_api::HabanaKernelInstantiation* out)
+{
+    return masked_softmax_glue(in, out, tpc_lib_api::DATA_BF16, &_binary_masked_softmax_bf16_f8_gaudi2_o_start,
+                               &_binary_masked_softmax_bf16_f8_gaudi2_o_end, false, tpc_lib_api::DATA_F8_143);
 }

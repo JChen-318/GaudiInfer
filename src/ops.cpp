@@ -281,13 +281,16 @@ std::pair<TensorId, TensorId> Ops::topk(TensorId x, uint32_t k, const std::strin
     return {values, idx};
 }
 
-std::pair<TensorId, TensorId> Ops::topk2(TensorId x, uint32_t k, uint32_t chunk, TensorId consts, const std::string& name) {
+std::pair<TensorId, TensorId> Ops::topk2(TensorId x, uint32_t k, uint32_t chunk, TensorId consts, const std::string& name,
+                                         TensorId precomputed_cmax) {
     const Shape s = shape(x);
     if (s.size() != 2 || s[1] % chunk || s[1] / chunk < k) throw std::invalid_argument("topk2: [R, V], V % chunk == 0");
     const uint64_t R = s[0], V = s[1], nc = V / chunk, K = k;
     const auto cp = split(consts, 0, {V, R, R}, name + "_c");  // iota, r * nc, r * k * chunk
     const auto x2 = reshape(x, {R * nc, chunk}, name + "_x2");
-    const auto cmax = reshape(reduce("max", reshape(x, {R, nc, chunk}, name + "_x3"), 2, name + "_cm"), {R, nc}, name + "_cm2");
+    const auto cmax = precomputed_cmax != kNoTensor
+                          ? precomputed_cmax
+                          : reshape(reduce("max", reshape(x, {R, nc, chunk}, name + "_x3"), 2, name + "_cm"), {R, nc}, name + "_cm2");
     const auto ci = topk(cmax, k, name + "_1").second;                                                    // [R, k] chunks
     const auto rows = reshape(add(ci, reshape(cp[1], {R, 1}, name + "_r1"), name + "_cr"), {R * K}, name + "_crf");
     const auto vals = reshape(gather_rows(x2, rows, name + "_gv"), {R, K * chunk}, name + "_gv2");      // their values
@@ -339,18 +342,48 @@ struct AddRmsNormQuantParams {  // tpc/flashinfer_gaudi/norm_quant_params.h
 constexpr float kInverseRangeBf16 = 0.004180908203125f;  // bf16(1/240), as vLLM's row quantization
 }  // namespace
 
-Ops::NormQuant Ops::add_rmsnorm_quant(TensorId x, TensorId residual, TensorId w, float eps, const std::string& name) {
+Ops::NormQuant Ops::add_rmsnorm_quant(TensorId x, TensorId residual, TensorId w, float eps, const std::string& name,
+                                      bool need_normalized) {
     const Shape s = shape(x);
     if (s.size() != 2 || dtype(x) != DType::BF16 || dtype(residual) != DType::BF16 || dtype(w) != DType::BF16)
         throw std::invalid_argument("g2e add_rmsnorm_quant: BF16 [rows, width] at " + name);
     NormQuant r;
     r.codes = temp(name + "_codes", DType::F8, s);
     r.scale = temp(name + "_scale", DType::F32, {s[0], 1});
-    r.normalized = temp(name + "_norm", DType::BF16, s);
     r.residual_out = temp(name + "_res", DType::BF16, s);
     AddRmsNormQuantParams p{eps, 1.0f / float(s[1]), kInverseRangeBf16};
-    g_.op("flashinfer_gaudi_add_rmsnorm_quant_bf16_gaudi2", {x, residual, w},
-          {r.codes, r.scale, r.normalized, r.residual_out}, &p, sizeof(p));
+    if (!need_normalized && s[1] <= 8192) {
+        r.normalized = kNoTensor;
+        g_.op("flashinfer_gaudi_add_rmsnorm_quant_bf16_gaudi2", {x, residual, w},
+              {r.codes, r.scale, r.residual_out}, &p, sizeof(p));
+    } else {
+        r.normalized = temp(name + "_norm", DType::BF16, s);
+        g_.op("flashinfer_gaudi_add_rmsnorm_quant_bf16_gaudi2", {x, residual, w},
+              {r.codes, r.scale, r.normalized, r.residual_out}, &p, sizeof(p));
+    }
+    return r;
+}
+
+Ops::NormQuant Ops::fp8_gemm_add_rmsnorm_quant(TensorId codes, TensorId scale, TensorId w, TensorId ws,
+                                               TensorId residual, TensorId norm_w, float eps, const std::string& name) {
+    const Shape cs = shape(codes), wsh = shape(w);
+    if (cs.size() != 2 || wsh.size() != 2 || cs[1] != wsh[1] || dtype(codes) != DType::F8 || dtype(w) != DType::F8)
+        throw std::invalid_argument("g2e fp8_gemm_add_rmsnorm_quant at " + name);
+    const uint64_t M = cs[0], N = wsh[0];
+    const auto raw = temp(name + "_raw", DType::BF16, {M, N});
+    ns_Fp8Gemm::ParamsV2 gp{};
+    gp.transpose_a = false;
+    gp.transpose_b = true;
+    g_.op("fp8_gemm_bf16", {codes, w, kNoTensor, kNoTensor, kNoTensor, kNoTensor, kNoTensor}, {raw}, &gp, sizeof(gp));
+    NormQuant r;
+    r.codes = temp(name + "_codes", DType::F8, {M, N});
+    r.scale = temp(name + "_scale", DType::F32, {M, 1});
+    r.normalized = kNoTensor;
+    r.residual_out = temp(name + "_res", DType::BF16, {M, N});
+    AddRmsNormQuantParams p{eps, 1.0f / float(N), kInverseRangeBf16};
+    g_.op("flashinfer_gaudi_add_rmsnorm_quant_bf16_gaudi2",
+          {raw, scale, cast(ws, DType::BF16, name + "_wsb"), residual, norm_w},
+          {r.codes, r.scale, r.residual_out}, &p, sizeof(p));
     return r;
 }
 
@@ -403,10 +436,15 @@ std::pair<TensorId, TensorId> Ops::mul_quant(TensorId a, TensorId b, const std::
     const Shape s = shape(a);
     if (s.size() != 2 || shape(b) != s || dtype(a) != DType::BF16 || dtype(b) != DType::BF16)
         throw std::invalid_argument("g2e mul_quant: a, b BF16 [M,F] at " + name);
-    const auto ab = concat({a, b}, 1, name + "_ab");
+    static const bool old_smq = std::getenv("G2E_OLD_SMQ") != nullptr;
     const auto codes = temp(name + "_codes", DType::F8, s);
     const auto scale = temp(name + "_scale", DType::F32, {s[0], 1});
-    g_.op("flashinfer_gaudi_silu_mul_quant_bf16_gaudi2", {ab, a}, {codes, scale});
+    if (old_smq) {
+        const auto ab = concat({a, b}, 1, name + "_ab");
+        g_.op("flashinfer_gaudi_silu_mul_quant_bf16_gaudi2", {ab, a}, {codes, scale});
+    } else {
+        g_.op("flashinfer_gaudi_silu_mul_quant_bf16_gaudi2", {b, a}, {codes, scale});
+    }
     return {codes, scale};
 }
 

@@ -70,9 +70,11 @@ void PrefixCache::pinner() {
         int k = -1;
         bool trim = false;
         for (int c = 0; c < 2 && k < 0; ++c)
-            if (spare_[c].size() < kSpares[c]) k = c;
-        for (int c = 0; c < 2 && k < 0; ++c)  // evictions of the other kind piled up: unpin the excess
-            if (spare_[c].size() > 2 * kSpares[c]) k = c, trim = true;
+            if (spare_[c].size() < spare_target_[c]) k = c;
+        for (int c = 0; c < 2 && k < 0; ++c) {  // evictions of the other kind piled up: unpin the excess
+            const size_t hi = std::max(2 * kSpares[c], spare_target_[c] + kSpares[c]);
+            if (spare_[c].size() > hi) k = c, trim = true;
+        }
         if (k < 0) {
             spare_cv_.wait_for(lk, std::chrono::milliseconds(200));
             continue;
@@ -236,27 +238,48 @@ void PrefixCache::snapshot(const std::vector<int32_t>& tokens, uint32_t n) {
     insert(std::move(it));
 }
 
+void PrefixCache::prepare_chunks(size_t count) {
+    if (!class_bytes_[0] || !host_budget_) return;
+    const size_t cap = std::min<size_t>(128, size_t(host_budget_ / class_bytes_[0]));
+    const size_t want = std::min(std::max(count, kSpares[0]), cap);
+    {
+        std::lock_guard lk(spare_mu_);
+        if (want <= spare_target_[0]) return;
+        spare_target_[0] = want;
+    }
+    spare_cv_.notify_one();
+}
+
 void PrefixCache::save(const std::vector<int32_t>& tokens) {
     const uint32_t n = uint32_t(tokens.size());
     if (n < kMinTokens || model_.position() != n) return;
     const uint64_t chunk_bytes = uint64_t(kChunk) * model_.kv_row_bytes();
     uint64_t h = kSeed;
+    std::vector<std::pair<uint32_t, uint64_t>> missing;
     for (uint32_t c = 0; c < n / kChunk; ++c) {
         h = chain(h, tokens.data() + uint64_t(c) * kChunk, kChunk);
-        if (Item* k = find(false, h)) {
-            touch(*k);
-            continue;
-        }
+        if (Item* k = find(false, h)) touch(*k);
+        else missing.emplace_back(c, h);
+    }
+    // Make room once upfront for the whole batch (at most one stream sync and recycled chunk buffers ready in spare_[0]).
+    const uint64_t total_need = uint64_t(missing.size()) * class_bytes_[0] + class_bytes_[1];
+    const bool batch_evict = total_need <= host_budget_;
+    if (batch_evict) make_room(total_need);
+    for (const auto& [c, kh] : missing) {
         auto it = std::make_unique<Item>();
-        it->key = h;
+        it->key = kh;
         it->pos = c * kChunk;
         it->bytes = chunk_bytes;
-        make_room(class_bytes_[0]);
+        if (!batch_evict) make_room(class_bytes_[0]);
         it->host = alloc(false);
         model_.save_kv(c * kChunk, kChunk, *it->host, 0);
         insert(std::move(it));
     }
     snapshot(tokens, n);
+    {
+        std::lock_guard lk(spare_mu_);
+        spare_target_[0] = kSpares[0];
+    }
 }
 
 uint32_t PrefixCache::restore(const std::vector<int32_t>& prompt) {

@@ -49,6 +49,8 @@ public:
     void save(const std::vector<int32_t>& tokens);
     // a snapshot only (no KV chunks: their rows stay in the caches until save() of the request copies them)
     void snapshot(const std::vector<int32_t>& tokens, uint32_t n);
+    // hint the background pinner to keep at least `count` chunk buffers pinned ahead (for a long prefill in flight)
+    void prepare_chunks(size_t count);
 
     struct Stats {
         uint64_t host_bytes = 0, disk_bytes = 0;
@@ -98,7 +100,8 @@ private:
     std::unordered_map<uint64_t, std::unique_ptr<Item>> items_;  // by item_id
     std::list<uint64_t> lru_;
     uint64_t class_bytes_[2] = {0, 0};                       // chunk, snapshot (with a full tail)
-    static constexpr size_t kSpares[2] = {16, 6};             // kept pinned ahead (2 GiB of chunks, ~1.7 GiB of snapshots)
+    static constexpr size_t kSpares[2] = {32, 8};             // kept pinned ahead (4 GiB of chunks, ~2.2 GiB of snapshots)
+    size_t spare_target_[2] = {kSpares[0], kSpares[1]};       // raised on demand for long prefills (65K-262K)
     std::vector<std::unique_ptr<HostBuffer>> spare_[2];
     mutable std::mutex spare_mu_;
     std::condition_variable spare_cv_;

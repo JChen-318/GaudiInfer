@@ -1,6 +1,8 @@
 #include "g2e/qwen35.hpp"
 
 #include <perf_lib_layer_params.h>
+#include "g2e/direct_attn.hpp"
+#include "g2e/direct_gdn.hpp"
 #include "g2e/gdn.hpp"
 #include "g2e/numeric.hpp"
 
@@ -61,6 +63,22 @@ void output(GraphBuilder& g, const std::string& name, TensorId src) {
 std::string L(uint32_t i, const char* part) { return "L" + std::to_string(i) + "." + part; }
 std::string P(uint32_t j, const std::string& part) { return "l" + std::to_string(j) + "." + part; }
 uint64_t align128(uint64_t x) { return (x + 127) & ~uint64_t(127); }
+bool fast_commit() {
+    static const bool old = std::getenv("G2E_OLD_COMMIT") != nullptr;
+    return !old;
+}
+bool fast_f8_softmax() {
+    static const bool old = std::getenv("G2E_KV_FP8_OLD_SM") != nullptr;
+    return !old;
+}
+bool fast_apre() {
+    static const bool old = std::getenv("G2E_OLD_APRE") != nullptr;
+    return !old;
+}
+bool fast_gdn_prep() {
+    static const bool on = std::getenv("G2E_BATCH_GDN_PREP") != nullptr;
+    return on;
+}
 }  // namespace
 
 Qwen35::Qwen35(const Device& device, const Stream& stream, const WeightPack& weights, uint32_t max_context,
@@ -101,7 +119,7 @@ Qwen35::Qwen35(const Device& device, const Stream& stream, const WeightPack& wei
             stream_.synchronize();
         }
     }
-    ids_ = DeviceBuffer(dev_, kIdsRopePos + kMaxT * 4);  // ids, posm1, last visible rows, RoPE positions
+    ids_ = DeviceBuffer(dev_, kIdsConvRows + 128);  // ids, posm1, last visible rows, RoPE positions, pad_mask, conv_rows
     rope_cs_ = DeviceBuffer(dev_, 2ull * kMaxT * (cfg_.rotary_dim / 2) * 4);
     quantize_lm_head();
     mrope_section_ = cfg_.mrope_section;
@@ -158,6 +176,34 @@ Qwen35::Qwen35(const Device& device, const Stream& stream, const WeightPack& wei
     stream_.synchronize();
     reset();
 }
+struct Qwen35::DirectShared {
+    bool failed = false;
+    uint32_t built_limit = 0;
+    std::unique_ptr<DirectRuntime> rt;
+    DirectAttnAssets attn_assets;
+    DeviceBuffer scales_buf;
+    DeviceBuffer ones_buf;
+    std::map<std::string, uint64_t> sc_off;
+};
+
+struct Qwen35::DirectBatchState {
+    struct Span {
+        int apost_layer = -1;
+        std::vector<uint32_t> gdn_layers;
+        int next_attn_layer = -1;
+        DirectGdnRunArgs args;
+        std::unique_ptr<DirectGdnBlock> block;
+        std::vector<std::pair<std::array<uint32_t, 8>, std::unique_ptr<DirectAttnCore>>> attn_cache;
+        DirectAttnCore* active_attn = nullptr;
+    };
+    bool failed = false;
+    uint32_t built_limit = 0;
+    std::array<uint32_t, 8> built_caps{};
+    DirectGdnAssets assets;
+    std::vector<Span> spans;
+    std::array<std::unique_ptr<DirectGdnCommit>, 9> commits;
+};
+
 Qwen35::~Qwen35() = default;
 
 // Host-prepared weights: Gemma norms as bf16(1 + w), -exp(A_log) in F32, conv taps transposed to [4, C].
@@ -458,6 +504,27 @@ bool Qwen35::fp8_prefill(uint32_t T, uint32_t Sb) const {
 
 uint32_t Qwen35::fp8_tail(uint32_t T) const { return std::max<uint32_t>(4096, T + 2048); }
 
+bool Qwen35::fp8_chunked(uint32_t T, uint32_t Sb) const {
+    static const bool off = std::getenv("G2E_PREFILL_NO_CHUNK_SDPA") != nullptr;
+    static const bool no_fp8 = std::getenv("G2E_PREFILL_NO_FP8") != nullptr;
+    static const bool prefill_sdpa = std::getenv("G2E_PREFILL_SDPA") != nullptr;
+    static const bool force_sdpa = std::getenv("G2E_VERIFY_SDPA") != nullptr;
+    return !off && !no_fp8 && !prefill_sdpa && !force_sdpa &&
+           fp8_prefill(T, Sb) && Sb >= fp8_tail(T) + 10240;
+}
+
+void Qwen35::ensure_fp8_chunk_bufs() {
+    if (fp8_q8_) return;
+    const uint64_t KV = cfg_.kv_heads, G = cfg_.heads / KV, D = cfg_.head_dim, Rmax = G * 2048u;
+    const uint64_t ml_stride = ((Rmax * 4 + 255) / 256) * 256;
+    fp8_q8_ = std::make_unique<DeviceBuffer>(dev_, KV * Rmax * D);
+    for (int s = 0; s < 2; ++s) {
+        fp8_o_[s] = std::make_unique<DeviceBuffer>(dev_, KV * Rmax * D * 4);
+        fp8_m_[s] = std::make_unique<DeviceBuffer>(dev_, KV * ml_stride);
+        fp8_l_[s] = std::make_unique<DeviceBuffer>(dev_, KV * ml_stride);
+    }
+}
+
 void Qwen35::memory_report() const {
     const auto m = device_memory();
     uint64_t kv = 0;
@@ -477,7 +544,7 @@ uint32_t Qwen35::attn_rows(uint32_t rows, uint32_t T) const {
     if (rows <= kFine) return bucket_for(rows);
     // prefill remainder pieces: coarse buckets up to 8K rows (their FP16 kernel attention); past that fine rows too,
     // which keeps Sb - pos < T + 2048 for the FP8 split attention (its unmasked prefix must lie before pos)
-    if (T > kSpecMaxT && T != kMaxT && rows <= 8192) return bucket_for(rows);
+    if (T > kSpecMaxT && T != 2048 && T != 4096 && rows <= 8192) return bucket_for(rows);
     return std::min((rows + kStep - 1) / kStep * kStep, cap_);
 }
 
@@ -505,11 +572,39 @@ Qwen35::Pair Qwen35::mlp(Ops& o, uint32_t j, TensorId y, TensorId s) {
     const auto gu_s = g.input(P(j, "gu_s"), DType::F32, {2 * F});
     const auto dn_w = g.input(P(j, "down_w"), DType::F8, {H, F});
     const auto dn_s = g.input(P(j, "down_s"), DType::F32, {H});
-    const auto nq = o.add_rmsnorm_quant(y, s, post, cfg_.eps, P(j, "post"));
+    const bool need_norm = (building_debug_j_ == int(j));
+    const auto nq = o.add_rmsnorm_quant(y, s, post, cfg_.eps, P(j, "post"), need_norm);
     dbg(o, j, "h1", nq.residual_out);
-    dbg(o, j, "x2", nq.normalized);
-    // G2E_DQ_FOLD=1: the gate_up GEMM's dequantisation inside the silu_mul_quant kernel (no scale epilogue)
-    static const bool fold = std::getenv("G2E_DQ_FOLD") != nullptr;
+    if (need_norm) dbg(o, j, "x2", nq.normalized);
+    // Fold gate_up dequant + 128-lane BF16 SiLU + mul + FP8 quant for prefill (rows >= 256) or when G2E_DQ_FOLD=1
+    static const bool force_fold = std::getenv("G2E_DQ_FOLD") != nullptr;
+    static const bool no_fold = std::getenv("G2E_NO_DQ_FOLD") != nullptr;
+    const bool fold = !no_fold && (force_fold || (!building_spec_ && o.shape(nq.codes)[0] >= 256));
+    const auto act = fold ? o.fp8_gemm_silu_mul_quant(nq.codes, nq.scale, gu_w, gu_s, P(j, "gu"))
+                          : o.silu_mul_quant(o.fp8_gemm(nq.codes, nq.scale, gu_w, gu_s, P(j, "gu")), P(j, "act"));
+    const auto down = o.fp8_gemm(act.first, act.second, dn_w, dn_s, P(j, "down"));
+    return {nq.residual_out, down};
+}
+
+Qwen35::Pair Qwen35::proj_mlp(Ops& o, uint32_t j, TensorId codes, TensorId scale, TensorId w, TensorId ws, TensorId s,
+                              const std::string& proj_name, bool fold_out_dq) {
+    static const bool no_fold_out = std::getenv("G2E_NO_OUT_DQ_FOLD") != nullptr;
+    if (!fold_out_dq || no_fold_out || building_debug_j_ == int(j)) {
+        const auto y = o.fp8_gemm(codes, scale, w, ws, proj_name);
+        dbg(o, j, "y", y);
+        return mlp(o, j, y, s);
+    }
+    auto& g = o.graph();
+    const uint64_t H = cfg_.hidden, F = cfg_.intermediate;
+    const auto post = g.input(P(j, "post_norm1p"), DType::BF16, {H});
+    const auto gu_w = g.input(P(j, "gu_w"), DType::F8, {2 * F, H});
+    const auto gu_s = g.input(P(j, "gu_s"), DType::F32, {2 * F});
+    const auto dn_w = g.input(P(j, "down_w"), DType::F8, {H, F});
+    const auto dn_s = g.input(P(j, "down_s"), DType::F32, {H});
+    const auto nq = o.fp8_gemm_add_rmsnorm_quant(codes, scale, w, ws, s, post, cfg_.eps, P(j, "post"));
+    static const bool force_fold = std::getenv("G2E_DQ_FOLD") != nullptr;
+    static const bool no_fold = std::getenv("G2E_NO_DQ_FOLD") != nullptr;
+    const bool fold = !no_fold && (force_fold || (!building_spec_ && o.shape(nq.codes)[0] >= 256));
     const auto act = fold ? o.fp8_gemm_silu_mul_quant(nq.codes, nq.scale, gu_w, gu_s, P(j, "gu"))
                           : o.silu_mul_quant(o.fp8_gemm(nq.codes, nq.scale, gu_w, gu_s, P(j, "gu")), P(j, "act"));
     const auto down = o.fp8_gemm(act.first, act.second, dn_w, dn_s, P(j, "down"));
@@ -586,8 +681,9 @@ TensorId Qwen35::kv_scores(Ops& o, TensorId q, TensorId kc, const std::string& n
 
 TensorId Qwen35::kv_pv(Ops& o, TensorId p, TensorId vc3, const std::string& name) {
     // FP8: the unnormalised probabilities (<= 1) x 128 in E4M3 (as the FP8 SDPA's q_scale_s); the caller divides by
-    // the row sums x 128
-    return o.batch_gemm(kv8_ ? kv_to_f8(o, p, 128.f, name + "_p8") : p, vc3, name, false, false, DType::F32);
+    // the row sums x 128 (or directly by sums when masked_softmax_bf16_f8 already emitted F8 x 128)
+    const auto pf = (kv8_ && o.dtype(p) != DType::F8) ? kv_to_f8(o, p, 128.f, name + "_p8") : p;
+    return o.batch_gemm(pf, vc3, name, false, false, DType::F32);
 }
 
 bool Qwen35::wy_geometry() const {
@@ -624,9 +720,15 @@ Qwen35::Pair Qwen35::gdn_layer(Ops& o, uint32_t j, uint32_t T, Pair in, uint32_t
     dbg(o, j, "ba", ba);
     const auto bap = o.split(ba, 1, {HV, HV}, P(j, "ba_split"));  // b, a
     const auto sp = o.unary("softplus", o.add(bap[1], o.cast(dt_bias, DType::F32, P(j, "dtbf")), P(j, "adt")), P(j, "sp"));
-    const auto gdecay = o.mul(sp, negexpA, P(j, "g"));  // [T, HV]
+    TensorId gdecay = o.mul(sp, negexpA, P(j, "g"));  // [T, HV]
+    TensorId beta = o.unary("sigmoid", bap[0], P(j, "beta"));
+    if (building_padded_ && B == 1 && !building_spec_) {
+        auto it = build_inputs_.find("pad_mask");
+        const TensorId pm = it != build_inputs_.end() ? it->second : (build_inputs_["pad_mask"] = g.input("pad_mask", DType::F32, {T, 1}));
+        gdecay = o.mul(gdecay, pm, P(j, "gpm"));
+        beta = o.mul(beta, pm, P(j, "bpm"));
+    }
     const auto decay = o.unary("exp", gdecay, P(j, "decay"));
-    const auto beta = o.unary("sigmoid", bap[0], P(j, "beta"));
     dbg(o, j, "g", gdecay);
     dbg(o, j, "beta", beta);
 
@@ -638,6 +740,58 @@ Qwen35::Pair Qwen35::gdn_layer(Ops& o, uint32_t j, uint32_t T, Pair in, uint32_t
         const auto pz0 = o.split(pz[0], 0, std::vector<uint64_t>(B, T), P(j, "pbz"));
         const auto gsp = o.split(gdecay, 0, std::vector<uint64_t>(B, T), P(j, "pbg"));
         const auto bsp = o.split(beta, 0, std::vector<uint64_t>(B, T), P(j, "pbb"));
+        if (gdn_prefill_fast_enabled() && gdn_chunk() == 64 && DK == 128 && DV == 128 && HV <= 64 && (HV % 4) == 0 &&
+            fused_gate_quant() && building_debug_j_ != int(j)) {
+            const uint32_t nc = T / 64;
+            const auto zsp = o.split(pz[1], 0, std::vector<uint64_t>(B, T), P(j, "pbzv"));
+            std::vector<TensorId> qcs, kcs, vcs, Ss;
+            for (uint32_t b = 0; b < B; ++b) {
+                const auto x = std::to_string(b);
+                const auto conv_in = g.input(P(j, "conv_in" + x), DType::BF16, {KC - 1, C});
+                Ss.push_back(g.input(P(j, "ssm_in" + x), DType::F32, {HV, DV, DK}));
+                const auto seq = o.concat({conv_in, pz0[b]}, 0, P(j, "pseq" + x));
+                output(g, P(j, "conv_out" + x), o.split(seq, 0, {T, KC - 1}, P(j, "ptail" + x))[1]);
+                const auto qcb = o.temp(P(j, "pfqc" + x), DType::BF16, {uint64_t(nc) * HK, 64, DK});
+                const auto kcb = o.temp(P(j, "pfkc" + x), DType::BF16, {uint64_t(nc) * HK, 64, DK});
+                const auto vcb = o.temp(P(j, "pfvc" + x), DType::BF16, {uint64_t(nc) * HV, 64, DV});
+                g.op("flashinfer_gaudi_gdn_prefill_conv_prep_bf16_gaudi2", {seq, conv_w}, {qcb, kcb, vcb});
+                qcs.push_back(o.reshape(qcb, {nc, 1, HK, 64, DK}, P(j, "pfq5" + x)));
+                kcs.push_back(o.reshape(kcb, {nc, 1, HK, 64, DK}, P(j, "pfk5" + x)));
+                vcs.push_back(o.reshape(vcb, {nc, 1, HV, 64, DV}, P(j, "pfv5" + x)));
+            }
+            const auto qc_all = o.reshape(o.concat(qcs, 1, P(j, "pfqcat")), {uint64_t(nc) * B * HK, 64, DK}, P(j, "pfqa"));
+            const auto kc_all = o.reshape(o.concat(kcs, 1, P(j, "pfkcat")), {uint64_t(nc) * B * HK, 64, DK}, P(j, "pfka"));
+            const auto vc_all = o.reshape(o.concat(vcs, 1, P(j, "pfvcat")), {uint64_t(nc) * B * HV, 64, DV}, P(j, "pfva"));
+            const std::string cp = "chunk64.";
+            auto cst = [&](const std::string& name, Shape shape) {
+                const auto key = cp + name;
+                if (auto it = build_inputs_.find(key); it != build_inputs_.end()) return it->second;
+                return build_inputs_[key] = g.input(key, DType::F32, std::move(shape));
+            };
+            const auto [out_c, s_out] = g2e::gdn_chunks_fast(
+                o, P(j, "pfcks_"), nc, {B * HK, B * HV, DK, DV}, cst, o.concat(Ss, 0, P(j, "pssc")),
+                qc_all, kc_all, vc_all,
+                o.concat(std::vector<TensorId>(gsp.begin(), gsp.end()), 1, P(j, "pgc")),
+                o.concat(std::vector<TensorId>(bsp.begin(), bsp.end()), 1, P(j, "pbc")));
+            const auto sparts = o.split(s_out, 0, std::vector<uint64_t>(B, HV), P(j, "psso"));
+            for (uint32_t b = 0; b < B; ++b) output(g, P(j, "ssm_out" + std::to_string(b)), sparts[b]);
+            const auto ob_parts = o.split(o.reshape(out_c, {nc, B, HV, 64, DV}, P(j, "pfo5")), 1,
+                                          std::vector<uint64_t>(B, 1), P(j, "pfob"));
+            const float eps = cfg_.eps;
+            std::vector<TensorId> cs, scs;
+            for (uint32_t b = 0; b < B; ++b) {
+                const auto x = std::to_string(b);
+                const auto oc_b = o.reshape(ob_parts[b], {uint64_t(nc) * HV, 64, DV}, P(j, "pfoc" + x));
+                const auto cb = o.temp(P(j, "pfgc" + x), DType::F8, {T, HV * DV});
+                const auto sb = o.temp(P(j, "pfgs" + x), DType::F32, {T, 1});
+                g.op("flashinfer_gaudi_gdn_prefill_gate_quant_bf16_gaudi2", {oc_b, zsp[b], norm_w}, {cb, sb},
+                     &eps, sizeof(eps));
+                cs.push_back(cb);
+                scs.push_back(sb);
+            }
+            return proj_mlp(o, j, o.concat(cs, 0, P(j, "pfgca")), o.concat(scs, 0, P(j, "pfgsa")),
+                            out_w, out_s, nq.residual_out, P(j, "outp"), true);
+        }
         const auto taps = o.split(o.cast(conv_w, DType::F32, P(j, "pcwf")), 0, std::vector<uint64_t>(KC, 1), P(j, "ptap"));
         std::vector<TensorId> qs, ks, vs, Ss;
         for (uint32_t b = 0; b < B; ++b) {
@@ -693,45 +847,101 @@ Qwen35::Pair Qwen35::gdn_layer(Ops& o, uint32_t j, uint32_t T, Pair in, uint32_t
         // kernel takes the slots as its batch dimension, the Gram / state products run as one batched GEMM
         if (!(building_spec_ && (T == 8 || T == 16) && wy_geometry()))
             throw std::logic_error("qwen35: batched GDN only for the WY verification");
-        const auto pz0 = o.split(pz[0], 0, std::vector<uint64_t>(B, T), P(j, "bz"));
         const auto gsp = o.split(gdecay, 0, std::vector<uint64_t>(B, T), P(j, "bg"));
-        const auto bsp = o.split(beta, 0, std::vector<uint64_t>(B, T), P(j, "bb"));
-        std::vector<TensorId> Xs, Vs, Ss;
-        for (uint32_t b = 0; b < B; ++b) {
-            const auto bs = std::to_string(b);
-            const auto conv_in = g.input(P(j, "conv_in" + bs), DType::BF16, {KC - 1, C});
-            const auto ssm_in = g.input(P(j, "ssm_in" + bs), DType::F32, {HV, DV, DK});
-            const auto seq = o.concat({conv_in, pz0[b]}, 0, P(j, "seq" + bs));
-            const auto X = o.temp(P(j, "bwx" + bs), DType::F32, {HK, 2 * T, DK});
-            const auto Vv = o.temp(P(j, "bwv" + bs), DType::F32, {T, HV * DV});
-            g.op("flashinfer_gaudi_gdn_spec_prep_bf16_gaudi2", {seq, conv_w}, {X, Vv});
-            // stashed for the commit; every one is also consumed below (see the single-slot form)
-            output(g, P(j, "st_x" + bs), X);
-            output(g, P(j, "st_v" + bs), Vv);
-            output(g, P(j, "st_g" + bs), gsp[b]);
-            output(g, P(j, "st_b" + bs), bsp[b]);
-            output(g, P(j, "st_seq" + bs), seq);
-            Vs.push_back(o.reshape(Vv, {1, T, HV * DV}, P(j, "bv3" + bs)));
-            // per slot, straight from its bound state (concatenating the states would copy them: they are
-            // persistent inputs); the products' outputs are concatenated
-            Xs.push_back(o.batch_gemm(X, X, P(j, "bwgram" + bs), false, true, DType::F32));  // [HK,2T,2T]
-            Ss.push_back(o.batch_gemm(X, o.reshape(ssm_in, {HK, REP * DV, DK}, P(j, "bs3" + bs)), P(j, "bwr" + bs), false,
-                                      true, DType::F32));                                  // [HK,2T,REP*DV]
+        const bool fc = fast_commit();
+        const bool bp = fast_gdn_prep();
+        std::vector<TensorId> bsp;
+        if (!fc) bsp = o.split(beta, 0, std::vector<uint64_t>(B, T), P(j, "bb"));
+        TensorId gram = kNoTensor, v_all4 = kNoTensor;
+        std::vector<TensorId> Ss;
+        if (bp) {
+            std::vector<TensorId> conv_ins;
+            for (uint32_t b = 0; b < B; ++b) {
+                const auto bs = std::to_string(b);
+                const auto ci = g.input(P(j, "conv_in" + bs), DType::BF16, {KC - 1, C});
+                conv_ins.push_back(o.reshape(ci, {1, KC - 1, C}, P(j, "ci3" + bs)));
+            }
+            const auto seq_all = o.concat({o.concat(conv_ins, 0, P(j, "cic")), o.reshape(pz[0], {B, T, C}, P(j, "pz3"))}, 1,
+                                          P(j, "seq_all"));  // [B, T + KC - 1, C]
+            const auto X_all = o.temp(P(j, "bwx_all"), DType::F32, {B, HK, 2 * T, DK});
+            const auto V_all = o.temp(P(j, "bwv_all"), DType::F32, {B, T, HV * DV});
+            g.op("flashinfer_gaudi_gdn_spec_prep_batch_bf16_gaudi2", {seq_all, conv_w}, {X_all, V_all});
+            const auto X_flat = o.reshape(X_all, {B * HK, 2 * T, DK}, P(j, "bwx_f"));
+            gram = o.batch_gemm(X_flat, X_flat, P(j, "bgr"), false, true, DType::F32);  // [B*HK, 2T, 2T]
+            const auto xs = o.split(X_all, 0, std::vector<uint64_t>(B, 1), P(j, "bxs"));
+            const auto seqs = o.split(seq_all, 0, std::vector<uint64_t>(B, 1), P(j, "bseqs"));
+            std::vector<TensorId> vs_sp;
+            if (!fc) vs_sp = o.split(V_all, 0, std::vector<uint64_t>(B, 1), P(j, "bvs"));
+            for (uint32_t b = 0; b < B; ++b) {
+                const auto bs = std::to_string(b);
+                const auto ssm_in = g.input(P(j, "ssm_in" + bs), DType::F32, {HV, DV, DK});
+                const auto X = o.reshape(xs[b], {HK, 2 * T, DK}, P(j, "bwx" + bs));
+                output(g, P(j, "st_x" + bs), X);
+                output(g, P(j, "st_g" + bs), gsp[b]);
+                if (!fc) {
+                    output(g, P(j, "st_v" + bs), o.reshape(vs_sp[b], {T, HV * DV}, P(j, "bwv" + bs)));
+                    output(g, P(j, "st_b" + bs), bsp[b]);
+                }
+                output(g, P(j, "st_seq" + bs), o.reshape(seqs[b], {T + KC - 1, C}, P(j, "seq" + bs)));
+                Ss.push_back(o.batch_gemm(X, o.reshape(ssm_in, {HK, REP * DV, DK}, P(j, "bs3" + bs)), P(j, "bwr" + bs), false,
+                                          true, DType::F32));  // [HK, 2T, REP*DV]
+            }
+            v_all4 = o.reshape(V_all, {B, T, HV, DV}, P(j, "wv4"));
+        } else {
+            const auto pz0 = o.split(pz[0], 0, std::vector<uint64_t>(B, T), P(j, "bz"));
+            std::vector<TensorId> Xs, Vs;
+            for (uint32_t b = 0; b < B; ++b) {
+                const auto bs = std::to_string(b);
+                const auto conv_in = g.input(P(j, "conv_in" + bs), DType::BF16, {KC - 1, C});
+                const auto ssm_in = g.input(P(j, "ssm_in" + bs), DType::F32, {HV, DV, DK});
+                const auto seq = o.concat({conv_in, pz0[b]}, 0, P(j, "seq" + bs));
+                const auto X = o.temp(P(j, "bwx" + bs), DType::F32, {HK, 2 * T, DK});
+                const auto Vv = o.temp(P(j, "bwv" + bs), DType::F32, {T, HV * DV});
+                g.op("flashinfer_gaudi_gdn_spec_prep_bf16_gaudi2", {seq, conv_w}, {X, Vv});
+                // stashed for the commit; every one is also consumed below (see the single-slot form)
+                output(g, P(j, "st_x" + bs), X);
+                output(g, P(j, "st_g" + bs), gsp[b]);
+                if (!fc) {
+                    output(g, P(j, "st_v" + bs), Vv);
+                    output(g, P(j, "st_b" + bs), bsp[b]);
+                }
+                output(g, P(j, "st_seq" + bs), seq);
+                Vs.push_back(o.reshape(Vv, {1, T, HV * DV}, P(j, "bv3" + bs)));
+                // per slot, straight from its bound state (concatenating the states would copy them: they are
+                // persistent inputs); the products' outputs are concatenated
+                Xs.push_back(o.batch_gemm(X, X, P(j, "bwgram" + bs), false, true, DType::F32));  // [HK,2T,2T]
+                Ss.push_back(o.batch_gemm(X, o.reshape(ssm_in, {HK, REP * DV, DK}, P(j, "bs3" + bs)), P(j, "bwr" + bs), false,
+                                          true, DType::F32));                                  // [HK,2T,REP*DV]
+            }
+            gram = o.concat(Xs, 0, P(j, "bgr"));  // [B*HK,2T,2T]
+            v_all4 = o.reshape(o.concat(Vs, 0, P(j, "bvc")), {B, T, HV, DV}, P(j, "wv4"));
         }
-        const auto gram = o.concat(Xs, 0, P(j, "bgr"));  // [B*HK,2T,2T]
         const auto rmat = o.concat(Ss, 0, P(j, "brm"));  // [B*HK,2T,REP*DV]
-        const auto gcat = o.concat(std::vector<TensorId>(gsp.begin(), gsp.end()), 0, P(j, "bgc"));
-        const auto bcat = o.concat(std::vector<TensorId>(bsp.begin(), bsp.end()), 0, P(j, "bbc"));
         const auto core4 = o.temp(P(j, "wcore"), DType::F32, {B, T, HV, DV});
-        g.op(T == 8 ? "flashinfer_gaudi_gdn_mtp_wyo8_f32_gaudi2" : "flashinfer_gaudi_gdn_mtp_wyo_f32_gaudi2",
-             {o.reshape(gcat, {B, T, HV}, P(j, "wg3")), o.reshape(bcat, {B, T, HV}, P(j, "wb3")),
-              o.reshape(rmat, {B, HK, 2 * T, REP * DV}, P(j, "wr4")), o.reshape(gram, {B, HK, 2 * T, 2 * T}, P(j, "wgr4")),
-              o.reshape(o.concat(Vs, 0, P(j, "bvc")), {B, T, HV, DV}, P(j, "wv4"))},
-             {core4});
+        if (fc) {
+            const auto ds4 = o.temp(P(j, "wds"), DType::F32, {B, T, HV, DV});
+            g.op(T == 8 ? "flashinfer_gaudi_gdn_mtp_wyod8_f32_gaudi2" : "flashinfer_gaudi_gdn_mtp_wyod_f32_gaudi2",
+                 {o.reshape(gdecay, {B, T, HV}, P(j, "wg3")), o.reshape(beta, {B, T, HV}, P(j, "wb3")),
+                  o.reshape(rmat, {B, HK, 2 * T, REP * DV}, P(j, "wr4")), o.reshape(gram, {B, HK, 2 * T, 2 * T}, P(j, "wgr4")),
+                  v_all4},
+                 {core4, ds4});
+            const auto dsp = o.split(ds4, 0, std::vector<uint64_t>(B, 1), P(j, "bds"));
+            for (uint32_t b = 0; b < B; ++b)
+                output(g, P(j, "st_v" + std::to_string(b)), o.reshape(dsp[b], {T, HV, DV}, P(j, "bds3" + std::to_string(b))));
+        } else {
+            const auto gcat = o.concat(std::vector<TensorId>(gsp.begin(), gsp.end()), 0, P(j, "bgc"));
+            const auto bcat = o.concat(std::vector<TensorId>(bsp.begin(), bsp.end()), 0, P(j, "bbc"));
+            g.op(T == 8 ? "flashinfer_gaudi_gdn_mtp_wyo8_f32_gaudi2" : "flashinfer_gaudi_gdn_mtp_wyo_f32_gaudi2",
+                 {o.reshape(gcat, {B, T, HV}, P(j, "wg3")), o.reshape(bcat, {B, T, HV}, P(j, "wb3")),
+                  o.reshape(rmat, {B, HK, 2 * T, REP * DV}, P(j, "wr4")), o.reshape(gram, {B, HK, 2 * T, 2 * T}, P(j, "wgr4")),
+                  v_all4},
+                 {core4});
+        }
         core = o.cast(o.reshape(core4, {RT, HV, DV}, P(j, "wc3")), DType::BF16, P(j, "core"));
         goto gated_output;
     }
-    if (T == 1) {
+    static const bool t1_bf16 = std::getenv("G2E_T1_BF16_GDN") != nullptr;
+    if (T == 1 && t1_bf16) {
         const auto conv_in = g.input(P(j, "conv_in"), DType::BF16, {1, KC - 1, C});
         const auto conv_out = g.input(P(j, "conv_out"), DType::BF16, {1, KC - 1, C});
         // one tensor per block: persistent tensors must not overlap, and every layer uses the same constants
@@ -753,8 +963,14 @@ Qwen35::Pair Qwen35::gdn_layer(Ops& o, uint32_t j, uint32_t T, Pair in, uint32_t
         const auto ssm_in = g.input(P(j, "ssm_in"), DType::F32, {HV, DV, DK});
         const auto seq = o.concat({conv_in, pz[0]}, 0, P(j, "seq"));
         if (!building_spec_) {
-            const auto tail = o.split(seq, 0, {T, KC - 1}, P(j, "tail"));
-            output(g, P(j, "conv_out"), tail[1]);
+            if (building_padded_) {
+                auto it = build_inputs_.find("conv_rows");
+                const TensorId crows = it != build_inputs_.end() ? it->second : (build_inputs_["conv_rows"] = g.input("conv_rows", DType::I32, {KC - 1}));
+                output(g, P(j, "conv_out"), o.gather(seq, crows, 0, P(j, "cwin")));
+            } else {
+                const auto tail = o.split(seq, 0, {T, KC - 1}, P(j, "tail"));
+                output(g, P(j, "conv_out"), tail[1]);
+            }
         }
         if (building_spec_ && spec_wy(T)) {
             // verification, WY form. One kernel: conv + SiLU, laid out as X = [k; q] per key head [HK, 2T, DK]
@@ -762,25 +978,61 @@ Qwen35::Pair Qwen35::gdn_layer(Ops& o, uint32_t j, uint32_t T, Pair in, uint32_t
             // (per key head: its 3 value heads side by side) and the Gram matrix of X run on the MME in FP32; the
             // WY kernel does the rest (normalisation, decay, delta rule) per value head. Every stashed tensor is
             // also consumed here (a graph output nothing else reads made layer recipes nondeterministic).
+            const bool fc = fast_commit();
             const auto X = o.temp(P(j, "wx"), DType::F32, {HK, 2 * T, DK});
             const auto Vv = o.temp(P(j, "wv"), DType::F32, {T, HV * DV});
             g.op("flashinfer_gaudi_gdn_spec_prep_bf16_gaudi2", {seq, conv_w}, {X, Vv});
             output(g, P(j, "st_x"), X);
-            output(g, P(j, "st_v"), Vv);
             output(g, P(j, "st_g"), gdecay);
-            output(g, P(j, "st_b"), beta);
+            if (!fc) {
+                output(g, P(j, "st_v"), Vv);
+                output(g, P(j, "st_b"), beta);
+            }
             output(g, P(j, "st_seq"), seq);
             const auto gram = o.batch_gemm(X, X, P(j, "wgram"), false, true, DType::F32);                       // [HK,2T,2T]
             const auto rmat = o.batch_gemm(X, o.reshape(ssm_in, {HK, REP * DV, DK}, P(j, "ws3")), P(j, "wr"), false, true,
                                            DType::F32);                                                         // [HK,2T,REP*DV]
             const auto core4 = o.temp(P(j, "wcore"), DType::F32, {1, T, HV, DV});
-            g.op("flashinfer_gaudi_gdn_mtp_wyo_f32_gaudi2",
-                 {o.reshape(gdecay, {1, T, HV}, P(j, "wg3")), o.reshape(beta, {1, T, HV}, P(j, "wb3")),
-                  o.reshape(rmat, {1, HK, 2 * T, REP * DV}, P(j, "wr4")), o.reshape(gram, {1, HK, 2 * T, 2 * T}, P(j, "wgr4")),
-                  o.reshape(Vv, {1, T, HV, DV}, P(j, "wv4"))},
-                 {core4});
+            if (fc) {
+                const auto ds4 = o.temp(P(j, "wds"), DType::F32, {1, T, HV, DV});
+                g.op("flashinfer_gaudi_gdn_mtp_wyod_f32_gaudi2",
+                     {o.reshape(gdecay, {1, T, HV}, P(j, "wg3")), o.reshape(beta, {1, T, HV}, P(j, "wb3")),
+                      o.reshape(rmat, {1, HK, 2 * T, REP * DV}, P(j, "wr4")), o.reshape(gram, {1, HK, 2 * T, 2 * T}, P(j, "wgr4")),
+                      o.reshape(Vv, {1, T, HV, DV}, P(j, "wv4"))},
+                     {core4, ds4});
+                output(g, P(j, "st_v"), o.reshape(ds4, {T, HV, DV}, P(j, "wds3")));
+            } else {
+                g.op("flashinfer_gaudi_gdn_mtp_wyo_f32_gaudi2",
+                     {o.reshape(gdecay, {1, T, HV}, P(j, "wg3")), o.reshape(beta, {1, T, HV}, P(j, "wb3")),
+                      o.reshape(rmat, {1, HK, 2 * T, REP * DV}, P(j, "wr4")), o.reshape(gram, {1, HK, 2 * T, 2 * T}, P(j, "wgr4")),
+                      o.reshape(Vv, {1, T, HV, DV}, P(j, "wv4"))},
+                     {core4});
+            }
             core = o.cast(o.reshape(core4, {T, HV, DV}, P(j, "wc3")), DType::BF16, P(j, "core"));
             goto gated_output;
+        }
+        if (!building_spec_ && gdn_prefill_fast_enabled() && T >= 64 && (T % 64) == 0 && gdn_chunk() == 64 &&
+            DK == 128 && DV == 128 && HV <= 64 && (HV % 4) == 0 && fused_gate_quant() && building_debug_j_ != int(j)) {
+            const uint32_t nc = T / 64;
+            const auto qc = o.temp(P(j, "fqc"), DType::BF16, {uint64_t(nc) * HK, 64, DK});
+            const auto kc = o.temp(P(j, "fkc"), DType::BF16, {uint64_t(nc) * HK, 64, DK});
+            const auto vc = o.temp(P(j, "fvc"), DType::BF16, {uint64_t(nc) * HV, 64, DV});
+            g.op("flashinfer_gaudi_gdn_prefill_conv_prep_bf16_gaudi2", {seq, conv_w}, {qc, kc, vc});
+            const std::string cp = "chunk64.";
+            auto cst = [&](const std::string& name, Shape shape) {
+                const auto key = cp + name;
+                if (auto it = build_inputs_.find(key); it != build_inputs_.end()) return it->second;
+                return build_inputs_[key] = g.input(key, DType::F32, std::move(shape));
+            };
+            const auto [out_c, s_out] = g2e::gdn_chunks_fast(o, P(j, "fcks_"), nc, {HK, HV, DK, DV},
+                                                             cst, ssm_in, qc, kc, vc, gdecay, beta);
+            output(g, P(j, "ssm_out"), s_out);
+            const auto codes = o.temp(P(j, "fgq_codes"), DType::F8, {RT, HV * DV});
+            const auto scale = o.temp(P(j, "fgq_scale"), DType::F32, {RT, 1});
+            const float eps = cfg_.eps;
+            g.op("flashinfer_gaudi_gdn_prefill_gate_quant_bf16_gaudi2", {out_c, pz[1], norm_w}, {codes, scale},
+                 &eps, sizeof(eps));
+            return proj_mlp(o, j, codes, scale, out_w, out_s, nq.residual_out, P(j, "outp"), true);
         }
         const auto seqf = o.cast(seq, DType::F32, P(j, "seqf"));
         const auto taps = o.split(o.cast(conv_w, DType::F32, P(j, "cwf")), 0, std::vector<uint64_t>(KC, 1), P(j, "tap"));
@@ -888,8 +1140,7 @@ gated_output:
         g.op("flashinfer_gaudi_gated_norm_quant_bf16_gaudi2", {o.reshape(core, {RT, HV, DV}, P(j, "core3")), z3, norm_w},
              {gated, pmax}, &eps, sizeof(eps));
         g.op("flashinfer_gaudi_row_quant_bf16_gaudi2", {gated, pmax}, {codes, scale});
-        const auto y = o.fp8_gemm(codes, scale, out_w, out_s, P(j, "outp"));
-        return mlp(o, j, y, nq.residual_out);
+        return proj_mlp(o, j, codes, scale, out_w, out_s, nq.residual_out, P(j, "outp"), B > 1);
     }
     const auto normed = o.rms_norm(core, norm_w, cfg_.eps, false, P(j, "gnorm"));
     const auto z = o.reshape(pz[1], {RT, HV, DV}, P(j, "z"));
@@ -904,9 +1155,7 @@ gated_output:
         dbg(o, j, "gated", gated);
         q8 = o.quantize(gated, P(j, "gq"));
     }
-    const auto y = o.fp8_gemm(q8.first, q8.second, out_w, out_s, P(j, "outp"));
-    dbg(o, j, "y", y);
-    return mlp(o, j, y, nq.residual_out);
+    return proj_mlp(o, j, q8.first, q8.second, out_w, out_s, nq.residual_out, P(j, "outp"), B > 1);
 }
 
 std::pair<TensorId, TensorId> Qwen35::gdn_chunk(Ops& o, const std::string& n, uint32_t C, uint64_t HK, uint64_t HV,
@@ -1086,9 +1335,15 @@ Recipe& Qwen35::block_recipe(uint32_t first, uint32_t T, uint32_t Sb) {
     }
     building_debug_j_ = -1;
     if (debug_layer_ >= int(first) && debug_layer_ < int(first + nb)) building_debug_j_ = debug_layer_ - int(first);
-    std::string key = "qwen35b_" + pattern + "_T" + std::to_string(T) + (building_spec_ ? (spec_wy(T) ? "_specwy" : "_spec") : "");
+    std::string key = "qwen35b_" + pattern + "_T" + std::to_string(T) +
+                      (building_spec_ ? (spec_wy(T) ? (fast_commit() ? "_specwyd" : "_specwy") : "_spec") : "") +
+                      (building_padded_ && pattern.find('g') != std::string::npos ? "_pm" : "");
     if (!building_spec_ && T > 64 && pattern.find('g') != std::string::npos && !std::getenv("G2E_GDN_SERIAL_CHUNKS"))
         key += "_bc" + (gdn_chunk() != 64 ? std::to_string(gdn_chunk()) : std::string());  // chunks batched (gdn_chunks)
+    if (pattern.find('g') != std::string::npos && T >= 64 && (T % 64) == 0 && !building_spec_ &&
+        gdn_chunk() == 64 && gdn_prefill_fast_enabled() && fused_gate_quant() && debug_layer_ < 0)
+        key += "_fg4";
+    if (std::getenv("G2E_NO_DQ_FOLD") == nullptr && (std::getenv("G2E_DQ_FOLD") != nullptr || (!building_spec_ && T >= 256))) key += "_dqf2";
     if (any_attention) key += "_S" + std::to_string(Sb) + (attn_sdpa(Sb) ? "f" : attn_batched() ? "b" : "") + "m";  // m: in-graph mask
     if (fused_gate_quant()) key += "_mq";
     if (gated_kernel() && pattern.find('g') != std::string::npos) key += "_gk2";
@@ -1098,6 +1353,7 @@ Recipe& Qwen35::block_recipe(uint32_t first, uint32_t T, uint32_t Sb) {
         key += "_dbg" + std::to_string(building_debug_j_);
         for (const auto& p : debug_points_) key += "_" + p;
     }
+    if (T == 1 && std::getenv("G2E_T1_BF16_GDN") == nullptr && pattern.find('g') != std::string::npos) key += "_t1f32";
     if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
     const uint64_t H = cfg_.hidden;
     GraphBuilder g(dev_);
@@ -1135,9 +1391,10 @@ bool Qwen35::attn_split(uint32_t T) const {
 }
 
 Recipe& Qwen35::attn_pre_recipe(uint32_t T) {
-    const std::string key = "qwen35_apre_T" + std::to_string(T);
-    if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
     const uint64_t H = cfg_.hidden, NH = cfg_.heads, KV = cfg_.kv_heads, D = cfg_.head_dim, R2 = cfg_.rotary_dim / 2;
+    const bool ak = fast_apre() && D == 256 && R2 == 32;
+    const std::string key = "qwen35_apre_T" + std::to_string(T) + (ak ? "_ak" : "");
+    if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
     const uint32_t j = 0;
     GraphBuilder g(dev_);
     Ops o(g);
@@ -1152,6 +1409,27 @@ Recipe& Qwen35::attn_pre_recipe(uint32_t T) {
     // as attention_layer
     const auto nq = o.add_rmsnorm_quant(delta, res, in_norm, cfg_.eps, P(j, "in"));
     const auto qkv = o.fp8_gemm(nq.codes, nq.scale, qkv_w, qkv_s, P(j, "qkv"));
+    output(g, "resid_out", nq.residual_out);
+    if (ak) {
+        const auto qo = o.temp(P(j, "qr"), DType::BF16, {T, NH, D});
+        const auto go = o.temp(P(j, "gate"), DType::BF16, {T, NH * D});
+        const auto ka = o.temp("kt", kv_dt(), {KV, T, D});
+        const auto va = o.temp("vt", kv_dt(), {KV, T, D});
+        const float eps = cfg_.eps;
+        g.op(kv8_ ? "flashinfer_gaudi_attn_qkv_prep_f8_gaudi2" : "flashinfer_gaudi_attn_qkv_prep_bf16_gaudi2",
+             {qkv, q_norm, k_norm, o.reshape(cosv, {T, R2}, "cos2"), o.reshape(sinv, {T, R2}, "sin2")},
+             {qo, go, ka, va}, &eps, sizeof(eps));
+        output(g, "q_out", qo);
+        output(g, "gate_out", go);
+        const auto kh = o.split(ka, 0, std::vector<uint64_t>(KV, 1), "kh");
+        const auto vh = o.split(va, 0, std::vector<uint64_t>(KV, 1), "vh");
+        for (uint64_t h = 0; h < KV; ++h) {
+            output(g, "k_out" + std::to_string(h), o.reshape(kh[h], {T, D}, "k2_" + std::to_string(h)));
+            output(g, "v_out" + std::to_string(h), o.reshape(vh[h], {T, D}, "v2_" + std::to_string(h)));
+        }
+        auto r = g.compile(key);
+        return *(recipes_[key] = std::move(r));
+    }
     const auto p = o.split(qkv, 1, {NH * D * 2, KV * D, KV * D}, P(j, "qkv_split"));
     const auto qg = o.split(o.reshape(p[0], {T, NH, 2 * D}, P(j, "qg3")), 2, {D, D}, P(j, "qg_split"));
     const auto q = o.rms_norm(qg[0], q_norm, cfg_.eps, true, P(j, "qn"));
@@ -1166,7 +1444,6 @@ Recipe& Qwen35::attn_pre_recipe(uint32_t T) {
     };
     output(g, "q_out", rope(q, P(j, "qr")));
     output(g, "gate_out", o.reshape(qg[1], {T, NH * D}, P(j, "gate")));
-    output(g, "resid_out", nq.residual_out);
     const auto kh = o.split(o.transpose(rope(k, P(j, "kr")), {1, 0, 2}, "kt"), 0, std::vector<uint64_t>(KV, 1), "kh");
     const auto vh = o.split(o.transpose(v, {1, 0, 2}, "vt"), 0, std::vector<uint64_t>(KV, 1), "vh");
     for (uint64_t h = 0; h < KV; ++h) {  // rows pos .. pos+T-1 of each head's cache
@@ -1193,13 +1470,19 @@ Recipe& Qwen35::attn_post_recipe(uint32_t T, uint32_t Sb) {
     // small mask; the partial outputs merged by their row maxima / normalisers. Unit FP8 scales for q, k, v (as
     // vLLM's uncalibrated FP8 KV cache). G2E_PREFILL_NO_FP8=1: the FP16 kernel
     static const bool no_fp8 = std::getenv("G2E_PREFILL_NO_FP8") != nullptr;
+    static const bool no_fp8_small = std::getenv("G2E_PREFILL_NO_FP8_SMALL") != nullptr;
     const bool fp8_attn = fp8_prefill(T, Sb) && !force_sdpa && !prefill_sdpa && !no_fp8;
+    const bool fp8_small = !no_fp8_small && T > kSpecMaxT && !fp8_attn && !force_sdpa && !prefill_sdpa && !no_fp8;
+    const bool fp8_small_causal = fp8_small && (T == Sb);
     const bool kernel_attn = (graph_attn || (T > kSpecMaxT && !force_sdpa && !prefill_sdpa)) && !graph_softmax &&
-                             Sb % 1024 == 0 && !fp8_attn;
+                             Sb % 1024 == 0 && !fp8_attn && !fp8_small;
     const bool f16_scores = kernel_attn && T > kSpecMaxT && !std::getenv("G2E_ATTN_BF16_SCORES") && !kv8_;
+    const bool f8_sm = kernel_attn && !f16_scores && kv8_ && fast_f8_softmax();
     static const bool one_softmax = std::getenv("G2E_ATTN_ONE_SOFTMAX") != nullptr;  // comparison switch
+    const bool dqf = std::getenv("G2E_NO_DQ_FOLD") == nullptr && (std::getenv("G2E_DQ_FOLD") != nullptr || T >= 256);
     const std::string key = "qwen35_apost_T" + std::to_string(T) + "_S" + std::to_string(Sb) + (fused_gate_quant() ? "_mq" : "") +
-                            (fp8_attn ? "_f8" : kernel_attn ? (std::getenv("G2E_ATTN_HEAD_CHAINS") ? "_gk" : f16_scores ? "_gkf" : "_gks") : graph_attn ? (one_softmax ? "_gb1" : "_gb2") : "");
+                            (dqf ? "_dqf2" : "") +
+                            (fp8_attn ? "_f8" : fp8_small ? (fp8_small_causal ? "_f8c" : "_f8s") : kernel_attn ? (std::getenv("G2E_ATTN_HEAD_CHAINS") ? "_gk" : f16_scores ? "_gkf" : f8_sm ? "_gks8" : "_gks") : graph_attn ? (one_softmax ? "_gb1" : "_gb2") : "");
     if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
     const uint64_t H = cfg_.hidden, NH = cfg_.heads, KV = cfg_.kv_heads, D = cfg_.head_dim, G = NH / KV;
     const uint32_t j = 0;
@@ -1213,7 +1496,7 @@ Recipe& Qwen35::attn_post_recipe(uint32_t T, uint32_t Sb) {
     const auto o_s = g.input(P(j, "o_s"), DType::F32, {H});
     // mask [T, Sb]: row t (position pos + t) sees cache rows c <= pos + t
     TensorId maskb = kNoTensor, mask4 = kNoTensor;
-    if (!kernel_attn && !fp8_attn) {  // the kernel masks by the last visible row of each query; the others add a mask
+    if (!kernel_attn && !fp8_attn && !fp8_small_causal) {  // the kernel masks by the last visible row of each query; causal SDPA needs no mask
         const auto posm1 = g.input("posm1", DType::F32, {1, 1});
         const auto iota_c = g.input("iota", DType::F32, {1, Sb});
         const auto iota_t = g.input("iota_t", DType::F32, {T, 1});
@@ -1282,6 +1565,37 @@ Recipe& Qwen35::attn_post_recipe(uint32_t T, uint32_t Sb) {
             const auto oh = o.div(num, o.add(wa, wb, "fws" + hs), "fon" + hs);
             outs.push_back(o.reshape(o.cast(oh, DType::BF16, "fob" + hs), {1, R, D}, "sd3" + hs));
         }
+    } else if (fp8_small) {
+        const uint64_t R = G * T;
+        const auto f8_one = g.input("f8_one", DType::F32, {1});
+        const auto qs_s = g.input("f8_s128", DType::F32, {1}), ds_s = g.input("f8_d128", DType::F32, {1});
+        auto f8 = [&](TensorId x, const std::string& n) {
+            const auto codes = o.temp(n, DType::F8, o.shape(x));
+            ns_ConvertToFp8::ParamsV2 cp{};
+            cp.round_mode = CAST_ROUND_HALF_NE;
+            g.op("convert_to_fp8_bf16", {x, f8_one}, {codes}, &cp, sizeof(cp));
+            return codes;
+        };
+        ns_Sdpa::ParamsV7 fp{};
+        fp.scale = sp.scale;
+        fp.is_causal = fp8_small_causal;
+        fp.is_inference = true;
+        fp.softmax_mode = SdpaSoftmaxMode_t::SDPA_DEFAULT_SOFTMAX;
+        fp.flags = 0x4002f00;
+        fp.wl = fp.wr = -1;
+        for (uint64_t h = 0; h < KV; ++h) {
+            const auto hs = std::to_string(h);
+            const auto q8 = o.reshape(f8(o.reshape(qh[h], {R, D}, "fq2" + hs), "fq8" + hs), {1, G, T, D}, "fq4" + hs);
+            const auto kc = g.input(P(j, "k_cache" + hs), kv_dt(), {Sb, D});
+            const auto vc = g.input(P(j, "v_cache" + hs), kv_dt(), {Sb, D});
+            const auto k8 = o.reshape(kv8_ ? kc : f8(kc, "fk8" + hs), {1, 1, Sb, D}, "fk4" + hs);
+            const auto v8 = o.reshape(kv8_ ? vc : f8(vc, "fv8" + hs), {1, 1, Sb, D}, "fv4" + hs);
+            const auto oh = o.temp("fso" + hs, DType::BF16, {1, G, T, D});
+            std::vector<TensorId> ins = {q8, k8, v8, fp8_small_causal ? kNoTensor : mask4, kNoTensor,
+                                         f8_one, f8_one, f8_one, qs_s, kNoTensor, ds_s, kNoTensor, kNoTensor};
+            g.op("sdpa_recomp_fwd_hf8", std::span<const TensorId>(ins), std::span<const TensorId>(&oh, 1), &fp, sizeof(fp));
+            outs.push_back(o.reshape(oh, {1, R, D}, "sd3" + hs));
+        }
     } else if (kernel_attn) {
         // per head: BF16 scores -> masked, unnormalised softmax kernel writing P in column chunks -> batched PV
         // over the chunks (keeps both MMEs busy despite the long reduction) -> sum over chunks / row sums
@@ -1304,18 +1618,20 @@ Recipe& Qwen35::attn_post_recipe(uint32_t T, uint32_t Sb) {
         };
         auto softmax = [&](uint64_t h) {
             const auto hs = std::to_string(h);
-            prs[h] = o.temp("pr" + hs, DType::BF16, {NC, R, C});
+            prs[h] = o.temp("pr" + hs, f8_sm ? DType::F8 : DType::BF16, {NC, R, C});
             sums[h] = o.temp("psum" + hs, DType::F32, {R, 1});
             const TensorId ins[] = {scs[h], last};
             const TensorId kouts[] = {prs[h], sums[h]};
-            g.op(f16_scores ? "flashinfer_gaudi_masked_softmax_f16_gaudi2" : "flashinfer_gaudi_masked_softmax_bf16_gaudi2", ins,
-                 kouts, &sp.scale, sizeof(float));
+            g.op(f16_scores ? "flashinfer_gaudi_masked_softmax_f16_gaudi2"
+                            : f8_sm ? "flashinfer_gaudi_masked_softmax_bf16_f8_gaudi2"
+                                    : "flashinfer_gaudi_masked_softmax_bf16_gaudi2",
+                 ins, kouts, &sp.scale, sizeof(float));
         };
         auto pv = [&](uint64_t h) {
             const auto hs = std::to_string(h);
             const auto acc = o.reduce("sum", kv_pv(o, prs[h], o.reshape(vcs[h], {NC, C, D}, "vc3" + hs), "pvc" + hs), 0,
                                       "pvs" + hs);  // [1, R, D]
-            const auto den = kv8_ ? o.mul(sums[h], o.constant(128.f, {1}, "p128" + hs), "psum8" + hs) : sums[h];
+            const auto den = (kv8_ && !f8_sm) ? o.mul(sums[h], o.constant(128.f, {1}, "p128" + hs), "psum8" + hs) : sums[h];
             const auto oh = o.div(o.reshape(acc, {R, D}, "pv2" + hs), den, "pvn" + hs);
             outs.push_back(o.reshape(o.cast(oh, DType::BF16, "pvb" + hs), {1, R, D}, "sd3" + hs));
         };
@@ -1359,7 +1675,7 @@ Recipe& Qwen35::attn_post_recipe(uint32_t T, uint32_t Sb) {
             outs.push_back(o.reshape(o.cast(oh, DType::BF16, "pvb" + hs), {1, G * T, D}, "sd3" + hs));
         }
     }
-    for (uint64_t h = 0; !graph_attn && !kernel_attn && !fp8_attn && h < KV; ++h) {  // SDPA
+    for (uint64_t h = 0; !graph_attn && !kernel_attn && !fp8_attn && !fp8_small && h < KV; ++h) {  // SDPA
         const auto hs = std::to_string(h);
         const auto kc = o.reshape(kv_in_bf16(o, P(j, "k_cache" + hs), Sb), {1, 1, Sb, D}, "kc4" + hs);
         const auto vc = o.reshape(kv_in_bf16(o, P(j, "v_cache" + hs), Sb), {1, 1, Sb, D}, "vc4" + hs);
@@ -1377,8 +1693,171 @@ Recipe& Qwen35::attn_post_recipe(uint32_t T, uint32_t Sb) {
     } else {
         q8 = o.quantize(o.mul(att2, o.unary("sigmoid", gate, "gsig"), "gated"), "gq");
     }
-    const auto y = o.fp8_gemm(q8.first, q8.second, o_w, o_s, P(j, "oproj"));
-    const auto out = mlp(o, j, y, resid);
+    const auto out = proj_mlp(o, j, q8.first, q8.second, o_w, o_s, resid, P(j, "oproj"), true);
+    output(g, "res_out", out.res);
+    output(g, "delta_out", out.delta);
+    auto r = g.compile(key);
+    return *(recipes_[key] = std::move(r));
+}
+
+Recipe& Qwen35::attn_fp8_chunk_recipe(uint32_t T, uint32_t C, bool is_first) {
+    const std::string key = "qwen35_af8c_T" + std::to_string(T) + "_C" + std::to_string(C) +
+                            (is_first ? "_f" : "_s") + (kv8_ ? "_kv8" : "");
+    if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
+    const uint64_t NH = cfg_.heads, KV = cfg_.kv_heads, D = cfg_.head_dim, G = NH / KV, R = G * T;
+    GraphBuilder g(dev_);
+    Ops o(g);
+    build_inputs_.clear();
+    const auto f8_one = g.input("f8_one", DType::F32, {1});
+    const auto qs_s = g.input("f8_s128", DType::F32, {1}), ds_s = g.input("f8_d128", DType::F32, {1});
+    auto f8 = [&](TensorId x, const std::string& n) {
+        const auto codes = o.temp(n, DType::F8, o.shape(x));
+        ns_ConvertToFp8::ParamsV2 cp{};
+        cp.round_mode = CAST_ROUND_HALF_NE;
+        g.op("convert_to_fp8_bf16", {x, f8_one}, {codes}, &cp, sizeof(cp));
+        return codes;
+    };
+    TensorId q8_all = kNoTensor;
+    if (is_first) {
+        const auto q = g.input("q_in", DType::BF16, {T, NH, D});
+        const auto q3 = o.reshape(o.transpose(q, {1, 0, 2}, "qt"), {KV, R, D}, "q3");
+        q8_all = f8(q3, "q8_all");
+        output(g, "q8_out", q8_all);
+    } else {
+        q8_all = g.input("q8_in", DType::F8, {KV, R, D});
+    }
+    const auto q8h = o.split(q8_all, 0, std::vector<uint64_t>(KV, 1), "q8h");
+
+    ns_Sdpa::ParamsV7 fp{};
+    fp.scale = float(1.0 / std::sqrt(double(D)));
+    fp.is_causal = false;
+    fp.is_inference = false;
+    fp.softmax_mode = SdpaSoftmaxMode_t::SDPA_DEFAULT_SOFTMAX;
+    fp.flags = 0x4002f00;
+    fp.wl = fp.wr = -1;
+
+    for (uint64_t h = 0; h < KV; ++h) {
+        const auto hs = std::to_string(h);
+        const auto q4 = o.reshape(q8h[h], {1, 1, R, D}, "q4_" + hs);
+        const auto kc = g.input("k_in" + hs, kv_dt(), {C, D});
+        const auto vc = g.input("v_in" + hs, kv_dt(), {C, D});
+        const auto k4 = o.reshape(kv8_ ? kc : f8(kc, "k8_" + hs), {1, 1, C, D}, "k4_" + hs);
+        const auto v4 = o.reshape(kv8_ ? vc : f8(vc, "v8_" + hs), {1, 1, C, D}, "v4_" + hs);
+        const auto oh = o.temp("oh_" + hs, DType::BF16, {1, 1, R, D});
+        const auto mx = o.temp("mx_" + hs, DType::BF16, {1, 1, R, 1});
+        const auto li = o.temp("li_" + hs, DType::BF16, {1, 1, R, 1});
+        std::vector<TensorId> ins = {q4, k4, v4, kNoTensor, kNoTensor, f8_one, f8_one, f8_one, qs_s, kNoTensor, ds_s, kNoTensor, kNoTensor};
+        const TensorId outs3[] = {oh, mx, li};
+        g.op("sdpa_recomp_fwd_hf8", std::span<const TensorId>(ins), std::span<const TensorId>(outs3), &fp, sizeof(fp));
+
+        const auto of = o.cast(o.reshape(oh, {R, D}, "o2_" + hs), DType::F32, "of_" + hs);
+        const auto mf = o.cast(o.reshape(mx, {R, 1}, "m2_" + hs), DType::F32, "mf_" + hs);
+        const auto lf = o.cast(o.reshape(li, {R, 1}, "l2_" + hs), DType::F32, "lf_" + hs);
+        if (is_first) {
+            const auto invl = o.div(o.constant(1.f, {1, 1}, "one_" + hs), lf, "invl_" + hs);
+            output(g, "o_out" + hs, of);
+            output(g, "m_out" + hs, mf);
+            output(g, "l_out" + hs, invl);
+        } else {
+            const auto o_in = g.input("o_in" + hs, DType::F32, {R, D});
+            const auto m_in = g.input("m_in" + hs, DType::F32, {R, 1});
+            const auto l_in = g.input("l_in" + hs, DType::F32, {R, 1});
+            const auto M = o.binary("max", m_in, mf, "mm_" + hs);
+            const auto wa = o.mul(l_in, o.unary("exp", o.sub(m_in, M, "da_" + hs), "ea_" + hs), "wa_" + hs);
+            const auto wb = o.div(o.unary("exp", o.sub(mf, M, "db_" + hs), "eb_" + hs), lf, "wb_" + hs);
+            const auto L = o.add(wa, wb, "ln_" + hs);
+            const auto al = o.div(wa, L, "al_" + hs);
+            const auto be = o.div(wb, L, "be_" + hs);
+            const auto on = o.add(o.mul(o_in, al, "oa_" + hs), o.mul(of, be, "ob_" + hs), "on_" + hs);
+            output(g, "o_out" + hs, on);
+            output(g, "m_out" + hs, M);
+            output(g, "l_out" + hs, L);
+        }
+    }
+    auto r = g.compile(key);
+    return *(recipes_[key] = std::move(r));
+}
+
+Recipe& Qwen35::attn_post_chunked_tail_recipe(uint32_t T) {
+    const bool dqf = std::getenv("G2E_NO_DQ_FOLD") == nullptr && (std::getenv("G2E_DQ_FOLD") != nullptr || T >= 256);
+    const std::string key = "qwen35_apost_tail_T" + std::to_string(T) + (fused_gate_quant() ? "_mq" : "") +
+                            (dqf ? "_dqf2" : "") + (kv8_ ? "_kv8" : "");
+    if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
+    const uint64_t H = cfg_.hidden, NH = cfg_.heads, KV = cfg_.kv_heads, D = cfg_.head_dim, G = NH / KV, R = G * T;
+    const uint64_t W = fp8_tail(T);
+    const uint32_t j = 0;
+    GraphBuilder g(dev_);
+    Ops o(g);
+    build_inputs_.clear();
+    const auto q8_all = g.input("q8_in", DType::F8, {KV, R, D});
+    const auto q8h = o.split(q8_all, 0, std::vector<uint64_t>(KV, 1), "q8h");
+    const auto gate = g.input("gate_in", DType::BF16, {T, NH * D});
+    const auto resid = g.input("resid_in", DType::BF16, {T, H});
+    const auto o_w = g.input(P(j, "o_w"), DType::F8, {H, NH * D});
+    const auto o_s = g.input(P(j, "o_s"), DType::F32, {H});
+    const auto f8_one = g.input("f8_one", DType::F32, {1});
+    const auto qs_s = g.input("f8_s128", DType::F32, {1}), ds_s = g.input("f8_d128", DType::F32, {1});
+    const auto posm1 = g.input("posm1", DType::F32, {1, 1});
+    const auto iota_c = g.input("iota", DType::F32, {1, W});
+    const auto iota_t = g.input("iota_t", DType::F32, {T, 1});
+    const auto lim = o.add(o.add(posm1, o.constant(1.f, {1, 1}, "mk_one"), "mk_p"), iota_t, "mk_lim");
+    const auto vis = o.binary("min", o.sub(lim, iota_c, "mk_d"), o.constant(0.f, {1, 1}, "mk_z"), "mk_m");
+    const auto tmask = o.reshape(o.cast(o.mul(vis, o.constant(1e30f, {1, 1}, "mk_big"), "mk_c"), DType::BF16, "mk_b"),
+                                 {1, 1, T, W}, "mk_4");
+    auto f8 = [&](TensorId x, const std::string& n) {
+        const auto codes = o.temp(n, DType::F8, o.shape(x));
+        ns_ConvertToFp8::ParamsV2 cp{};
+        cp.round_mode = CAST_ROUND_HALF_NE;
+        g.op("convert_to_fp8_bf16", {x, f8_one}, {codes}, &cp, sizeof(cp));
+        return codes;
+    };
+    ns_Sdpa::ParamsV7 fp{};
+    fp.scale = float(1.0 / std::sqrt(double(D)));
+    fp.is_causal = false;
+    fp.is_inference = false;
+    fp.softmax_mode = SdpaSoftmaxMode_t::SDPA_DEFAULT_SOFTMAX;
+    fp.flags = 0x4002f00;
+    fp.wl = fp.wr = -1;
+
+    std::vector<TensorId> outs;
+    for (uint64_t h = 0; h < KV; ++h) {
+        const auto hs = std::to_string(h);
+        const auto q4 = o.reshape(q8h[h], {1, G, T, D}, "fq4_" + hs);
+        const auto kt = g.input("k_in" + hs, kv_dt(), {W, D});
+        const auto vt = g.input("v_in" + hs, kv_dt(), {W, D});
+        const auto k4 = o.reshape(kv8_ ? kt : f8(kt, "tk8_" + hs), {1, 1, W, D}, "tk4_" + hs);
+        const auto v4 = o.reshape(kv8_ ? vt : f8(vt, "tv8_" + hs), {1, 1, W, D}, "tv4_" + hs);
+        const auto oh = o.temp("to_" + hs, DType::BF16, {1, G, T, D});
+        const auto mx = o.temp("tm_" + hs, DType::BF16, {1, G, T, 1});
+        const auto li = o.temp("tl_" + hs, DType::BF16, {1, G, T, 1});
+        std::vector<TensorId> ins = {q4, k4, v4, tmask, kNoTensor, f8_one, f8_one, f8_one, qs_s, kNoTensor, ds_s, kNoTensor, kNoTensor};
+        const TensorId outs3[] = {oh, mx, li};
+        g.op("sdpa_recomp_fwd_hf8", std::span<const TensorId>(ins), std::span<const TensorId>(outs3), &fp, sizeof(fp));
+
+        const auto of = o.cast(o.reshape(oh, {R, D}, "to2_" + hs), DType::F32, "tof_" + hs);
+        const auto mf = o.cast(o.reshape(mx, {R, 1}, "tm2_" + hs), DType::F32, "tmf_" + hs);
+        const auto lf = o.cast(o.reshape(li, {R, 1}, "tl2_" + hs), DType::F32, "tlf_" + hs);
+        const auto o_in = g.input("o_in" + hs, DType::F32, {R, D});
+        const auto m_in = g.input("m_in" + hs, DType::F32, {R, 1});
+        const auto l_in = g.input("l_in" + hs, DType::F32, {R, 1});
+        const auto M = o.binary("max", m_in, mf, "fmm_" + hs);
+        const auto wa = o.mul(l_in, o.unary("exp", o.sub(m_in, M, "fda_" + hs), "fea_" + hs), "fwa_" + hs);
+        const auto wb = o.div(o.unary("exp", o.sub(mf, M, "fdb_" + hs), "feb_" + hs), lf, "fwb_" + hs);
+        const auto L = o.add(wa, wb, "fws_" + hs);
+        const auto al = o.div(wa, L, "fal_" + hs);
+        const auto be = o.div(wb, L, "fbe_" + hs);
+        const auto merged = o.add(o.mul(o_in, al, "fna_" + hs), o.mul(of, be, "fnb_" + hs), "fnn_" + hs);
+        outs.push_back(o.reshape(o.cast(merged, DType::BF16, "fob_" + hs), {1, R, D}, "sd3_" + hs));
+    }
+    const auto att2 = o.reshape(o.transpose(o.reshape(o.concat(outs, 0, "sdall"), {NH, T, D}, "a3"), {1, 0, 2}, "at"),
+                                {T, NH * D}, "a2");
+    std::pair<TensorId, TensorId> q8;
+    if (fused_gate_quant()) {
+        q8 = o.mul_quant(o.unary("sigmoid", gate, "gsig"), att2, "gq");
+    } else {
+        q8 = o.quantize(o.mul(att2, o.unary("sigmoid", gate, "gsig"), "gated"), "gq");
+    }
+    const auto out = proj_mlp(o, j, q8.first, q8.second, o_w, o_s, resid, P(j, "oproj"), true);
     output(g, "res_out", out.res);
     output(g, "delta_out", out.delta);
     auto r = g.compile(key);
@@ -1440,6 +1919,11 @@ void Qwen35::precompile(const std::function<void(size_t, size_t)>& progress) {
         building_spec_ = s.spec;
         if (gdn < cfg_.layers) {
             block_recipe(gdn - gdn % block_, s.T, 0);
+            if (!s.spec && block_ == 1 && s.T >= 32 && s.T <= 4096) {
+                building_padded_ = true;
+                block_recipe(gdn, s.T, 0);
+                building_padded_ = false;
+            }
             for (uint32_t f = 0, n = 1; f < cfg_.layers; f += n) {  // the GDN groups run_layers launches
                 n = group_at(f, cfg_.layers);
                 if (cfg_.attention[f]) continue;
@@ -1449,18 +1933,60 @@ void Qwen35::precompile(const std::function<void(size_t, size_t)>& progress) {
             }
         }
         tick();
-        if (attn < cfg_.layers && block_ == 1)  // the fine rows of attn_rows (verification, decode, prefill pieces)
+        if (attn < cfg_.layers && block_ == 1) {  // the fine rows of attn_rows (verification, decode, prefill pieces)
+            bool chunked_done = false;
             for (uint32_t rows = kAttnFine + 1; rows <= max_ctx_; rows += kAttnStep) {
                 const uint32_t b = attn_rows(rows, s.T);
+                if (fp8_chunked(s.T, b)) {
+                    if (!chunked_done) {
+                        attn_pre_recipe(s.T);
+                        if (s.T <= 2048) {
+                            if (s.T <= 512) {
+                                attn_fp8_chunk_recipe(s.T, 24576, true);
+                                attn_fp8_chunk_recipe(s.T, 24576, false);
+                            }
+                            if (s.T <= 1024) {
+                                attn_fp8_chunk_recipe(s.T, 12288, true);
+                                attn_fp8_chunk_recipe(s.T, 12288, false);
+                            }
+                            attn_fp8_chunk_recipe(s.T, 6144, true);
+                            attn_fp8_chunk_recipe(s.T, 6144, false);
+                            attn_fp8_chunk_recipe(s.T, 4096, false);
+                            attn_fp8_chunk_recipe(s.T, 8192, false);
+                            attn_post_chunked_tail_recipe(s.T);
+                        }
+                        chunked_done = true;
+                    }
+                    continue;
+                }
                 if (std::find(buckets.begin(), buckets.end(), b) != buckets.end()) continue;
                 attn_pre_recipe(s.T);
                 attn_post_recipe(s.T, b);
             }
+        }
         for (uint32_t b : buckets) {
             if (attn < cfg_.layers) {
                 if (block_ == 1 && attn_sdpa(b)) {  // long contexts: the split attention launches (attn_split)
                     attn_pre_recipe(s.T);
-                    attn_post_recipe(s.T, b);
+                    if (fp8_chunked(s.T, b)) {
+                        if (s.T <= 2048) {
+                            if (s.T <= 512) {
+                                attn_fp8_chunk_recipe(s.T, 24576, true);
+                                attn_fp8_chunk_recipe(s.T, 24576, false);
+                            }
+                            if (s.T <= 1024) {
+                                attn_fp8_chunk_recipe(s.T, 12288, true);
+                                attn_fp8_chunk_recipe(s.T, 12288, false);
+                            }
+                            attn_fp8_chunk_recipe(s.T, 6144, true);
+                            attn_fp8_chunk_recipe(s.T, 6144, false);
+                            attn_fp8_chunk_recipe(s.T, 4096, false);
+                            attn_fp8_chunk_recipe(s.T, 8192, false);
+                            attn_post_chunked_tail_recipe(s.T);
+                        }
+                    } else {
+                        attn_post_recipe(s.T, b);
+                    }
                 } else {
                     block_recipe(attn - attn % block_, s.T, b);
                 }
@@ -1543,6 +2069,8 @@ Recipe& Qwen35::head_recipe() {
 void Qwen35::set_capture(std::vector<uint32_t> layers) {
     capture_ = std::move(layers);
     if (!capture_.empty()) feats_ = DeviceBuffer(dev_, capture_.size() * feature_stride());
+    direct_b8_.reset();
+    direct_b1_cache_.clear();
 }
 
 std::vector<float> Qwen35::prefill(std::span<const int32_t> tokens, const std::function<void(uint32_t, uint32_t)>& on_chunk) {
@@ -1550,7 +2078,7 @@ std::vector<float> Qwen35::prefill(std::span<const int32_t> tokens, const std::f
     std::map<std::string, double> prefill_prof;
     size_t done = 0;
     while (done < tokens.size()) {
-        static const size_t piece = [] {  // G2E_PREFILL_PIECE: smaller full pieces (a power of two <= kMaxT)
+        static const size_t piece = [] {  // G2E_PREFILL_PIECE: prefill chunk size (power of two <= kMaxT)
             const char* e = std::getenv("G2E_PREFILL_PIECE");
             size_t v = e ? size_t(std::atoi(e)) : kMaxT;
             return v >= 1 && v <= kMaxT && (v & (v - 1)) == 0 ? v : size_t(kMaxT);
@@ -1559,8 +2087,26 @@ std::vector<float> Qwen35::prefill(std::span<const int32_t> tokens, const std::f
         // a remainder of 2..15 tokens: one padded verification forward (forward_short) instead of its power-of-two
         // pieces; G2E_PREFILL_POW2=1 keeps the pieces
         static const bool pow2 = std::getenv("G2E_PREFILL_POW2") != nullptr;
+        static const bool no_pad = std::getenv("G2E_PREFILL_NO_PAD") != nullptr;
         const bool short_piece = !pow2 && n >= 2 && n < kSpecMaxT && block_ == 1 && spec_wy(kSpecMaxT);
-        if (n < piece && !short_piece) {  // largest power of two <= n
+        uint32_t pad_T = 0;
+        if (!pow2 && !no_pad && !short_piece && block_ == 1 && debug_layer_ < 0 && n > kSpecMaxT && n < piece &&
+            (n & (n - 1)) != 0) {
+            uint32_t t = 32;
+            while (t < n) t *= 2;
+            // Pad up to 256 unconditionally; for 512/1024/2048/4096 pad only when density >= 75% (below 75%, dummy
+            // queries in compute-bound long-context SDPA outweigh the extra launch).
+            const bool worth = t <= 256 ||
+                               (t == 512 && n >= 384) ||
+                               (t == 1024 && n >= 768) ||
+                               (t == 2048 && n >= 1536) ||
+                               (t == 4096 && n >= 3072);
+            if (worth && t <= piece && pos_ + t <= cap_) {
+                const uint32_t sb_pad = attn_rows(std::min<uint32_t>(pos_ + t, cap_), t);
+                if (!fp8_prefill(t, sb_pad) || pos_ + fp8_tail(t) >= sb_pad) pad_T = t;
+            }
+        }
+        if (n < piece && !short_piece && !pad_T) {  // largest power of two <= n
             size_t p = 1;
             while (p * 2 <= n) p *= 2;
             n = p;
@@ -1569,7 +2115,9 @@ std::vector<float> Qwen35::prefill(std::span<const int32_t> tokens, const std::f
         const uint32_t at = pos_;
         static const bool plog = std::getenv("G2E_PREFILL_LOG") != nullptr;  // every forward's wall time
         const auto f0 = std::chrono::steady_clock::now();
-        logits = short_piece ? forward_short(tokens.subspan(done, n), last) : forward(tokens.subspan(done, n), nullptr, last);
+        logits = short_piece ? forward_short(tokens.subspan(done, n), last)
+                             : pad_T ? forward_padded(tokens.subspan(done, n), pad_T, last)
+                                     : forward(tokens.subspan(done, n), nullptr, last);
         if (plog) {
             stream_.synchronize();
             std::fprintf(stderr, "[prefill] %zu rows at %u: %.1f ms (launches up to %llu)\n", n, at,
@@ -1591,7 +2139,7 @@ std::vector<float> Qwen35::prefill(std::span<const int32_t> tokens, const std::f
         if (on_chunk) on_chunk(at, uint32_t(n));
         done += n;
     }
-    if (profile_ && tokens.size() > kMaxT) {
+    if (profile_ && tokens.size() > 2048) {
         std::vector<std::pair<double, std::string>> v;
         double total = 0;
         for (const auto& [k, ms] : prefill_prof) v.push_back({ms, k}), total += ms;
@@ -1744,6 +2292,44 @@ std::vector<float> Qwen35::forward_short(std::span<const int32_t> tokens, bool w
     return std::vector<float>(staging_.as<float>(), staging_.as<float>() + cfg_.vocab);
 }
 
+std::vector<float> Qwen35::forward_padded(std::span<const int32_t> tokens, uint32_t T_pad, bool want_logits) {
+    if (pending_T_ || pending_total_) throw std::logic_error("qwen35: accept() the pending verification first");
+    const uint32_t n = uint32_t(tokens.size());
+    if (!n || n >= T_pad || T_pad > kMaxT || (T_pad & (T_pad - 1)))
+        throw std::invalid_argument("qwen35: forward_padded invalid sizes");
+    std::vector<int32_t> block(tokens.begin(), tokens.end());
+    block.resize(T_pad, tokens.back());
+    const uint64_t row = uint64_t(cfg_.hidden) * 2;
+    Event e0(dev_), e1(dev_), eb(dev_);
+    e0.record(stream_);
+    run_layers(block, false, nullptr, n);
+    eb.record(stream_);
+    if (!want_logits) {
+        e1.record(stream_);
+        stream_.synchronize();
+        last_ms_ = Event::elapsed_ms(e0, e1);
+        pos_ += n;
+        return {};
+    }
+    auto& hr = head_recipe();
+    std::vector<Binding> hb = {{"res", &res_[cur_], (n - 1) * row},
+                               {"delta", &delta_[cur_], (n - 1) * row},
+                               {"final_norm1p", &aux_, aux_off_.at("final_norm1p")},
+                               w_.bind("lm_head", "lm_head"),
+                               {"logits", &logits_, 0}};
+    hr.enqueue(stream_, hb);
+    e1.record(stream_);
+    stream_.download(logits_, 0, staging_, 0, uint64_t(cfg_.vocab) * 4);
+    stream_.synchronize();
+    last_ms_ = Event::elapsed_ms(e0, e1);
+    if (profile_) {
+        prof_.head_ms = Event::elapsed_ms(eb, e1);
+        prof_.blocks_ms = Event::elapsed_ms(e0, eb);
+    }
+    pos_ += n;
+    return std::vector<float>(staging_.as<float>(), staging_.as<float>() + cfg_.vocab);
+}
+
 std::vector<int32_t> Qwen35::verify(std::span<const int32_t> tokens, const std::function<void()>& launched) {
     if (pending_T_ || pending_total_) throw std::logic_error("qwen35: accept() the pending verification first");
     const uint32_t T = uint32_t(tokens.size());
@@ -1833,9 +2419,9 @@ Qwen35::VerifyTop Qwen35::verify_topk(std::span<const int32_t> tokens, float inv
 }
 
 Recipe& Qwen35::verify_topk_recipe(uint32_t T) {
-    const std::string key = "qwen35_vtop2_T" + std::to_string(T);
+    const std::string key = "qwen35_vtop5_T" + std::to_string(T);
     if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
-    const uint64_t H = cfg_.hidden, V = cfg_.vocab;
+    const uint64_t H = cfg_.hidden, V = cfg_.vocab, nc = V / kTopkChunk;
     GraphBuilder g(dev_);
     Ops o(g);
     const auto res = g.input("res", DType::BF16, {T, H});
@@ -1844,13 +2430,21 @@ Recipe& Qwen35::verify_topk_recipe(uint32_t T) {
     const auto w = g.input("lm_head", DType::BF16, {V, H});
     const auto inv_temp = g.input("inv_temp", DType::F32, {1});
     const auto nq = o.add_rmsnorm_quant(delta, res, nw, cfg_.eps, "final");
-    const auto scaled = o.mul(o.linear_bf16(nq.normalized, w, "lg", DType::F32), inv_temp, "scaled");  // [T, V]
-    const auto top = o.topk2(scaled, kTopK, kTopkChunk, g.input("tk_consts", DType::I32, {V + 2 * uint64_t(T)}), "tk");
-    output(g, "top_v", top.first);
+    const auto lg = o.linear_bf16(nq.normalized, w, "lg", DType::F32);  // [T, V]
+    // Single-pass online softmax + topk2 stage-1 chunk maxes (1x HBM read of lg, 3*T items = 100% 24-TPC saturation)
+    const auto pmx = o.temp("pmx_v", DType::F32, {3, T, 64});
+    const auto psm = o.temp("psm_v", DType::F32, {3, T, 64});
+    const auto cmax = o.temp("cmax_v", DType::F32, {T, nc});
+    g.op("flashinfer_gaudi_row_softmax_stats_cmax_f32_gaudi2", {lg, inv_temp}, {pmx, psm, cmax});
+    const auto top = o.topk2(lg, kTopK, kTopkChunk, g.input("tk_consts", DType::I32, {V + 2 * uint64_t(T)}), "tk", cmax);
+    output(g, "top_v", o.mul(top.first, inv_temp, "top_vs"));
     output(g, "top_i", top.second);
-    const auto mx = o.reduce("max", scaled, 1, "mx_v");
-    output(g, "mx", mx);
-    output(g, "sum", o.reduce("sum", o.unary("exp", o.sub(scaled, mx, "shift"), "ex"), 1, "sum_v"));
+    const auto pmx1 = o.reshape(o.split(pmx, 2, {1, 63}, "pmxs")[0], {3, T}, "pmx1");
+    const auto psm1 = o.reshape(o.split(psm, 2, {1, 63}, "psms")[0], {3, T}, "psm1");
+    const auto mx1 = o.reduce("max", pmx1, 0, "mx_r");
+    const auto sm1 = o.reduce("sum", o.mul(psm1, o.unary("exp", o.sub(pmx1, mx1, "dmx"), "emx"), "wsm"), 0, "sm_r");
+    output(g, "mx", o.reshape(mx1, {T, 1}, "mx_o"));
+    output(g, "sum", o.reshape(sm1, {T, 1}, "sm_o"));
     auto r = g.compile(key);
     return *(recipes_[key] = std::move(r));
 }
@@ -1862,22 +2456,54 @@ void Qwen35::accept(uint32_t a) {
     // its own staging region (no host write touches it before the upload has run: no synchronisation needed)
     // (one region per batch index: the accepts of a batched verification are queued back to back)
     const uint64_t ctl = uint64_t(stash_b_) * 4096;
+    const bool dc = pending_wy_ && fast_commit();
     auto* m = reinterpret_cast<float*>(staging_.as<uint8_t>() + kAcceptStage + ctl);
     for (uint32_t t = 0; t < T; ++t) m[t] = t <= a ? 1.f : 0.f;
+    *reinterpret_cast<int32_t*>(staging_.as<uint8_t>() + kAcceptStage + ctl + 1024) = int32_t(a);
     auto* rows = reinterpret_cast<int32_t*>(staging_.as<uint8_t>() + kAcceptStage + ctl + 2048);
     for (uint32_t k = 0; k + 1 < cfg_.conv_kernel; ++k) rows[k] = int32_t(a + 1 + k);
     stream_.upload(staging_, kAcceptStage + ctl, spec_ctl_, ctl, 4096);
-    std::vector<Binding> b = {{"mask", &spec_ctl_, ctl}, {"rows", &spec_ctl_, ctl + 2048}};
-    const std::string cp = "chunk" + std::to_string(T) + ".";
-    std::vector<std::string> names = {"upper", "strict", "inclusive", "lower", "eye", "diag8"};
-    for (uint32_t sz = 8; sz < T; sz *= 2) names.push_back("ll" + std::to_string(sz));
-    if (T >= 8) for (const auto& nm : names) b.push_back({cp + nm, &aux_, aux_off_.at(cp + nm)});
     const auto L = stash_layout(T, pending_wy_);
+    bool same_sides = !ssm_side_.empty();
+    for (size_t i = 1; i < ssm_side_.size() && same_sides; ++i)
+        if (ssm_side_[i] != ssm_side_[0] || conv_side_[i] != conv_side_[0]) same_sides = false;
+    DirectBatchState* b1_st = nullptr;
+    if (auto it = direct_b1_cache_.find(cap_); it != direct_b1_cache_.end()) b1_st = it->second.get();
+    else if (!direct_b1_cache_.empty()) b1_st = direct_b1_cache_.begin()->second.get();
+    if (T == 16 && dc && same_sides && direct_shared_ && !direct_shared_->failed &&
+        b1_st && !b1_st->failed && num_gdn_ > 0 && cfg_.conv_kernel == 4) {
+        stream_.synchronize();
+        DirectGdnCommitArgs cargs{};
+        const uint64_t NG = std::max(num_gdn_, 1u);
+        cargs.ssm[0] = ssm_all_[ssm_side_[0]].address();
+        cargs.conv_out[0] = conv_all_[conv_side_[0]].address();
+        cargs.x[0] = spec_stash_.address() + L.base[0] + uint64_t(stash_b_) * NG * L.size[0];
+        cargs.v[0] = spec_stash_.address() + L.base[2] + uint64_t(stash_b_) * NG * L.size[2];
+        cargs.g[0] = spec_stash_.address() + L.base[3] + uint64_t(stash_b_) * NG * L.size[3];
+        cargs.seq[0] = spec_stash_.address() + L.base[5] + uint64_t(stash_b_) * NG * L.size[5];
+        cargs.acc[0] = spec_ctl_.address() + ctl + 1024;
+        cargs.rows[0] = spec_ctl_.address() + ctl + 2048;
+        auto& cm = b1_st->commits[1];
+        if (!cm) cm = std::make_unique<DirectGdnCommit>(*direct_shared_->rt, b1_st->assets, num_gdn_, T, cargs, 0xa, 1);
+        else cm->update_args(cargs);
+        cm->run();
+        pending_T_ = 0;
+        if (pending_total_) --pending_total_;
+        pos_ += a + 1;
+        return;
+    }
+    std::vector<Binding> b = {{dc ? "acc" : "mask", &spec_ctl_, dc ? ctl + 1024 : ctl}, {"rows", &spec_ctl_, ctl + 2048}};
+    if (!dc) {
+        const std::string cp = "chunk" + std::to_string(T) + ".";
+        std::vector<std::string> names = {"upper", "strict", "inclusive", "lower", "eye", "diag8"};
+        for (uint32_t sz = 8; sz < T; sz *= 2) names.push_back("ll" + std::to_string(sz));
+        if (T >= 8) for (const auto& nm : names) b.push_back({cp + nm, &aux_, aux_off_.at(cp + nm)});
+    }
     const char* fields[] = {"q", "k", "v", "g", "b", "seq"};
     if (pending_wy_) fields[0] = "x";
-    const uint64_t NG = std::max(num_gdn_, 1u);
+    if (dc) fields[4] = nullptr;
     for (int f = 0; f < 6; ++f)
-        if (L.size[f]) b.push_back({fields[f], &spec_stash_, L.base[f] + uint64_t(stash_b_) * NG * L.size[f]});
+        if (fields[f] && L.size[f]) b.push_back({fields[f], &spec_stash_, L.base[f] + uint64_t(stash_b_) * std::max(num_gdn_, 1u) * L.size[f]});
     b.push_back({"ssm_in", &ssm_all_[ssm_side_[0]], 0});
     b.push_back({"ssm_out", &ssm_all_[ssm_side_[0] ^ 1], 0});
     b.push_back({"conv_out", &conv_all_[conv_side_[0] ^ 1], 0});
@@ -1967,13 +2593,30 @@ Recipe& Qwen35::verify_head_recipe(uint32_t T) {
 // Commit of a verification: per GDN layer, the state after the accepted rows (rejected rows get beta = g = 0, so
 // they leave the state unchanged) and the conv window ending at the last accepted row.
 Recipe& Qwen35::spec_commit_recipe(uint32_t T, bool raw_qk) {  // raw_qk: the stash holds un-normalised q/k
-    const std::string key = "qwen35_speccommit2_T" + std::to_string(T) + (raw_qk ? "_x" : "");
+    const bool dc = raw_qk && fast_commit();
+    const std::string key = dc ? ("qwen35_speccommit_dc_T" + std::to_string(T))
+                               : ("qwen35_speccommit2_T" + std::to_string(T) + (raw_qk ? "_x" : ""));
     if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
     const uint64_t HK = cfg_.lin_k_heads, HV = cfg_.lin_v_heads, DK = cfg_.lin_k_dim, DV = cfg_.lin_v_dim,
                    C = cfg_.conv_channels(), KC = cfg_.conv_kernel, NG = num_gdn_;
     GraphBuilder g(dev_);
     Ops o(g);
     build_inputs_.clear();
+    if (dc) {
+        const auto acc = g.input("acc", DType::I32, {1});
+        const auto rows = g.input("rows", DType::I32, {KC - 1});
+        const auto ssm_in = g.input("ssm_in", DType::F32, {NG * HV, DV, DK});
+        const auto x = g.input("x", DType::F32, {NG, HK, 2 * T, DK});
+        const auto ds = g.input("v", DType::F32, {NG, T, HV, DV});
+        const auto gd = g.input("g", DType::F32, {NG, T, HV});
+        const auto s_next = o.temp("ssm_next", DType::F32, {NG * HV, DV, DK});
+        g.op("flashinfer_gaudi_gdn_state_commit_f32_gaudi2", {ssm_in, x, ds, gd, acc}, {s_next});
+        output(g, "ssm_out", s_next);
+        const auto seq = g.input("seq", DType::BF16, {NG, T + KC - 1, C});
+        output(g, "conv_out", o.gather(seq, rows, 1, "win"));
+        auto r = g.compile(key);
+        return *(recipes_[key] = std::move(r));
+    }
     // every GDN layer at once: the layers become extra heads (value head l*HV+h uses key head l*HK+h/REP)
     const auto mask = g.input("mask", DType::F32, {T, 1});
     const auto rows = g.input("rows", DType::I32, {KC - 1});
@@ -2028,7 +2671,9 @@ uint32_t Qwen35::core_bucket(uint32_t rows) {
 Recipe& Qwen35::acore_batch_recipe(uint32_t B, uint32_t T, uint32_t Sb) {
     // acore_recipe for B slots in one graph: slot b's queries are rows b*T.. of q_in, its visible rows last[b], its
     // cache k/v_cache<b>_<h> (Sb rows: the bucket of the longest slot; the others' extra rows are masked)
-    const std::string key = "qwen35_acoreb_B" + std::to_string(B) + "_T" + std::to_string(T) + "_S" + std::to_string(Sb);
+    const bool f8_sm = kv8_ && fast_f8_softmax();
+    const std::string key = "qwen35_acoreb_B" + std::to_string(B) + "_T" + std::to_string(T) + "_S" + std::to_string(Sb) +
+                            (f8_sm ? "_f8s" : "");
     if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
     if (Sb % 1024) throw std::logic_error("qwen35: acore rows must be a multiple of 1024");
     const uint64_t NH = cfg_.heads, KV = cfg_.kv_heads, D = cfg_.head_dim, G = NH / KV;
@@ -2053,17 +2698,18 @@ Recipe& Qwen35::acore_batch_recipe(uint32_t B, uint32_t T, uint32_t Sb) {
         }
         for (uint64_t h = 0; h < KV; ++h) {
             const auto hs = std::to_string(h);
-            prs[h] = o.temp(x + "pr" + hs, DType::BF16, {NC, R, C});
+            prs[h] = o.temp(x + "pr" + hs, f8_sm ? DType::F8 : DType::BF16, {NC, R, C});
             sums[h] = o.temp(x + "psum" + hs, DType::F32, {R, 1});
             const TensorId ins[] = {scs[h], last};
             const TensorId kouts[] = {prs[h], sums[h]};
-            g.op("flashinfer_gaudi_masked_softmax_bf16_gaudi2", ins, kouts, &scale, sizeof(float));
+            g.op(f8_sm ? "flashinfer_gaudi_masked_softmax_bf16_f8_gaudi2" : "flashinfer_gaudi_masked_softmax_bf16_gaudi2",
+                 ins, kouts, &scale, sizeof(float));
         }
         for (uint64_t h = 0; h < KV; ++h) {
             const auto hs = std::to_string(h);
             const auto acc = o.reduce("sum", kv_pv(o, prs[h], o.reshape(vcs[h], {NC, C, D}, x + "vc3" + hs), x + "pvc" + hs), 0,
                                       x + "pvs" + hs);
-            const auto den = kv8_ ? o.mul(sums[h], o.constant(128.f, {1}, x + "p128" + hs), x + "psum8" + hs) : sums[h];
+            const auto den = (kv8_ && !f8_sm) ? o.mul(sums[h], o.constant(128.f, {1}, x + "p128" + hs), x + "psum8" + hs) : sums[h];
             const auto oh = o.div(o.reshape(acc, {R, D}, x + "pv2" + hs), den, x + "pvn" + hs);
             outs.push_back(o.reshape(o.cast(oh, DType::BF16, x + "pvb" + hs), {1, R, D}, x + "sd3" + hs));
         }
@@ -2082,6 +2728,8 @@ uint32_t Qwen35::core_rows(uint32_t rows) {
 
 Recipe& Qwen35::gdn_batch_recipe(uint32_t B, uint32_t T) {
     std::string key = "qwen35_gdnb2_B" + std::to_string(B) + (T != kSpecMaxT ? "_T" + std::to_string(T) : "");
+    if (fast_commit()) key += "_dc";
+    if (fast_gdn_prep()) key += "_bp";
     if (fused_gate_quant()) key += "_mq";
     if (gated_kernel()) key += "_gk2";
     if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
@@ -2103,9 +2751,11 @@ Recipe& Qwen35::gdn_batch_recipe(uint32_t B, uint32_t T) {
 }
 
 Recipe& Qwen35::apre_batch_recipe(uint32_t B, uint32_t T) {
-    const std::string key = "qwen35_apreb_B" + std::to_string(B) + (T != kSpecMaxT ? "_T" + std::to_string(T) : "");
-    if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
     const uint64_t H = cfg_.hidden, NH = cfg_.heads, KV = cfg_.kv_heads, D = cfg_.head_dim, R2 = cfg_.rotary_dim / 2;
+    const bool ak = fast_apre() && D == 256 && R2 == 32;
+    const std::string key = "qwen35_apreb_B" + std::to_string(B) + (T != kSpecMaxT ? "_T" + std::to_string(T) : "") +
+                            (ak ? "_ak" : "");
+    if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
     const uint64_t R = uint64_t(T) * B;
     const uint32_t j = 0;
     GraphBuilder g(dev_);
@@ -2120,11 +2770,39 @@ Recipe& Qwen35::apre_batch_recipe(uint32_t B, uint32_t T) {
     // would overlap when two slots stand at the same position: persistent tensors must not)
     const uint64_t tab = uint64_t(max_ctx_) + kMaxT;
     const auto rpos = g.input("rope_pos", DType::I32, {R});
-    const auto cosv = o.reshape(o.gather_rows(g.input("cos_tab", DType::F32, {tab, R2}), rpos, "cosg"), {R, 1, R2}, "cos3");
-    const auto sinv = o.reshape(o.gather_rows(g.input("sin_tab", DType::F32, {tab, R2}), rpos, "sing"), {R, 1, R2}, "sin3");
-    // as attn_pre_recipe
-    const auto nq = o.add_rmsnorm_quant(delta, res, in_norm, cfg_.eps, P(j, "in"));
+    const auto cosg = o.gather_rows(g.input("cos_tab", DType::F32, {tab, R2}), rpos, "cosg");
+    const auto sing = o.gather_rows(g.input("sin_tab", DType::F32, {tab, R2}), rpos, "sing");
+    // as attn_pre_recipe (normalized output is unused in apre_batch_recipe)
+    const auto nq = o.add_rmsnorm_quant(delta, res, in_norm, cfg_.eps, P(j, "in"), false);
     const auto qkv = o.fp8_gemm(nq.codes, nq.scale, qkv_w, qkv_s, P(j, "qkv"));
+    output(g, "resid_out", nq.residual_out);
+    if (ak) {
+        const auto qo = o.temp(P(j, "qr"), DType::BF16, {R, NH, D});
+        const auto go = o.temp(P(j, "gate"), DType::BF16, {R, NH * D});
+        const auto ka = o.temp("kt", kv_dt(), {KV, R, D});
+        const auto va = o.temp("vt", kv_dt(), {KV, R, D});
+        const float eps = cfg_.eps;
+        g.op(kv8_ ? "flashinfer_gaudi_attn_qkv_prep_f8_gaudi2" : "flashinfer_gaudi_attn_qkv_prep_bf16_gaudi2",
+             {qkv, q_norm, k_norm, cosg, sing}, {qo, go, ka, va}, &eps, sizeof(eps));
+        output(g, "q_out", qo);
+        output(g, "gate_out", go);
+        const auto kh = o.split(ka, 0, std::vector<uint64_t>(KV, 1), "kh");
+        const auto vh = o.split(va, 0, std::vector<uint64_t>(KV, 1), "vh");
+        for (uint64_t h = 0; h < KV; ++h) {
+            const auto hs = std::to_string(h);
+            const auto kb = o.split(o.reshape(kh[h], {R, D}, "k2_" + hs), 0, std::vector<uint64_t>(B, T), "kb" + hs);
+            const auto vb = o.split(o.reshape(vh[h], {R, D}, "v2_" + hs), 0, std::vector<uint64_t>(B, T), "vb" + hs);
+            for (uint32_t b = 0; b < B; ++b) {
+                const auto x = std::to_string(b) + "_" + hs;
+                output(g, "k_out" + x, kb[b]);
+                output(g, "v_out" + x, vb[b]);
+            }
+        }
+        auto r = g.compile(key);
+        return *(recipes_[key] = std::move(r));
+    }
+    const auto cosv = o.reshape(cosg, {R, 1, R2}, "cos3");
+    const auto sinv = o.reshape(sing, {R, 1, R2}, "sin3");
     const auto p = o.split(qkv, 1, {NH * D * 2, KV * D, KV * D}, P(j, "qkv_split"));
     const auto qg = o.split(o.reshape(p[0], {R, NH, 2 * D}, P(j, "qg3")), 2, {D, D}, P(j, "qg_split"));
     const auto q = o.rms_norm(qg[0], q_norm, cfg_.eps, true, P(j, "qn"));
@@ -2139,7 +2817,6 @@ Recipe& Qwen35::apre_batch_recipe(uint32_t B, uint32_t T) {
     };
     output(g, "q_out", rope(q, P(j, "qr")));
     output(g, "gate_out", o.reshape(qg[1], {R, NH * D}, P(j, "gate")));
-    output(g, "resid_out", nq.residual_out);
     const auto kh = o.split(o.transpose(rope(k, P(j, "kr")), {1, 0, 2}, "kt"), 0, std::vector<uint64_t>(KV, 1), "kh");
     const auto vh = o.split(o.transpose(v, {1, 0, 2}, "vt"), 0, std::vector<uint64_t>(KV, 1), "vh");
     for (uint64_t h = 0; h < KV; ++h) {  // rows pos_b .. pos_b + T - 1 of each slot's cache, per head
@@ -2161,7 +2838,9 @@ Recipe& Qwen35::acore_recipe(uint32_t T, uint32_t Sb) {
     // o_proj and MLP (batched in apost_batch_recipe); prefill-sized pieces (T > 16) take FP16 scores and the FP16
     // softmax kernel, as attn_post_recipe's prefill form
     const bool f16 = T > kSpecMaxT && !kv8_;
-    const std::string key = "qwen35_acore_T" + std::to_string(T) + "_S" + std::to_string(Sb) + (f16 ? "_f16" : "");
+    const bool f8_sm = !f16 && kv8_ && fast_f8_softmax();
+    const std::string key = "qwen35_acore_T" + std::to_string(T) + "_S" + std::to_string(Sb) +
+                            (f16 ? "_f16" : f8_sm ? "_f8s" : "");
     if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
     if (Sb % 1024) throw std::logic_error("qwen35: acore rows must be a multiple of 1024");
     const uint64_t NH = cfg_.heads, KV = cfg_.kv_heads, D = cfg_.head_dim, G = NH / KV;
@@ -2183,18 +2862,20 @@ Recipe& Qwen35::acore_recipe(uint32_t T, uint32_t Sb) {
     }
     for (uint64_t h = 0; h < KV; ++h) {
         const auto hs = std::to_string(h);
-        prs[h] = o.temp("pr" + hs, DType::BF16, {NC, R, C});
+        prs[h] = o.temp("pr" + hs, f8_sm ? DType::F8 : DType::BF16, {NC, R, C});
         sums[h] = o.temp("psum" + hs, DType::F32, {R, 1});
         const TensorId ins[] = {scs[h], last};
         const TensorId kouts[] = {prs[h], sums[h]};
-        g.op(f16 ? "flashinfer_gaudi_masked_softmax_f16_gaudi2" : "flashinfer_gaudi_masked_softmax_bf16_gaudi2", ins, kouts, &scale,
-             sizeof(float));
+        g.op(f16 ? "flashinfer_gaudi_masked_softmax_f16_gaudi2"
+                 : f8_sm ? "flashinfer_gaudi_masked_softmax_bf16_f8_gaudi2"
+                         : "flashinfer_gaudi_masked_softmax_bf16_gaudi2",
+             ins, kouts, &scale, sizeof(float));
     }
     for (uint64_t h = 0; h < KV; ++h) {
         const auto hs = std::to_string(h);
         const auto acc = o.reduce("sum", kv_pv(o, prs[h], o.reshape(vcs[h], {NC, C, D}, "vc3" + hs), "pvc" + hs), 0,
                                   "pvs" + hs);  // [1, R, D]
-        const auto den = kv8_ ? o.mul(sums[h], o.constant(128.f, {1}, "p128" + hs), "psum8" + hs) : sums[h];
+        const auto den = (kv8_ && !f8_sm) ? o.mul(sums[h], o.constant(128.f, {1}, "p128" + hs), "psum8" + hs) : sums[h];
         const auto oh = o.div(o.reshape(acc, {R, D}, "pv2" + hs), den, "pvn" + hs);
         outs.push_back(o.reshape(o.cast(oh, DType::BF16, "pvb" + hs), {1, R, D}, "sd3" + hs));
     }
@@ -2205,8 +2886,10 @@ Recipe& Qwen35::acore_recipe(uint32_t T, uint32_t Sb) {
 }
 
 Recipe& Qwen35::apost_batch_recipe(uint32_t B, uint32_t T) {
+    const uint64_t R_check = uint64_t(T) * B;
+    const bool dqf = std::getenv("G2E_NO_DQ_FOLD") == nullptr && (std::getenv("G2E_DQ_FOLD") != nullptr || R_check >= 256);
     const std::string key = "qwen35_apostb_B" + std::to_string(B) + (T != kSpecMaxT ? "_T" + std::to_string(T) : "") +
-                            (fused_gate_quant() ? "_mq" : "");
+                            (fused_gate_quant() ? "_mq" : "") + (dqf ? "_dqf2" : "");
     if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
     const uint64_t H = cfg_.hidden, NH = cfg_.heads, D = cfg_.head_dim, R = uint64_t(T) * B;
     const uint32_t j = 0;
@@ -2224,8 +2907,7 @@ Recipe& Qwen35::apost_batch_recipe(uint32_t B, uint32_t T) {
     } else {
         q8 = o.quantize(o.mul(att2, o.unary("sigmoid", gate, "gsig"), "gated"), "gq");
     }
-    const auto y = o.fp8_gemm(q8.first, q8.second, o_w, o_s, P(j, "oproj"));
-    const auto out = mlp(o, j, y, resid);
+    const auto out = proj_mlp(o, j, q8.first, q8.second, o_w, o_s, resid, P(j, "oproj"), true);
     output(g, "res_out", out.res);
     output(g, "delta_out", out.delta);
     auto r = g.compile(key);
@@ -2235,13 +2917,33 @@ Recipe& Qwen35::apost_batch_recipe(uint32_t B, uint32_t T) {
 // Commit of several slots' batched verifications at once: as spec_commit_recipe per slot (its own mask, conv rows
 // and stash), the recurrences of every slot's GDN layers as extra heads of one chunked delta rule.
 Recipe& Qwen35::spec_commit_batch_recipe(uint32_t B, uint32_t T, bool raw_qk) {
-    const std::string key = "qwen35_speccommitb2_B" + std::to_string(B) + "_T" + std::to_string(T) + (raw_qk ? "_x" : "");
+    const bool dc = raw_qk && fast_commit();
+    const std::string key = dc ? ("qwen35_speccommitb_dc_B" + std::to_string(B) + "_T" + std::to_string(T))
+                               : ("qwen35_speccommitb2_B" + std::to_string(B) + "_T" + std::to_string(T) + (raw_qk ? "_x" : ""));
     if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
     const uint64_t HK = cfg_.lin_k_heads, HV = cfg_.lin_v_heads, DK = cfg_.lin_k_dim, DV = cfg_.lin_v_dim,
                    C = cfg_.conv_channels(), KC = cfg_.conv_kernel, NG = num_gdn_;
     GraphBuilder g(dev_);
     Ops o(g);
     build_inputs_.clear();
+    if (dc) {
+        for (uint32_t b = 0; b < B; ++b) {
+            const std::string x = std::to_string(b);
+            const auto acc = g.input("acc" + x, DType::I32, {1});
+            const auto rows = g.input("rows" + x, DType::I32, {KC - 1});
+            const auto ssm_in = g.input("ssm_in" + x, DType::F32, {NG * HV, DV, DK});
+            const auto xin = g.input("x" + x, DType::F32, {NG, HK, 2 * T, DK});
+            const auto ds = g.input("v" + x, DType::F32, {NG, T, HV, DV});
+            const auto gd = g.input("g" + x, DType::F32, {NG, T, HV});
+            const auto s_next = o.temp("ssm_next" + x, DType::F32, {NG * HV, DV, DK});
+            g.op("flashinfer_gaudi_gdn_state_commit_f32_gaudi2", {ssm_in, xin, ds, gd, acc}, {s_next});
+            output(g, "ssm_out" + x, s_next);
+            const auto seq = g.input("seq" + x, DType::BF16, {NG, T + KC - 1, C});
+            output(g, "conv_out" + x, o.gather(seq, rows, 1, "win" + x));
+        }
+        auto r = g.compile(key);
+        return *(recipes_[key] = std::move(r));
+    }
     std::vector<TensorId> qs, ks, vs, gs, bs, ss;
     for (uint32_t b = 0; b < B; ++b) {
         const std::string x = std::to_string(b);
@@ -2315,40 +3017,84 @@ void Qwen35::accept_batch(std::span<const uint32_t> slots, std::span<const uint3
         top = std::max(top, q.stash_b + 1);
         sq.push_back(&q);
     }
-    // controls: per slot (its batch index's region) mask [T,1] f32 at 0, conv rows [3] i32 at 2048; one upload
+    // controls: per slot (its batch index's region) mask [T,1] f32 at 0, acc at 1024, conv rows [3] i32 at 2048; one upload
+    const bool dc = wy && fast_commit();
     for (uint32_t b = 0; b < B; ++b) {
         const uint64_t ctl = uint64_t(sq[b]->stash_b) * 4096;
         auto* m = reinterpret_cast<float*>(staging_.as<uint8_t>() + kAcceptStage + ctl);
         for (uint32_t t = 0; t < T; ++t) m[t] = t <= accepted[b] ? 1.f : 0.f;
+        *reinterpret_cast<int32_t*>(staging_.as<uint8_t>() + kAcceptStage + ctl + 1024) = int32_t(accepted[b]);
         auto* rows = reinterpret_cast<int32_t*>(staging_.as<uint8_t>() + kAcceptStage + ctl + 2048);
         for (uint32_t k = 0; k + 1 < cfg_.conv_kernel; ++k) rows[k] = int32_t(accepted[b] + 1 + k);
     }
     stream_.upload(staging_, kAcceptStage, spec_ctl_, 0, uint64_t(top) * 4096);
     std::vector<Binding> bnd;
-    const std::string cp = "chunk" + std::to_string(T) + ".";
-    std::vector<std::string> names = {"upper", "strict", "inclusive", "lower", "eye", "diag8"};
-    for (uint32_t sz = 8; sz < T; sz *= 2) names.push_back("ll" + std::to_string(sz));
-    for (const auto& nm : names) bnd.push_back({cp + nm, &aux_, aux_off_.at(cp + nm)});
+    if (!dc) {
+        const std::string cp = "chunk" + std::to_string(T) + ".";
+        std::vector<std::string> names = {"upper", "strict", "inclusive", "lower", "eye", "diag8"};
+        for (uint32_t sz = 8; sz < T; sz *= 2) names.push_back("ll" + std::to_string(sz));
+        for (const auto& nm : names) bnd.push_back({cp + nm, &aux_, aux_off_.at(cp + nm)});
+    }
     const auto L = stash_layout(T, wy);
     const uint64_t NG = std::max(num_gdn_, 1u);
-    const char* fields[] = {wy ? "x" : "q", "k", "v", "g", "b", "seq"};
+    bool same_sides = true;
+    for (uint32_t b = 0; b < B && same_sides; ++b) {
+        const Seq& q = *sq[b];
+        if (q.ssm_side.empty()) { same_sides = false; break; }
+        for (size_t i = 1; i < q.ssm_side.size(); ++i)
+            if (q.ssm_side[i] != q.ssm_side[0] || q.conv_side[i] != q.conv_side[0]) { same_sides = false; break; }
+    }
+    if (B == 8 && T == 16 && dc && same_sides && direct_shared_ && !direct_shared_->failed &&
+        direct_b8_ && !direct_b8_->failed && num_gdn_ > 0 && cfg_.conv_kernel == 4) {
+        stream_.synchronize();  // ensure spec_ctl_ upload is visible in HBM before Direct SCAL commit
+        DirectGdnCommitArgs cargs{};
+        for (uint32_t b = 0; b < B; ++b) {
+            const Seq& q = *sq[b];
+            const uint64_t ctl = uint64_t(q.stash_b) * 4096;
+            cargs.ssm[b] = q.ssm[q.ssm_side[0]].address();
+            cargs.conv_out[b] = q.conv[q.conv_side[0]].address();
+            cargs.x[b] = spec_stash_.address() + L.base[0] + uint64_t(q.stash_b) * NG * L.size[0];
+            cargs.v[b] = spec_stash_.address() + L.base[2] + uint64_t(q.stash_b) * NG * L.size[2];
+            cargs.g[b] = spec_stash_.address() + L.base[3] + uint64_t(q.stash_b) * NG * L.size[3];
+            cargs.seq[b] = spec_stash_.address() + L.base[5] + uint64_t(q.stash_b) * NG * L.size[5];
+            cargs.acc[b] = spec_ctl_.address() + ctl + 1024;
+            cargs.rows[b] = spec_ctl_.address() + ctl + 2048;
+        }
+        auto& cm = direct_b8_->commits[B];
+        if (!cm) {
+            cm = std::make_unique<DirectGdnCommit>(*direct_shared_->rt, direct_b8_->assets, num_gdn_, T, cargs, 0xa, B);
+        } else {
+            cm->update_args(cargs);
+        }
+        cm->run();
+        for (uint32_t b = 0; b < B; ++b) {
+            Seq& q = *sq[b];
+            q.pending_T = 0;
+            q.pos += accepted[b] + 1;
+        }
+        pending_total_ -= std::min(pending_total_, B);
+        return;
+    }
+    const char* fields[] = {wy ? "x" : "q", "k", "v", "g", dc ? nullptr : "b", "seq"};
     for (uint32_t b = 0; b < B; ++b) {
         const Seq& q = *sq[b];
         const std::string x = std::to_string(b);
         const uint64_t ctl = uint64_t(q.stash_b) * 4096;
-        bnd.push_back({"mask" + x, &spec_ctl_, ctl});
+        bnd.push_back({(dc ? "acc" : "mask") + x, &spec_ctl_, dc ? ctl + 1024 : ctl});
         bnd.push_back({"rows" + x, &spec_ctl_, ctl + 2048});
         for (int f = 0; f < 6; ++f)
-            if (L.size[f]) bnd.push_back({fields[f] + x, &spec_stash_, L.base[f] + uint64_t(q.stash_b) * NG * L.size[f]});
+            if (fields[f] && L.size[f]) bnd.push_back({fields[f] + x, &spec_stash_, L.base[f] + uint64_t(q.stash_b) * NG * L.size[f]});
         bnd.push_back({"ssm_in" + x, &q.ssm[q.ssm_side[0]], 0});
         bnd.push_back({"ssm_out" + x, &q.ssm[q.ssm_side[0] ^ 1], 0});
-        bnd.push_back({"conv_out" + x, &q.conv[q.conv_side[0] ^ 1], 0});
+        // conv_out reads only from spec_stash_ (never q.conv), so writing to the current conv_side avoids flipping it!
+        bnd.push_back({"conv_out" + x, &q.conv[dc ? q.conv_side[0] : (q.conv_side[0] ^ 1)], 0});
     }
     spec_commit_batch_recipe(B, T, wy).enqueue(stream_, bnd);
     for (uint32_t b = 0; b < B; ++b) {
         Seq& q = *sq[b];
         for (auto& side : q.ssm_side) side ^= 1;
-        for (auto& side : q.conv_side) side ^= 1;
+        if (!dc)
+            for (auto& side : q.conv_side) side ^= 1;
         q.pending_T = 0;
         q.pos += accepted[b] + 1;
     }
@@ -2356,7 +3102,13 @@ void Qwen35::accept_batch(std::span<const uint32_t> slots, std::span<const uint3
 }
 
 Recipe& Qwen35::gdn_prefill_batch_recipe(uint32_t B, uint32_t T) {
+    const uint64_t R_check = uint64_t(T) * B;
+    const bool fg = gdn_prefill_fast_enabled() && gdn_chunk() == 64 && cfg_.lin_k_dim == 128 && cfg_.lin_v_dim == 128 &&
+                    cfg_.lin_v_heads <= 64 && (cfg_.lin_v_heads % 4) == 0 && fused_gate_quant();
+    const bool dqf = std::getenv("G2E_NO_DQ_FOLD") == nullptr && (std::getenv("G2E_DQ_FOLD") != nullptr || R_check >= 256);
     std::string key = "qwen35_gdnpb_B" + std::to_string(B) + "_T" + std::to_string(T) + "_c" + std::to_string(gdn_chunk());
+    if (fg) key += "_fg4";
+    if (dqf) key += "_dqf2";
     if (fused_gate_quant()) key += "_mq";
     if (gated_kernel()) key += "_gk2";
     if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
@@ -2507,7 +3259,10 @@ std::vector<std::vector<float>> Qwen35::prefill_batch(std::span<const uint32_t> 
             }
             {
                 const std::string cp = "chunk" + std::to_string(gdn_chunk()) + ".";
-                std::vector<std::string> names = {"upper", "strict", "inclusive", "lower", "eye", "diag8"};
+                const bool fg = gdn_prefill_fast_enabled() && gdn_chunk() == 64 && cfg_.lin_k_dim == 128 && cfg_.lin_v_dim == 128 &&
+                                cfg_.lin_v_heads <= 64 && (cfg_.lin_v_heads % 4) == 0 && fused_gate_quant();
+                std::vector<std::string> names = fg ? std::vector<std::string>{"upper", "lower"}
+                                                    : std::vector<std::string>{"upper", "strict", "inclusive", "lower", "eye", "diag8"};
                 for (uint32_t sz = 8; sz < gdn_chunk(); sz *= 2) names.push_back("ll" + std::to_string(sz));
                 for (const auto& nm : names) gb.push_back({cp + nm, &aux_, aux_off_.at(cp + nm)});
             }
@@ -2569,9 +3324,9 @@ std::vector<Qwen35::VerifyTop> Qwen35::verify_batch_topk(std::span<const uint32_
 }
 
 Recipe& Qwen35::verify_topkb_recipe(uint32_t R) {
-    const std::string key = "qwen35_vtopb_R" + std::to_string(R);
+    const std::string key = "qwen35_vtopb4_R" + std::to_string(R);
     if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
-    const uint64_t H = cfg_.hidden, V = cfg_.vocab;
+    const uint64_t H = cfg_.hidden, V = cfg_.vocab, nc = V / kTopkChunk;
     GraphBuilder g(dev_);
     Ops o(g);
     const auto res = g.input("res", DType::BF16, {R, H});
@@ -2580,15 +3335,298 @@ Recipe& Qwen35::verify_topkb_recipe(uint32_t R) {
     const auto w = g.input("lm_head", DType::BF16, {V, H});
     const auto inv_temp = g.input("inv_temp", DType::F32, {R, 1});
     const auto nq = o.add_rmsnorm_quant(delta, res, nw, cfg_.eps, "final");
-    const auto scaled = o.mul(o.linear_bf16(nq.normalized, w, "lg", DType::F32), inv_temp, "scaled");  // [R, V]
-    const auto top = o.topk2(scaled, kTopK, kTopkChunk, g.input("tk_consts", DType::I32, {V + 2 * uint64_t(R)}), "tk");
-    output(g, "top_v", top.first);
+    const auto lg = o.linear_bf16(nq.normalized, w, "lg", DType::F32);  // [R, V]
+    const auto pmx = o.temp("pmx_v", DType::F32, {3, R, 64});
+    const auto psm = o.temp("psm_v", DType::F32, {3, R, 64});
+    const auto cmax = o.temp("cmax_v", DType::F32, {R, nc});
+    g.op("flashinfer_gaudi_row_softmax_stats_cmax_f32_gaudi2", {lg, inv_temp}, {pmx, psm, cmax});
+    const auto top = o.topk2(lg, kTopK, kTopkChunk, g.input("tk_consts", DType::I32, {V + 2 * uint64_t(R)}), "tk", cmax);
+    output(g, "top_v", o.mul(top.first, inv_temp, "top_vs"));
     output(g, "top_i", top.second);
-    const auto mx = o.reduce("max", scaled, 1, "mx_v");
-    output(g, "mx", mx);
-    output(g, "sum", o.reduce("sum", o.unary("exp", o.sub(scaled, mx, "shift"), "ex"), 1, "sum_v"));
+    const auto pmx1 = o.reshape(o.split(pmx, 2, {1, 63}, "pmxs")[0], {3, R}, "pmx1");
+    const auto psm1 = o.reshape(o.split(psm, 2, {1, 63}, "psms")[0], {3, R}, "psm1");
+    const auto mx1 = o.reduce("max", pmx1, 0, "mx_r");
+    const auto sm1 = o.reduce("sum", o.mul(psm1, o.unary("exp", o.sub(pmx1, mx1, "dmx"), "emx"), "wsm"), 0, "sm_r");
+    output(g, "mx", o.reshape(mx1, {R, 1}, "mx_o"));
+    output(g, "sum", o.reshape(sm1, {R, 1}, "sm_o"));
     auto r = g.compile(key);
     return *(recipes_[key] = std::move(r));
+}
+
+bool Qwen35::ensure_direct_shared(uint32_t nl) {
+    static const bool enabled = std::getenv("G2E_NO_DIRECT_MME") == nullptr &&
+                                (std::getenv("G2E_DIRECT_MME") != nullptr ||
+                                 std::getenv("SCAL_CONFIG_FILE_PATH") != nullptr ||
+                                 std::getenv("SCAL_CFG_FILE_PATH") != nullptr);
+    if (!enabled) return false;
+    if (cfg_.hidden != 5120 || cfg_.intermediate != 17408 || cfg_.heads != 24 || cfg_.kv_heads != 4 ||
+        cfg_.head_dim != 256 || cfg_.rotary_dim != 64 || !wy_geometry() || !fast_commit() || debug_layer_ >= 0)
+        return false;
+    if (direct_shared_ && direct_shared_->built_limit >= nl) return !direct_shared_->failed;
+    direct_shared_ = std::make_unique<DirectShared>();
+    direct_shared_->built_limit = nl;
+    try {
+        direct_shared_->rt = std::make_unique<DirectRuntime>(dev_);
+        const char* dd = std::getenv("G2E_MME_DESC_DIR");
+        const char* td = std::getenv("G2E_TPC_OBJ_DIR");
+        const std::string desc_dir = (dd && *dd) ? dd : (std::string(G2E_SOURCE_DIR) + "/tools/mme_descs_R128");
+        const std::string tpc_dir = (td && *td) ? td : std::string(G2E_TPC_OBJ_DIR);
+        direct_shared_->attn_assets = DirectAttnAssets::load(*direct_shared_->rt, desc_dir, tpc_dir);
+
+        const uint64_t H = cfg_.hidden;
+        std::vector<uint8_t> host_sc;
+        auto put_iv = [&](const std::string& wname) {
+            const auto raw = w_.read(wname);
+            std::vector<float> src(raw.size() / 4);
+            std::memcpy(src.data(), raw.data(), raw.size());
+            const auto iv = DirectRuntime::interleave_f32_scales(src);
+            const uint64_t off = (host_sc.size() + 255ull) & ~255ull;
+            host_sc.resize(off + iv.size() * 4);
+            std::memcpy(host_sc.data() + off, iv.data(), iv.size() * 4);
+            direct_shared_->sc_off[wname] = off;
+        };
+        for (uint32_t i = 0; i < nl; ++i) {
+            put_iv(L(i, "gate_up.s"));
+            put_iv(L(i, "down.s"));
+            if (cfg_.attention[i]) {
+                put_iv(L(i, "qkv.s"));
+                put_iv(L(i, "o.s"));
+            } else {
+                put_iv(L(i, "qkvz.s"));
+                put_iv(L(i, "out.s"));
+            }
+        }
+        direct_shared_->scales_buf = DeviceBuffer(dev_, host_sc.size());
+        {
+            HostBuffer h(dev_, std::max<uint64_t>(host_sc.size(), H * 4));
+            std::memcpy(h.data(), host_sc.data(), host_sc.size());
+            stream_.upload(h, 0, direct_shared_->scales_buf, 0, host_sc.size());
+            stream_.synchronize();
+            direct_shared_->ones_buf = DeviceBuffer(dev_, H * 4);
+            auto* o = h.as<float>();
+            for (uint64_t k = 0; k < H; ++k) o[k] = 1.0f;
+            stream_.upload(h, 0, direct_shared_->ones_buf, 0, H * 4);
+            stream_.synchronize();
+        }
+        return true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[g2e] Direct MME+SRAM shared init fallback to Synapse (%s)\n", e.what());
+        direct_shared_->failed = true;
+        return false;
+    }
+}
+
+bool Qwen35::ensure_direct_plan(std::unique_ptr<DirectBatchState>& dst, uint32_t B, std::array<uint32_t, 8> slot_caps) {
+    const uint32_t nl = layer_limit_ ? std::min(layer_limit_, cfg_.layers) : cfg_.layers;
+    if (!ensure_direct_shared(nl)) return false;
+    if (dst && dst->built_limit == nl && dst->built_caps == slot_caps) return !dst->failed;
+    dst = std::make_unique<DirectBatchState>();
+    dst->built_limit = nl;
+    dst->built_caps = slot_caps;
+    try {
+        const char* dd = std::getenv(B == 1 ? "G2E_MME_DESC_DIR_R16" : "G2E_MME_DESC_DIR");
+        const char* td = std::getenv("G2E_TPC_OBJ_DIR");
+        const std::string desc_dir = (dd && *dd) ? dd
+            : (std::string(G2E_SOURCE_DIR) + (B == 1 ? "/tools/mme_descs_R16" : "/tools/mme_descs_R128"));
+        const std::string tpc_dir = (td && *td) ? td : std::string(G2E_TPC_OBJ_DIR);
+        dst->assets = DirectGdnAssets::load(*direct_shared_->rt, desc_dir, tpc_dir, B);
+
+        const uint64_t H = cfg_.hidden, F = cfg_.intermediate, C = cfg_.conv_channels();
+        const auto& sc_off = direct_shared_->sc_off;
+        auto feat_for = [&](uint32_t layer_idx) -> uint64_t {
+            for (size_t k = 0; k < capture_.size(); ++k)
+                if (capture_[k] == layer_idx) return feats_.address() + uint64_t(k) * feature_stride();
+            return 0;
+        };
+
+        const auto Ls = stash_layout(kSpecMaxT, true);
+        const uint64_t NG = std::max(num_gdn_, 1u);
+        const std::array<uint32_t, 4> strides = {
+            uint32_t(NG * Ls.size[0] / 4),
+            uint32_t(NG * Ls.size[2] / 4),
+            uint32_t(NG * Ls.size[3] / 4),
+            uint32_t(NG * Ls.size[5] / 2),
+        };
+
+        auto make_gdn_w = [&](uint32_t i) {
+            DirectGdnLayerWeights dw{};
+            dw.in_norm1p = aux_.address() + aux_off_.at(L(i, "in_norm1p"));
+            dw.post_norm1p = aux_.address() + aux_off_.at(L(i, "post_norm1p"));
+            const auto qkvz_w = w_.bind("qkvz_w", L(i, "qkvz.w"));
+            const auto ba_w = w_.bind("ba_w", L(i, "ba"));
+            const auto dt_bias = w_.bind("dt_bias", L(i, "dt_bias"));
+            const auto gdn_norm = w_.bind("gdn_norm", L(i, "gdn_norm"));
+            const auto out_w = w_.bind("out_w", L(i, "out.w"));
+            const auto gu_w = w_.bind("gu_w", L(i, "gate_up.w"));
+            const auto dn_w = w_.bind("dn_w", L(i, "down.w"));
+            dw.qkv_w = qkvz_w.buffer->address() + qkvz_w.offset;
+            dw.z_w = dw.qkv_w + C * H;
+            dw.qkv_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "qkvz.s"));
+            dw.z_s_int = dw.qkv_s_int + C * 4;
+            dw.ba_w = ba_w.buffer->address() + ba_w.offset;
+            dw.conv_t = aux_.address() + aux_off_.at(L(i, "conv_t"));
+            dw.dt_bias = dt_bias.buffer->address() + dt_bias.offset;
+            dw.negexpA = aux_.address() + aux_off_.at(L(i, "negexpA"));
+            dw.gdn_norm = gdn_norm.buffer->address() + gdn_norm.offset;
+            dw.out_w = out_w.buffer->address() + out_w.offset;
+            dw.out_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "out.s"));
+            dw.gate_w = gu_w.buffer->address() + gu_w.offset;
+            dw.up_w = dw.gate_w + F * H;
+            dw.gate_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "gate_up.s"));
+            dw.up_s_int = dw.gate_s_int + F * 4;
+            dw.dn_w = dn_w.buffer->address() + dn_w.offset;
+            dw.dn_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "down.s"));
+            dw.feat_out = feat_for(i);
+            return dw;
+        };
+
+        auto make_apost_w = [&](uint32_t i) {
+            DirectApostLayerWeights aw{};
+            aw.post_norm1p = aux_.address() + aux_off_.at(L(i, "post_norm1p"));
+            const auto ow = w_.bind("o_w", L(i, "o.w"));
+            const auto gw = w_.bind("gu_w", L(i, "gate_up.w"));
+            const auto dnw = w_.bind("dn_w", L(i, "down.w"));
+            aw.o_w = ow.buffer->address() + ow.offset;
+            aw.o_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "o.s"));
+            aw.gate_w = gw.buffer->address() + gw.offset;
+            aw.up_w = aw.gate_w + F * H;
+            aw.gate_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "gate_up.s"));
+            aw.up_s_int = aw.gate_s_int + F * 4;
+            aw.dn_w = dnw.buffer->address() + dnw.offset;
+            aw.dn_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "down.s"));
+            aw.feat_out = feat_for(i);
+            return aw;
+        };
+
+        auto make_apre_w = [&](uint32_t i) {
+            DirectApreLayerWeights ap{};
+            ap.in_norm1p = aux_.address() + aux_off_.at(L(i, "in_norm1p"));
+            const auto qkvw = w_.bind("qkv_w", L(i, "qkv.w"));
+            const auto qn = w_.bind("q_norm", L(i, "q_norm"));
+            const auto kn = w_.bind("k_norm", L(i, "k_norm"));
+            ap.qkv_w = qkvw.buffer->address() + qkvw.offset;
+            ap.qkv_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "qkv.s"));
+            ap.q_norm = qn.buffer->address() + qn.offset;
+            ap.k_norm = kn.buffer->address() + kn.offset;
+            ap.rope_pos = ids_.address() + kIdsRopePos;
+            ap.last_tab = ids_.address() + kIdsLast;
+            ap.cos_tab = cos_tab_.address();
+            ap.sin_tab = sin_tab_.address();
+            ap.rope_tab_rows = max_ctx_ + kMaxT;
+            ap.kv8 = kv8_;
+            return ap;
+        };
+
+        const uint64_t sram_base = direct_shared_->rt->sram_base();
+        const auto emb_bind = w_.bind("embed", "embed");
+        const uint64_t embed_table_addr = emb_bind.buffer->address() + emb_bind.offset;
+        uint32_t cursor = 0;
+        int prev_attn = -1;
+        while (cursor < nl || prev_attn >= 0) {
+            DirectBatchState::Span sp;
+            sp.apost_layer = prev_attn;
+            prev_attn = -1;
+            while (cursor < nl && !cfg_.attention[cursor]) {
+                sp.gdn_layers.push_back(cursor);
+                ++cursor;
+            }
+            if (cursor < nl && cfg_.attention[cursor]) {
+                sp.next_attn_layer = int(cursor);
+                prev_attn = int(cursor);
+                ++cursor;
+            }
+            if (sp.apost_layer < 0 && sp.gdn_layers.empty()) continue;
+
+            const size_t ng = sp.gdn_layers.size();
+            if (sp.apost_layer < 0 && dst->spans.empty()) {
+                sp.args.embed_ids = ids_.address();
+                sp.args.embed_table = embed_table_addr;
+                sp.args.embed_vocab = cfg_.vocab;
+            }
+            sp.args.res_in = res_[0].address();
+            sp.args.delta_in = zero_.address();
+            sp.args.gate_in = sram_base + kDirectSramGateOff;
+            sp.args.att_in = sram_base + kDirectSramAttOff;
+            sp.args.resid_in = sram_base + kDirectSramResidOff;
+            sp.args.res_out = res_[1].address();
+            sp.args.delta_out = delta_[1].address();
+            sp.args.conv_in.resize(ng);
+            sp.args.ssm_in.resize(ng);
+            sp.args.st_x.resize(ng);
+            sp.args.st_v.resize(ng);
+            sp.args.st_g.resize(ng);
+            sp.args.st_seq.resize(ng);
+            sp.args.apre_kv_cap = slot_caps;
+            if (B == 1 && sp.next_attn_layer >= 0 && !k_cache_.empty()) {
+                const int s_attn = slot_[uint32_t(sp.next_attn_layer)];
+                sp.args.apre_k_dst.fill(k_cache_[s_attn].address());
+                sp.args.apre_v_dst.fill(v_cache_[s_attn].address());
+            } else {
+                sp.args.apre_k_dst.fill(res_[0].address());
+                sp.args.apre_v_dst.fill(res_[0].address());
+            }
+
+            std::vector<DirectGdnLayerWeights> gws(ng);
+            for (size_t j = 0; j < ng; ++j) {
+                const uint32_t lyr = sp.gdn_layers[j];
+                const uint32_t s = uint32_t(slot_[lyr]);
+                gws[j] = make_gdn_w(lyr);
+                for (uint32_t b = 0; b < B; ++b) {
+                    sp.args.conv_in[j][b] = conv_all_[0].address() + uint64_t(s) * conv_bytes_;
+                    sp.args.ssm_in[j][b] = ssm_all_[0].address() + uint64_t(s) * ssm_bytes_;
+                }
+                sp.args.st_x[j] = spec_stash_.address() + Ls.base[0] + uint64_t(s) * Ls.size[0];
+                sp.args.st_v[j] = spec_stash_.address() + Ls.base[2] + uint64_t(s) * Ls.size[2];
+                sp.args.st_g[j] = spec_stash_.address() + Ls.base[3] + uint64_t(s) * Ls.size[3];
+                sp.args.st_seq[j] = spec_stash_.address() + Ls.base[5] + uint64_t(s) * Ls.size[5];
+            }
+            DirectApostLayerWeights aw{};
+            const DirectApostLayerWeights* aw_ptr = nullptr;
+            if (sp.apost_layer >= 0) {
+                aw = make_apost_w(uint32_t(sp.apost_layer));
+                aw_ptr = &aw;
+            }
+            DirectApreLayerWeights apw{};
+            const DirectApreLayerWeights* apw_ptr = nullptr;
+            if (sp.next_attn_layer >= 0) {
+                apw = make_apre_w(uint32_t(sp.next_attn_layer));
+                apw_ptr = &apw;
+            }
+            sp.block = std::make_unique<DirectGdnBlock>(*direct_shared_->rt, dst->assets,
+                                                        direct_shared_->ones_buf.address(), gws, sp.args, strides, 0xa,
+                                                        aw_ptr, apw_ptr, kDirectSramWorkOff, B);
+            dst->spans.push_back(std::move(sp));
+        }
+        std::fprintf(stderr, "[g2e] Unified 64-layer Direct MME+SRAM engine active (B=%u): %zu spans (%u layers, kv=%s)\n",
+                     B, dst->spans.size(), nl, kv8_ ? "FP8" : "BF16");
+        return true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[g2e] Direct MME+SRAM (B=%u) fallback to Synapse (%s)\n", B, e.what());
+        dst->failed = true;
+        return false;
+    }
+}
+
+bool Qwen35::ensure_direct_b8(std::array<uint32_t, 8> slot_caps) {
+    return ensure_direct_plan(direct_b8_, 8, slot_caps);
+}
+
+Qwen35::DirectBatchState* Qwen35::ensure_direct_b1(uint32_t slot_cap, uint32_t cur_pos) {
+    static const bool off = std::getenv("G2E_NO_DIRECT_B1") != nullptr;
+    if (off) return nullptr;
+    static const uint32_t min_pos = [] {
+        if (std::getenv("G2E_DIRECT_B1") != nullptr || std::getenv("G2E_DIRECT_MME") != nullptr) return 0u;
+        if (const char* e = std::getenv("G2E_DIRECT_B1_MIN_POS")) return uint32_t(std::atoi(e));
+        return 16384u;  // default on for long contexts where chained Direct B=1 beats Synapse cleanly
+    }();
+    if (cur_pos < min_pos) return nullptr;
+    auto it = direct_b1_cache_.find(slot_cap);
+    if (it != direct_b1_cache_.end()) return (it->second && !it->second->failed) ? it->second.get() : nullptr;
+    if (direct_b1_cache_.size() >= 4) direct_b1_cache_.erase(direct_b1_cache_.begin());
+    std::array<uint32_t, 8> caps{};
+    caps[0] = slot_cap;
+    auto& ptr = direct_b1_cache_[slot_cap];
+    return ensure_direct_plan(ptr, 1, caps) ? ptr.get() : nullptr;
 }
 
 Qwen35::BatchOut Qwen35::batch_verify(std::span<const uint32_t> slots, std::span<const std::vector<int32_t>> blocks,
@@ -2626,7 +3664,7 @@ Qwen35::BatchOut Qwen35::batch_verify(std::span<const uint32_t> slots, std::span
     // G2E_VERIFY_PROF=1: every 50th batch, the device time by part (events between the launches)
     static const bool vprof = std::getenv("G2E_VERIFY_PROF") != nullptr;
     static int vcalls = 0;
-    const bool prof = vprof && ++vcalls % 50 == 0;
+    const bool prof = vprof && (++vcalls <= 10 || vcalls % 50 == 0);
     static std::vector<std::unique_ptr<Event>> pev;
     std::vector<int> pkind;
     auto mark = [&](int kind) {
@@ -2635,6 +3673,10 @@ Qwen35::BatchOut Qwen35::batch_verify(std::span<const uint32_t> slots, std::span
         pev[pkind.size()]->record(stream_);
         pkind.push_back(kind);
     };
+    std::array<uint32_t, 8> slot_caps{};
+    if (B == 8 && T == 16)
+        for (uint32_t b = 0; b < 8; ++b) slot_caps[b] = sq[b]->cap;
+    const bool use_direct = (B == 8 && T == 16 && ensure_direct_b8(slot_caps));
     if (stage_ev_ && stage_ev_->recorded()) stage_ev_->synchronize();
     {
         auto* ids = reinterpret_cast<int32_t*>(staging_.as<uint8_t>() + kIdsStage);
@@ -2647,14 +3689,16 @@ Qwen35::BatchOut Qwen35::batch_verify(std::span<const uint32_t> slots, std::span
                 rpos[b * T + t] = int32_t(sq[b]->pos + t);   // RoPE rows (text: rope_delta 0)
             }
     }
-    stream_.upload(staging_, kIdsStage, ids_, 0, kIdsRopePos + uint64_t(R) * 4);
-    {
+    if (!use_direct) {
+        stream_.upload(staging_, kIdsStage, ids_, 0, kIdsRopePos + uint64_t(R) * 4);
         const Binding eb[] = {{"ids", &ids_, 0}, w_.bind("embed", "embed"), {"res", &res_[0], 0}};
         embed_recipe(R).enqueue(stream_, eb);
+        mark(0);
+        if (!stage_ev_) stage_ev_ = std::make_unique<Event>(dev_);
+        stage_ev_->record(stream_);
+    } else {
+        mark(0);
     }
-    mark(0);
-    if (!stage_ev_) stage_ev_ = std::make_unique<Event>(dev_);
-    stage_ev_->record(stream_);
     auto bind_w = [&](std::vector<Binding>& v, const std::string& name, const std::string& weight) {
         v.push_back(w_.bind(P(0, name), weight));
     };
@@ -2664,7 +3708,100 @@ Qwen35::BatchOut Qwen35::batch_verify(std::span<const uint32_t> slots, std::span
     const auto Ls = stash_layout(T, true);
     const uint64_t NG = std::max(num_gdn_, 1u);
     int cur = 0;
-    for (uint32_t i = 0; i < cfg_.layers; ++i) {
+    if (use_direct) {
+        using clk = std::chrono::steady_clock;
+        const auto td0 = clk::now();
+        std::array<uint32_t, 8> need_rows{};
+        for (uint32_t b = 0; b < B; ++b) need_rows[b] = ((sq[b]->pos + T + 1023u) / 1024u) * 1024u;
+        const uint64_t sram_base = direct_shared_->rt->sram_base();
+
+        // 1. Update dynamic HBM addresses & per-slot positions across ALL 17 spans + 16 attention cores.
+        std::vector<DirectPlan*> all_plans;
+        all_plans.reserve(64);
+        for (auto& sp : direct_b8_->spans) {
+            for (size_t j = 0; j < sp.gdn_layers.size(); ++j) {
+                const uint32_t s = uint32_t(slot_[sp.gdn_layers[j]]);
+                for (uint32_t b = 0; b < 8; ++b) {
+                    const Seq& q = *sq[b < B ? b : 0u];
+                    sp.args.conv_in[j][b] = q.conv[q.conv_side[s]].address() + uint64_t(s) * conv_bytes_;
+                    sp.args.ssm_in[j][b] = q.ssm[q.ssm_side[s]].address() + uint64_t(s) * ssm_bytes_;
+                }
+            }
+            if (sp.next_attn_layer >= 0) {
+                const int s = slot_[uint32_t(sp.next_attn_layer)];
+                DirectAttnRunArgs aargs{};
+                aargs.q_in = sram_base + kDirectSramQOff;
+                aargs.att_out = sram_base + kDirectSramAttOff;
+                aargs.last_tab = ids_.address() + kIdsLast;
+                for (uint32_t b = 0; b < 8; ++b) {
+                    const Seq& q = *sq[b < B ? b : 0u];
+                    sp.args.apre_k_dst[b] = q.k[s].address();
+                    sp.args.apre_v_dst[b] = q.v[s].address();
+                    if (b < B) {
+                        for (uint64_t h = 0; h < KV; ++h) {
+                            const uint64_t head = h * uint64_t(q.cap) * D * kv_es();
+                            aargs.k_cache[b][h] = q.k[s].address() + head;
+                            aargs.v_cache[b][h] = q.v[s].address() + head;
+                        }
+                    }
+                }
+                DirectAttnCore* core = nullptr;
+                for (auto& entry : sp.attn_cache) {
+                    if (entry.first == need_rows) {
+                        core = entry.second.get();
+                        break;
+                    }
+                }
+                if (!core) {
+                    if (sp.attn_cache.size() >= 2) sp.attn_cache.erase(sp.attn_cache.begin());
+                    auto created = std::make_unique<DirectAttnCore>(*direct_shared_->rt, direct_shared_->attn_assets, kv8_,
+                                                                    /*pack_q_from_hbm=*/false, need_rows, aargs,
+                                                                    kDirectSramWorkOff, 0xa);
+                    core = created.get();
+                    sp.attn_cache.emplace_back(need_rows, std::move(created));
+                } else {
+                    core->update_args(aargs);
+                }
+                sp.active_attn = core;
+                core->collect_plans(all_plans);
+            }
+            sp.block->update_args(sp.args);
+            all_plans.push_back(sp.block->plan());
+        }
+        // Upload ALL dirty patched ECBs + ids_ control block in ONE batched PDMA sync (zero Synapse embed launch / sync)!
+        direct_shared_->rt->flush_patches_and_upload(all_plans, ids_.address(),
+                                                     staging_.as<uint8_t>() + kIdsStage,
+                                                     kIdsRopePos + uint64_t(R) * 4);
+        const double patch_ms = std::chrono::duration<double, std::milli>(clk::now() - td0).count();
+
+        // Execute ALL 64 layers back-to-back on Direct SCAL with on-device SOB chaining (ZERO inter-plan host waits)!
+        double gdn_ms = 0.0, attn_ms = 0.0, exec_ms = 0.0;
+        if (direct_shared_->rt->chain_enabled()) {
+            std::vector<DirectPlan*> exec_plans;
+            exec_plans.reserve(64);
+            for (auto& sp : direct_b8_->spans) {
+                exec_plans.push_back(sp.block->plan());
+                if (sp.active_attn) sp.active_attn->collect_plans(exec_plans);
+            }
+            exec_ms = direct_shared_->rt->run_chain(exec_plans) * 1e-3;
+        } else {
+            for (auto& sp : direct_b8_->spans) {
+                gdn_ms += sp.block->run() * 1e-3;
+                if (sp.active_attn) attn_ms += sp.active_attn->run() * 1e-3;
+            }
+            exec_ms = gdn_ms + attn_ms;
+        }
+        if (prof) {
+            if (direct_shared_->rt->chain_enabled())
+                std::fprintf(stderr, "verify_direct (64L chained): patch %.2f ms  exec %.2f ms  total %.2f ms\n",
+                             patch_ms, exec_ms, patch_ms + exec_ms);
+            else
+                std::fprintf(stderr, "verify_direct (64L): patch %.2f ms  gdn+apre+apost %.2f ms  attn_core %.2f ms  total %.2f ms\n",
+                             patch_ms, gdn_ms, attn_ms, patch_ms + gdn_ms + attn_ms);
+        }
+        cur = 1;
+    }
+    for (uint32_t i = 0; i < (use_direct ? 0u : cfg_.layers); ++i) {
         const int s = slot_[i];
         if (cfg_.attention[i]) {
             std::vector<Binding> pb = {{"res_in", &res_[cur], 0}, {"delta_in", i == 0 ? &zero_ : &delta_[cur], 0},
@@ -2750,7 +3887,7 @@ Qwen35::BatchOut Qwen35::batch_verify(std::span<const uint32_t> slots, std::span
             bind_w(gb, "gdn_norm", L(i, "gdn_norm"));
             bind_w(gb, "out_w", L(i, "out.w"));
             bind_w(gb, "out_s", L(i, "out.s"));
-            const char* fields[] = {"st_x", nullptr, "st_v", "st_g", "st_b", "st_seq"};
+            const char* fields[] = {"st_x", nullptr, "st_v", "st_g", fast_commit() ? nullptr : "st_b", "st_seq"};
             for (uint32_t b = 0; b < B; ++b) {
                 const Seq& q = *sq[b];
                 const auto bs = std::to_string(b);
@@ -2859,24 +3996,137 @@ Qwen35::BatchOut Qwen35::batch_verify(std::span<const uint32_t> slots, std::span
     return out;
 }
 
-void Qwen35::run_layers(std::span<const int32_t> tokens, bool spec, std::vector<std::vector<uint16_t>>* dump) {
+void Qwen35::run_layers(std::span<const int32_t> tokens, bool spec, std::vector<std::vector<uint16_t>>* dump,
+                        uint32_t valid_n) {
     const uint32_t T = uint32_t(tokens.size());
+    const bool padded = !spec && valid_n > 0 && valid_n < T;
     if (!T || T > kMaxT) throw std::invalid_argument("qwen35: 1.." + std::to_string(kMaxT) + " tokens per forward");
     if (pos_ + T > cap_) throw std::out_of_range("qwen35: context full");
     const uint64_t H = cfg_.hidden, R2 = cfg_.rotary_dim / 2, D = cfg_.head_dim, KV = cfg_.kv_heads;
     const uint64_t row = H * 2;
     const uint32_t Sb = bucket_for(std::max<uint32_t>(pos_, 1));
     (void)row;
+    static const char* trace_path_early = std::getenv("G2E_TRACE");
+    static const uint32_t b1_max_rows = [] {
+        const char* e = std::getenv("G2E_DIRECT_B1_MAX_ROWS");
+        return e ? uint32_t(std::atoi(e)) : 262144u;
+    }();
+    const uint32_t need_raw_b1 = pos_ + T;
+    const uint32_t b1_step = need_raw_b1 <= 4096 ? 1024u : (need_raw_b1 <= 32768 ? 4096u : 8192u);
+    uint32_t need_rows_b1 = ((need_raw_b1 + b1_step - 1u) / b1_step) * b1_step;
+    if (need_rows_b1 > cap_) need_rows_b1 = ((need_raw_b1 + 1023u) / 1024u) * 1024u;
+    DirectBatchState* b1_state = (spec && T == kSpecMaxT && !dump && !rope_explicit_ && inject_.empty() &&
+                                  !trace_path_early && debug_layer_ < 0 && block_ == 1 && !k_cache_.empty() &&
+                                  cap_ >= 1024 && need_rows_b1 <= cap_ && need_rows_b1 <= b1_max_rows)
+                                     ? ensure_direct_b1(cap_, pos_)
+                                     : nullptr;
+    const bool use_direct_b1 = (b1_state != nullptr);
     // the previous forward's uploads read the same staging regions
     if (stage_ev_ && stage_ev_->recorded()) stage_ev_->synchronize();
     // embeddings: one gather launch (a DMA per row cost ~30 us of host time each)
     std::memcpy(staging_.as<uint8_t>() + kIdsStage, tokens.data(), T * 4);
     *reinterpret_cast<float*>(staging_.as<uint8_t>() + kIdsStage + kIdsPosm1) = float(pos_) - 1.f;  // attn_mask
+    *reinterpret_cast<float*>(staging_.as<uint8_t>() + kIdsStage + kIdsPosm1H1) = float(pos_ + 2048u) - 1.f;
     {   // last visible cache row of each query row (masked softmax kernel): pos + t
         auto* last = reinterpret_cast<int32_t*>(staging_.as<uint8_t>() + kIdsStage + kIdsLast);
         for (uint32_t t = 0; t < T; ++t) last[t] = int32_t(pos_ + t);
+        if (use_direct_b1) {
+            for (uint32_t b = 1; b < 4; ++b) last[b * 32] = int32_t(pos_);
+            auto* rpos = reinterpret_cast<int32_t*>(staging_.as<uint8_t>() + kIdsStage + kIdsRopePos);
+            for (uint32_t t = 0; t < T; ++t) rpos[t] = int32_t(int64_t(pos_) + rope_delta_ + t);
+        }
+        if (padded) {
+            auto* pm = reinterpret_cast<float*>(staging_.as<uint8_t>() + kIdsStage + kIdsPadMask);
+            for (uint32_t t = 0; t < T; ++t) pm[t] = t < valid_n ? 1.f : 0.f;
+            auto* cr = reinterpret_cast<int32_t*>(staging_.as<uint8_t>() + kIdsStage + kIdsConvRows);
+            for (uint32_t k = 0; k + 1 < cfg_.conv_kernel; ++k) cr[k] = int32_t(valid_n + k);
+        }
     }
-    stream_.upload(staging_, kIdsStage, ids_, 0, kIdsLast + uint64_t(T) * 4);
+    const uint64_t ids_up = padded ? (kIdsConvRows + 128)
+                                   : use_direct_b1 ? (kIdsRopePos + uint64_t(T) * 4)
+                                                   : (kIdsLast + uint64_t(T) * 4);
+    if (use_direct_b1) {
+        using clk = std::chrono::steady_clock;
+        static const bool prof_b1 = std::getenv("G2E_VERIFY_PROF") != nullptr;
+        const auto td0 = clk::now();
+        std::array<uint32_t, 8> need_rows{};
+        need_rows[0] = need_rows_b1;
+        const uint64_t sram_base = direct_shared_->rt->sram_base();
+        std::vector<DirectPlan*> all_plans;
+        all_plans.reserve(64);
+        for (auto& sp : b1_state->spans) {
+            for (size_t j = 0; j < sp.gdn_layers.size(); ++j) {
+                const uint32_t s = uint32_t(slot_[sp.gdn_layers[j]]);
+                sp.args.conv_in[j][0] = conv_all_[conv_side_[s]].address() + uint64_t(s) * conv_bytes_;
+                sp.args.ssm_in[j][0] = ssm_all_[ssm_side_[s]].address() + uint64_t(s) * ssm_bytes_;
+            }
+            if (sp.next_attn_layer >= 0) {
+                const int s = slot_[uint32_t(sp.next_attn_layer)];
+                DirectAttnRunArgs aargs{};
+                aargs.q_in = sram_base + kDirectSramQOff;
+                aargs.att_out = sram_base + kDirectSramAttOff;
+                aargs.last_tab = ids_.address() + kIdsLast;
+                sp.args.apre_k_dst[0] = k_cache_[s].address();
+                sp.args.apre_v_dst[0] = v_cache_[s].address();
+                for (uint64_t h = 0; h < KV; ++h) {
+                    const uint64_t head = h * uint64_t(cap_) * D * kv_es();
+                    aargs.k_cache[0][h] = k_cache_[s].address() + head;
+                    aargs.v_cache[0][h] = v_cache_[s].address() + head;
+                }
+                DirectAttnCore* core = nullptr;
+                for (auto& entry : sp.attn_cache) {
+                    if (entry.first == need_rows) {
+                        core = entry.second.get();
+                        break;
+                    }
+                }
+                if (!core) {
+                    if (sp.attn_cache.size() >= 4) sp.attn_cache.erase(sp.attn_cache.begin());
+                    auto created = std::make_unique<DirectAttnCore>(*direct_shared_->rt, direct_shared_->attn_assets, kv8_,
+                                                                    /*pack_q_from_hbm=*/false, need_rows, aargs,
+                                                                    kDirectSramWorkOff, 0xa);
+                    core = created.get();
+                    sp.attn_cache.emplace_back(need_rows, std::move(created));
+                } else {
+                    core->update_args(aargs);
+                }
+                sp.active_attn = core;
+                core->collect_plans(all_plans);
+            }
+            sp.block->update_args(sp.args);
+            all_plans.push_back(sp.block->plan());
+        }
+        direct_shared_->rt->flush_patches_and_upload(all_plans, ids_.address(),
+                                                     staging_.as<uint8_t>() + kIdsStage, ids_up);
+        const double patch_ms = std::chrono::duration<double, std::milli>(clk::now() - td0).count();
+        double gdn_ms = 0.0, attn_ms = 0.0, exec_ms = 0.0;
+        if (direct_shared_->rt->chain_enabled()) {
+            std::vector<DirectPlan*> exec_plans;
+            exec_plans.reserve(64);
+            for (auto& sp : b1_state->spans) {
+                exec_plans.push_back(sp.block->plan());
+                if (sp.active_attn) sp.active_attn->collect_plans(exec_plans);
+            }
+            exec_ms = direct_shared_->rt->run_chain(exec_plans) * 1e-3;
+        } else {
+            for (auto& sp : b1_state->spans) {
+                gdn_ms += sp.block->run() * 1e-3;
+                if (sp.active_attn) attn_ms += sp.active_attn->run() * 1e-3;
+            }
+            exec_ms = gdn_ms + attn_ms;
+        }
+        if (prof_b1) {
+            if (direct_shared_->rt->chain_enabled())
+                std::fprintf(stderr, "verify_direct_b1 (64L chained, rows=%u): patch %.2f ms  exec %.2f ms  total %.2f ms\n",
+                             need_rows_b1, patch_ms, exec_ms, patch_ms + exec_ms);
+            else
+                std::fprintf(stderr, "verify_direct_b1 (64L, rows=%u): patch %.2f ms  gdn+apre+apost %.2f ms  attn_core %.2f ms  total %.2f ms\n",
+                             need_rows_b1, patch_ms, gdn_ms, attn_ms, patch_ms + gdn_ms + attn_ms);
+        }
+        cur_ = 1;
+        return;
+    }
+    stream_.upload(staging_, kIdsStage, ids_, 0, ids_up);
     {
         const Binding eb2[] = {{"ids", &ids_, 0}, w_.bind("embed", "embed"), {"res", &res_[0], 0}};
         embed_recipe(T).enqueue(stream_, eb2);
@@ -2903,6 +4153,7 @@ void Qwen35::run_layers(std::span<const int32_t> tokens, bool spec, std::vector<
     e0.record(stream_);
     int cur = 0;
     building_spec_ = spec;
+    building_padded_ = padded;
     const uint32_t nlayers = layer_limit_ ? std::min(layer_limit_, cfg_.layers) : cfg_.layers;
     auto bind_w = [&](std::vector<Binding>& b, uint32_t j, const std::string& name, const std::string& weight) {
         b.push_back(w_.bind(P(j, name), weight));
@@ -2952,35 +4203,136 @@ void Qwen35::run_layers(std::span<const int32_t> tokens, bool spec, std::vector<
             }
             pr.enqueue(stream_, pb);
             if (profile_) prof_ev_[li + 1]->record(stream_);  // (attributed with the post launch)
-            auto& qr = attn_post_recipe(T, Sb2);
-            if (profile_) prof_names.back() = qr.name();
-            std::vector<Binding> qb = {{"q_in", &apre_q_, 0}, {"gate_in", &apre_g_, 0}, {"resid_in", &apre_r_, 0},
-                                       {"res_out", &res_[cur ^ 1], 0}, {"delta_out", &delta_[cur ^ 1], 0},
-                                       {"posm1", &ids_, kIdsPosm1},
-                                       {"iota", &aux_, aux_off_.at("iota")},
-                                       {"iota_t", &aux_, aux_off_.at("iota_t")}};
-            bind_aux(qb, 0, "post_norm1p", L(i, "post_norm1p"));
-            bind_w(qb, 0, "gu_w", L(i, "gate_up.w"));
-            bind_w(qb, 0, "gu_s", L(i, "gate_up.s"));
-            bind_w(qb, 0, "down_w", L(i, "down.w"));
-            bind_w(qb, 0, "down_s", L(i, "down.s"));
-            bind_w(qb, 0, "o_w", L(i, "o.w"));
-            bind_w(qb, 0, "o_s", L(i, "o.s"));
-            for (uint64_t h = 0; h < KV; ++h) {
-                const uint64_t head = h * uint64_t(cap_) * D * kv_es();
-                qb.push_back({P(0, "k_cache" + std::to_string(h)), &k_cache_[s], head});
-                qb.push_back({P(0, "v_cache" + std::to_string(h)), &v_cache_[s], head});
+            if (fp8_chunked(T, Sb2)) {
+                ensure_fp8_chunk_bufs();
+                // T == 4096 uses 4096-row GDN & attn_pre (-485ms on 105K), then splits fp8_chunked into two
+                // 2048-row SRAM-optimal halves (C=6144, W=4096) to avoid R=24576 SRAM spill & 3x larger tail mask!
+                const uint32_t halves = (T == 4096) ? 2u : 1u;
+                const uint32_t sub_T = T / halves;
+                const uint64_t NH = cfg_.heads, G = NH / KV, R = G * sub_T;
+                const uint64_t o_stride = R * D * 4;
+                const uint64_t ml_stride = ((R * 4 + 255) / 256) * 256;
+                const uint32_t W = fp8_tail(sub_T);
+                for (uint32_t half = 0; half < halves; ++half) {
+                    const uint32_t sub_pos = pos_ + half * sub_T;
+                    const uint32_t sub_Sb = halves == 1 ? Sb2 : attn_rows(std::min<uint32_t>(sub_pos + sub_T, cap_), sub_T);
+                    const uint32_t Pn = sub_Sb - W;
+                    const uint64_t q_off = uint64_t(half) * sub_T * NH * D * 2;
+                    const uint64_t g_off = uint64_t(half) * sub_T * NH * D * 2;
+                    const uint64_t r_off = uint64_t(half) * sub_T * H * 2;
+                    std::vector<uint32_t> chunks;
+                    uint32_t rem = Pn;
+                    if (sub_T <= 512) {
+                        while (rem == 24576 || rem >= 24576 + 4096) { chunks.push_back(24576); rem -= 24576; }
+                    }
+                    if (sub_T <= 1024) {
+                        while (rem == 12288 || rem >= 12288 + 4096) { chunks.push_back(12288); rem -= 12288; }
+                    }
+                    if (rem > 0) {
+                        const uint32_t q6 = rem / 6144, r6 = rem % 6144;
+                        if (r6 == 0) {
+                            chunks.insert(chunks.end(), q6, 6144);
+                        } else if (r6 == 4096) {
+                            chunks.insert(chunks.end(), q6, 6144);
+                            chunks.push_back(4096);
+                        } else {  // r6 == 2048, q6 >= 1
+                            chunks.insert(chunks.end(), q6 - 1, 6144);
+                            chunks.push_back(8192);
+                        }
+                    }
+                    int side = 0;
+                    uint32_t off = 0;
+                    for (size_t ci = 0; ci < chunks.size(); ++ci) {
+                        const uint32_t C = chunks[ci];
+                        const bool is_first = (ci == 0);
+                        auto& cr = attn_fp8_chunk_recipe(sub_T, C, is_first);
+                        std::vector<Binding> cb = {{"f8_one", &aux_, aux_off_.at("f8_one")},
+                                                   {"f8_s128", &aux_, aux_off_.at("f8_s128")},
+                                                   {"f8_d128", &aux_, aux_off_.at("f8_d128")}};
+                        if (is_first) {
+                            cb.push_back({"q_in", &apre_q_, q_off});
+                            cb.push_back({"q8_out", fp8_q8_.get(), 0});
+                        } else {
+                            cb.push_back({"q8_in", fp8_q8_.get(), 0});
+                        }
+                        const int dst = is_first ? 0 : (side ^ 1);
+                        for (uint64_t h = 0; h < KV; ++h) {
+                            const auto hs = std::to_string(h);
+                            const uint64_t kv_off = (h * uint64_t(cap_) + off) * D * kv_es();
+                            cb.push_back({"k_in" + hs, &k_cache_[s], kv_off});
+                            cb.push_back({"v_in" + hs, &v_cache_[s], kv_off});
+                            if (!is_first) {
+                                cb.push_back({"o_in" + hs, fp8_o_[side].get(), h * o_stride});
+                                cb.push_back({"m_in" + hs, fp8_m_[side].get(), h * ml_stride});
+                                cb.push_back({"l_in" + hs, fp8_l_[side].get(), h * ml_stride});
+                            }
+                            cb.push_back({"o_out" + hs, fp8_o_[dst].get(), h * o_stride});
+                            cb.push_back({"m_out" + hs, fp8_m_[dst].get(), h * ml_stride});
+                            cb.push_back({"l_out" + hs, fp8_l_[dst].get(), h * ml_stride});
+                        }
+                        cr.enqueue(stream_, cb);
+                        side = dst;
+                        off += C;
+                    }
+                    auto& qr = attn_post_chunked_tail_recipe(sub_T);
+                    if (profile_) prof_names.back() = qr.name() + "_S" + std::to_string(sub_Sb);
+                    std::vector<Binding> qb = {{"q8_in", fp8_q8_.get(), 0}, {"gate_in", &apre_g_, g_off}, {"resid_in", &apre_r_, r_off},
+                                               {"res_out", &res_[cur ^ 1], r_off}, {"delta_out", &delta_[cur ^ 1], r_off},
+                                               {"posm1", &ids_, half ? kIdsPosm1H1 : kIdsPosm1},
+                                               {"iota", &aux_, aux_off_.at("iota") + uint64_t(Pn) * 4},
+                                               {"iota_t", &aux_, aux_off_.at("iota_t")},
+                                               {"f8_one", &aux_, aux_off_.at("f8_one")},
+                                               {"f8_s128", &aux_, aux_off_.at("f8_s128")},
+                                               {"f8_d128", &aux_, aux_off_.at("f8_d128")}};
+                    bind_aux(qb, 0, "post_norm1p", L(i, "post_norm1p"));
+                    bind_w(qb, 0, "gu_w", L(i, "gate_up.w"));
+                    bind_w(qb, 0, "gu_s", L(i, "gate_up.s"));
+                    bind_w(qb, 0, "down_w", L(i, "down.w"));
+                    bind_w(qb, 0, "down_s", L(i, "down.s"));
+                    bind_w(qb, 0, "o_w", L(i, "o.w"));
+                    bind_w(qb, 0, "o_s", L(i, "o.s"));
+                    for (uint64_t h = 0; h < KV; ++h) {
+                        const auto hs = std::to_string(h);
+                        const uint64_t kv_off = (h * uint64_t(cap_) + Pn) * D * kv_es();
+                        qb.push_back({"k_in" + hs, &k_cache_[s], kv_off});
+                        qb.push_back({"v_in" + hs, &v_cache_[s], kv_off});
+                        qb.push_back({"o_in" + hs, fp8_o_[side].get(), h * o_stride});
+                        qb.push_back({"m_in" + hs, fp8_m_[side].get(), h * ml_stride});
+                        qb.push_back({"l_in" + hs, fp8_l_[side].get(), h * ml_stride});
+                    }
+                    qr.enqueue(stream_, qb);
+                }
+            } else {
+                auto& qr = attn_post_recipe(T, Sb2);
+                if (profile_) prof_names.back() = qr.name();
+                std::vector<Binding> qb = {{"q_in", &apre_q_, 0}, {"gate_in", &apre_g_, 0}, {"resid_in", &apre_r_, 0},
+                                           {"res_out", &res_[cur ^ 1], 0}, {"delta_out", &delta_[cur ^ 1], 0},
+                                           {"posm1", &ids_, kIdsPosm1},
+                                           {"iota", &aux_, aux_off_.at("iota")},
+                                           {"iota_t", &aux_, aux_off_.at("iota_t")}};
+                bind_aux(qb, 0, "post_norm1p", L(i, "post_norm1p"));
+                bind_w(qb, 0, "gu_w", L(i, "gate_up.w"));
+                bind_w(qb, 0, "gu_s", L(i, "gate_up.s"));
+                bind_w(qb, 0, "down_w", L(i, "down.w"));
+                bind_w(qb, 0, "down_s", L(i, "down.s"));
+                bind_w(qb, 0, "o_w", L(i, "o.w"));
+                bind_w(qb, 0, "o_s", L(i, "o.s"));
+                for (uint64_t h = 0; h < KV; ++h) {
+                    const uint64_t head = h * uint64_t(cap_) * D * kv_es();
+                    qb.push_back({P(0, "k_cache" + std::to_string(h)), &k_cache_[s], head});
+                    qb.push_back({P(0, "v_cache" + std::to_string(h)), &v_cache_[s], head});
+                }
+                qb.push_back({"last", &ids_, kIdsLast});
+                for (const char* c : {"f8_one", "f8_s128", "f8_d128"}) qb.push_back({c, &aux_, aux_off_.at(c)});
+                {   // the mask inputs (graph / SDPA forms) or the last visible rows (kernel form): what the recipe has
+                    std::vector<Binding> kept;
+                    for (auto& bnd : qb)
+                        for (const auto& t : qr.tensors())
+                            if (t.name == bnd.name) { kept.push_back(bnd); break; }
+                    qb.swap(kept);
+                }
+                qr.enqueue(stream_, qb);
             }
-            qb.push_back({"last", &ids_, kIdsLast});
-            for (const char* c : {"f8_one", "f8_s128", "f8_d128"}) qb.push_back({c, &aux_, aux_off_.at(c)});
-            {   // the mask inputs (graph / SDPA forms) or the last visible rows (kernel form): what the recipe has
-                std::vector<Binding> kept;
-                for (auto& bnd : qb)
-                    for (const auto& t : qr.tensors())
-                        if (t.name == bnd.name) { kept.push_back(bnd); break; }
-                qb.swap(kept);
-            }
-            qr.enqueue(stream_, qb);
             for (size_t k = 0; k < capture_.size(); ++k)
                 if (capture_[k] == first) {
                     const Binding cb[] = {{"res", &res_[cur ^ 1], 0}, {"delta", &delta_[cur ^ 1], 0},
@@ -3039,7 +4391,8 @@ void Qwen35::run_layers(std::span<const int32_t> tokens, bool spec, std::vector<
                 b.push_back({P(j, "conv_in"), &conv_all_[conv_side_[s]], uint64_t(s) * conv_bytes_});
                 if (!(spec && T > 1)) b.push_back({P(j, "conv_out"), &conv_all_[conv_side_[s] ^ 1], uint64_t(s) * conv_bytes_});
                 flip_conv.push_back(s);
-                if (T == 1) {
+                static const bool t1_bf16 = std::getenv("G2E_T1_BF16_GDN") != nullptr;
+                if (T == 1 && t1_bf16) {
                     b.push_back({P(j, "ssm"), &ssm_all_[ssm_side_[s]], uint64_t(s) * ssm_bytes_});
 
                 } else {
@@ -3048,9 +4401,12 @@ void Qwen35::run_layers(std::span<const int32_t> tokens, bool spec, std::vector<
                     if (spec) {
                         const auto L = stash_layout(T, spec_wy(T));
                         const char* fields[] = {"st_q", "st_k", "st_v", "st_g", "st_b", "st_seq"};
-                        if (spec_wy(T)) fields[0] = "st_x";
+                        if (spec_wy(T)) {
+                            fields[0] = "st_x";
+                            if (fast_commit()) fields[4] = nullptr;
+                        }
                         for (int f = 0; f < 6; ++f)
-                            if (L.size[f]) b.push_back({P(j, fields[f]), &spec_stash_, L.base[f] + uint64_t(s) * L.size[f]});
+                            if (fields[f] && L.size[f]) b.push_back({P(j, fields[f]), &spec_stash_, L.base[f] + uint64_t(s) * L.size[f]});
                         flip_conv.pop_back();  // the commit writes the conv windows
                     } else {
                         b.push_back({P(j, "ssm_out"), &ssm_all_[ssm_side_[s] ^ 1], uint64_t(s) * ssm_bytes_});
@@ -3063,14 +4419,23 @@ void Qwen35::run_layers(std::span<const int32_t> tokens, bool spec, std::vector<
             if (nb > 1 && capture_[k] >= first && capture_[k] < first + nb)
                 b.push_back({"feat_j" + std::to_string(capture_[k] - first), &feats_, k * feature_stride()});
         if (chunk_consts) {
-            const std::string cp = "chunk" + std::to_string(std::min<uint32_t>(T, gdn_chunk())) + ".";
-            std::vector<std::string> names = {"upper", "strict", "inclusive", "lower", "eye", "diag8"};
-            for (uint32_t sz = 8; sz < std::min<uint32_t>(T, gdn_chunk()); sz *= 2) names.push_back("ll" + std::to_string(sz));
+            const uint32_t ck = std::min<uint32_t>(T, gdn_chunk());
+            const std::string cp = "chunk" + std::to_string(ck) + ".";
+            const bool fg = !spec && T >= 64 && (T % 64) == 0 && gdn_chunk() == 64 && gdn_prefill_fast_enabled() &&
+                            fused_gate_quant() && debug_layer_ < 0 && cfg_.lin_k_dim == 128 && cfg_.lin_v_dim == 128 &&
+                            cfg_.lin_v_heads <= 64 && (cfg_.lin_v_heads % 4) == 0;
+            std::vector<std::string> names = fg ? std::vector<std::string>{"upper", "lower"}
+                                                : std::vector<std::string>{"upper", "strict", "inclusive", "lower", "eye", "diag8"};
+            for (uint32_t sz = 8; sz < ck; sz *= 2) names.push_back("ll" + std::to_string(sz));
             for (const auto& nm : names) b.push_back({cp + nm, &aux_, aux_off_.at(cp + nm)});
         }
-        if (T == 1 && !flip_conv.empty()) {
+        if (T == 1 && std::getenv("G2E_T1_BF16_GDN") != nullptr && !flip_conv.empty()) {
             b.push_back({"idx", &consts_, 0});
             b.push_back({"acc", &consts_, 128});
+        }
+        if (padded && !flip_conv.empty()) {
+            b.push_back({"pad_mask", &ids_, kIdsPadMask});
+            b.push_back({"conv_rows", &ids_, kIdsConvRows});
         }
         if (has_attention) {
             b.push_back({"cos", cos_buf, cos_at});
@@ -3145,6 +4510,7 @@ void Qwen35::run_layers(std::span<const int32_t> tokens, bool spec, std::vector<
     eb.record(stream_);
     cur_ = cur;
     building_spec_ = false;
+    building_padded_ = false;
     if (profile_) {
         stream_.synchronize();
         prof_ = {};

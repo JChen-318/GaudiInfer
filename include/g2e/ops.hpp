@@ -59,7 +59,8 @@ public:
     // the k largest values lie in the k chunks (of `chunk` columns) with the largest maxima, so only those k*chunk
     // values are sorted. `consts` [V + 2R] i32 = topk2_constants(R, V, k, chunk). Same set as topk; ties may order
     // differently.
-    std::pair<TensorId, TensorId> topk2(TensorId x, uint32_t k, uint32_t chunk, TensorId consts, const std::string& name);
+    std::pair<TensorId, TensorId> topk2(TensorId x, uint32_t k, uint32_t chunk, TensorId consts, const std::string& name,
+                                        TensorId precomputed_cmax = kNoTensor);
     static std::vector<int32_t> topk2_constants(uint64_t rows, uint64_t cols, uint32_t k, uint32_t chunk);
     // Rows of table [R, ...] selected by idx I32 [n] -> [n, ...].
     TensorId gather_rows(TensorId table, TensorId idx, const std::string& name);
@@ -70,7 +71,11 @@ public:
     struct NormQuant { TensorId codes, scale, normalized, residual_out; };
     // s = x + residual; n = bf16(s * rsqrt(mean(s^2) + eps) * w); codes/scale = vLLM row FP8 quantization of n.
     // `w` is the final BF16 weight (pass 1 + w for Gemma-style norms).
-    NormQuant add_rmsnorm_quant(TensorId x, TensorId residual, TensorId w, float eps, const std::string& name);
+    NormQuant add_rmsnorm_quant(TensorId x, TensorId residual, TensorId w, float eps, const std::string& name,
+                                bool need_normalized = true);
+    // FP8 GEMM (no scale epilogue) + add_rmsnorm_quant with GEMM dequantisation folded in (3 outputs: codes, scale, residual_out).
+    NormQuant fp8_gemm_add_rmsnorm_quant(TensorId codes, TensorId scale, TensorId w, TensorId ws,
+                                         TensorId residual, TensorId norm_w, float eps, const std::string& name);
     // FP8 GEMM of pre-quantized rows: codes [M,K] (scale [M,1]) x w [N,K] (ws [N]) -> BF16 [M,N]
     TensorId fp8_gemm(TensorId codes, TensorId scale, TensorId w, TensorId ws, const std::string& name);
     // gate_up GEMM + silu(gate) * up -> FP8 codes and row scales, the GEMM's dequantisation folded into the kernel

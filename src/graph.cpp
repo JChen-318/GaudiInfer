@@ -381,6 +381,36 @@ std::unique_ptr<Recipe> GraphBuilder::compile(const std::string& name) {
         if (synRecipeDeSerialize(&impl->handle, path.c_str()) == synSuccess) impl->cached = true;
         else { impl->handle = nullptr; std::fprintf(stderr, "g2e: unreadable cached recipe %s, recompiling\n", path.c_str()); }
     }
+    static const bool reuse_prefill = std::getenv("G2E_REUSE_PREFILL_CACHE") != nullptr;
+    const bool is_batch_recipe = name.find("gdnb") != std::string::npos ||
+                                 name.find("apreb") != std::string::npos ||
+                                 name.find("apostb") != std::string::npos ||
+                                 name.find("acore") != std::string::npos ||
+                                 name.find("speccommit") != std::string::npos ||
+                                 name.find("vtopb") != std::string::npos;
+    if (!impl->handle && reuse_prefill && !is_batch_recipe && !recipe_cache_dir().empty()) {
+        const std::string prefix = name + "-";
+        const std::string suffix = ".recipe";
+        std::string best_path;
+        std::filesystem::file_time_type best_time{};
+        for (const auto& entry : std::filesystem::directory_iterator(recipe_cache_dir())) {
+            const std::string fn = entry.path().filename().string();
+            if (fn.size() == prefix.size() + 32 + suffix.size() &&
+                fn.compare(0, prefix.size(), prefix) == 0 &&
+                fn.compare(fn.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                const auto wt = entry.last_write_time();
+                if (best_path.empty() || wt > best_time) {
+                    best_time = wt;
+                    best_path = entry.path().string();
+                }
+            }
+        }
+        if (!best_path.empty() && synRecipeDeSerialize(&impl->handle, best_path.c_str()) == synSuccess) {
+            impl->cached = true;
+        } else {
+            impl->handle = nullptr;
+        }
+    }
     if (!impl->handle) {
         impl->handle = p.materialize_and_compile(name);
         if (!path.empty()) {

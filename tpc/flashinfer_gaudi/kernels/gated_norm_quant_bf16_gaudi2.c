@@ -81,8 +81,8 @@ void main(tensor core, tensor z, tensor w, tensor gated, tensor pmax, float eps)
     const float128 wf = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b(wc, w));
     for (int row = start[1]; row < end[1]; ++row)
         for (int grp = start[0]; grp < end[0]; ++grp) {
-            float64 maximum = 0;
-            #pragma loop_unroll(2)
+            bfloat128 mb = 0;
+            #pragma loop_unroll(4)
             for (int i = 0; i < HEADS_PER_GROUP; ++i) {
                 const int h = grp * HEADS_PER_GROUP + i;
                 int5 c = {0, h, row, 0, 0};
@@ -98,9 +98,10 @@ void main(tensor core, tensor z, tensor w, tensor gated, tensor pmax, float eps)
                 const bfloat128 g = v_convert_f32_to_bf16_all_b(nm) * v_convert_f32_to_bf16_all_b(sl);
                 int5 oc = {h * 128, row, 0, 0, 0};
                 v_bf16_st_tnsr(oc, gated, g);
-                const float128 gf = v_convert_bf16_to_f32_all_b(g);
-                maximum = v_f32_max_b(maximum, v_f32_max_b(v_f32_abs_b(gf.v1), v_f32_abs_b(gf.v2)));
+                mb = v_bf16_max_b(mb, v_bf16_abs_b(g));
             }
+            const float128 gf = v_convert_bf16_to_f32_all_b(mb);
+            const float64 maximum = v_f32_max_b(gf.v1, gf.v2);
             int5 pc = {0, grp, row, 0, 0};  // the group maximum in all 64 lanes
             v_f32_st_tnsr(pc, pmax, max64(maximum));
         }

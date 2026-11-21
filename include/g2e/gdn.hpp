@@ -30,6 +30,17 @@ struct GdnConstant {
 };
 std::vector<GdnConstant> gdn_chunk_constants(uint32_t C);
 
+// Fused prefill GDN path (conv_prep + decay_prep + pure BF16 MME chunks + single-pass gate_quant; default ON,
+// opt-out via G2E_OLD_PREFILL_GDN=1).
+bool gdn_prefill_fast_enabled();
+
+// Fast BF16-MME chunked GDN for C == 64 (inputs qc/kc [nc*HK, 64, 128] bf16, vc [nc*HV, 64, 128] bf16,
+// g/beta [nc*64, HV] f32, state S [HV, 128, 128] f32). Returns (out_c [nc*HV, 64, 128] bf16, S' [HV, 128, 128] f32).
+std::pair<TensorId, TensorId> gdn_chunks_fast(Ops& o, const std::string& prefix, uint32_t nc, const GdnChunkDims& d,
+                                              const std::function<TensorId(const std::string&, Shape)>& constant,
+                                              TensorId state, TensorId qc, TensorId kc, TensorId vc,
+                                              TensorId g, TensorId beta);
+
 // `constant(name, shape)` returns the graph tensor holding chunk constant `name` (the caller decides whether it is a
 // persistent input and shares it). Returns (core [C, HV, DV], S' [HV, DV, DK]).
 std::pair<TensorId, TensorId> gdn_chunk(Ops& o, const std::string& prefix, uint32_t C, const GdnChunkDims& d,

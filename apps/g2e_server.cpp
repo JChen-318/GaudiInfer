@@ -212,20 +212,31 @@ struct Server {
     void finish_job(size_t s, GenerationResult gen, std::string error) {
         auto job = std::move(running[s]);
         running[s].reset();
-        if (prefix) {
+        {
+            std::lock_guard lk(job->mu);
+            job->gen = std::move(gen);
+            job->error = std::move(error);
+            job->done = true;
+            job->cv.notify_one();
+        }
+    }
+    void save_slot_prefix(size_t s) {
+        if (!prefix) return;
+        try {
+            gens[s]->save_prefix();
             std::lock_guard lk(stats_mu);
             prefix_stats = prefix->stats();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[g2e] slot %zu: prefix cache save failed: %s\n", s, e.what());
         }
-        std::lock_guard lk(job->mu);
-        job->gen = std::move(gen);
-        job->error = std::move(error);
-        job->done = true;
-        job->cv.notify_one();
     }
     void step_job(size_t s) {
         Generator& g = *gens[s];
         try {
-            if (g.step(kPrefillStep)) finish_job(s, g.take_result(), "");
+            if (g.step(kPrefillStep)) {
+                finish_job(s, g.take_result(), "");
+                save_slot_prefix(s);
+            }
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[g2e] slot %zu: %s\n", s, e.what());
             try { g.abort(); } catch (...) {}
@@ -237,8 +248,13 @@ struct Server {
         for (size_t s : group) gp.push_back(gens[s].get());
         try {
             const auto done = Generator::step_batch(gp);
+            std::vector<size_t> to_save;
             for (size_t k = 0; k < group.size(); ++k)
-                if (done[k]) finish_job(group[k], gens[group[k]]->take_result(), "");
+                if (done[k]) {
+                    finish_job(group[k], gens[group[k]]->take_result(), "");
+                    to_save.push_back(group[k]);
+                }
+            for (size_t s : to_save) save_slot_prefix(s);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[g2e] batched round: %s\n", e.what());
             for (size_t s : group) {
@@ -416,8 +432,10 @@ struct Server {
         kv_budget = opt.kv_gib > 0 ? uint64_t(opt.kv_gib * double(1ull << 30))
                                    : held + (free_now > kMarginBytes ? free_now - kMarginBytes : 0);
         gens[0]->release();  // slot 0's warm-up caches go back to the budget
-        for (auto& g : gens)
+        for (auto& g : gens) {
             g->set_kv_reserve([this](uint32_t slot, uint64_t extra) { return reserve_kv(slot, extra); });
+            g->set_defer_prefix_save(true);
+        }
         std::fprintf(stderr, "[g2e] %u slots, dynamic KV caches: budget %.1f GiB = %.0fK context rows in all (device free %.1f GiB)\n",
                      opt.slots, double(kv_budget) / (1ull << 30),
                      double(kv_budget) / double(model->kv_bytes_for(1)) / 1024.0, double(free_now) / (1ull << 30));

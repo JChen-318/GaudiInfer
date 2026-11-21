@@ -48,7 +48,13 @@ void main(tensor seq, tensor w, tensor X, tensor V)
         const float64_pair_t w2 = bf16_to_f32_linear(v_bf16_ld_tnsr_b(wc, w));
         wc[1] = 3;
         const float64_pair_t w3 = bf16_to_f32_linear(v_bf16_ld_tnsr_b(wc, w));
+#ifdef BATCHED
+        for (int b = start[1]; b < end[1]; ++b) {
+        int5 sc = {c, 0, b, 0, 0};
+#else
+        const int b = 0;
         int5 sc = {c, 0, 0, 0, 0};
+#endif
         float64_pair_t s0 = bf16_to_f32_linear(v_bf16_ld_tnsr_b(sc, seq));
         sc[1] = 1;
         float64_pair_t s1 = bf16_to_f32_linear(v_bf16_ld_tnsr_b(sc, seq));
@@ -75,17 +81,20 @@ void main(tensor seq, tensor w, tensor X, tensor V)
             if (c < 2 * QK) {
                 const int is_k = c >= QK;
                 const int head = (c - (is_k ? QK : 0)) / 128;
-                int5 xc = {0, is_k ? t : tokens + t, head, 0, 0};
+                int5 xc = {0, is_k ? t : tokens + t, head, b, 0};
                 v_f32_st_tnsr(xc, X, o.v1);
                 xc[0] = 64;
                 v_f32_st_tnsr(xc, X, o.v2);
             } else {
-                int5 vc = {c - 2 * QK, t, 0, 0, 0};
+                int5 vc = {c - 2 * QK, t, b, 0, 0};
                 v_f32_st_tnsr(vc, V, o.v1);
                 vc[0] += 64;
                 v_f32_st_tnsr(vc, V, o.v2);
             }
             s0 = s1; s1 = s2; s2 = s3;
         }
+#ifdef BATCHED
+        }
+#endif
     }
 }

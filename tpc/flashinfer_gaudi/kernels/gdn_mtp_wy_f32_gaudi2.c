@@ -66,10 +66,39 @@
     })
 #define LANE(v, idx) v_broadcast_element_f32(LANE_TO_0((v), (idx)), 0)
 
+// LUT-free FP32 rsqrt(x) for x > 0 (3 Newton-Raphson steps -> full 23-bit FP32 precision, zero VLM LUT usage).
+static inline float64 rsqrt_vec_f32(float64 x)
+{
+    float64 y = as_float64((int64)0x5f3759df - (as_int64(x) >> 1));
+    const float64 h = 0.5f * x;
+    y = y * (1.5f - h * y * y);
+    y = y * (1.5f - h * y * y);
+    y = y * (1.5f - h * y * y);
+    return y;
+}
+static inline float64 exp_vec_f32(float64 x)
+{
+    const float64 xc = v_f32_max_b(x, -87.0f);
+    const float64 t = xc * 1.4426950408889634f;
+    const int64 n = v_convert_f32_to_i32_b(t, SW_RHNE);
+    const float64 f = t - v_convert_i32_to_f32_b(n, 0);
+    float64 p = 0.0096181291f;
+    p = v_f32_mac_b(p, f, 0.0555041087f);
+    p = v_f32_mac_b(p, f, 0.2402265070f);
+    p = v_f32_mac_b(p, f, 0.6931471806f);
+    p = v_f32_mac_b(p, f, 1.0f);
+    const int64 bits = (n + 127) << 23;
+    const float64 r = p * (*((float64*)&bits));
+    return v_f32_sel_leq_f32_b(x, -87.0f, 0.0f, r);
+}
+
 // Per token t: lanes [0, T) -a_tj (0 for j >= t), [T, 2T) e_tj (0 for j > t), L_RKB.. per-token scalars.
 volatile __local__ float64 token_coef[TOKENS];
 // ds_t for rows 0..63 (index 2t) and 64..127 (index 2t + 1); zeroed once (masked terms multiply it by 0).
 __local__ float64 token_delta[2 * TOKENS];
+// VLM cache of gram rows k_t.k_j and q_t.k_j (2 * 16 * 256B = 8 KiB) to avoid loading gram twice!
+__local__ float64 gram_k[TOKENS];
+__local__ float64 gram_q[TOKENS];
 
 void main(
 #ifndef NO_PHASE2
@@ -78,6 +107,8 @@ void main(
           tensor log_decay, tensor beta, tensor rmat, tensor gram, tensor vals, tensor output
 #ifndef NO_PHASE2
           , tensor checkpoints
+#elif defined(OUTPUT_DS)
+          , tensor ds_out
 #endif
           )
 {
@@ -100,6 +131,8 @@ void main(
             float64 next_qrow = v_f32_ld_tnsr_b(qrow_coords, gram);
             for (int t = 0; t < TOKENS; ++t) {
                 const float64 krow_now = next_krow, qrow_now = next_qrow;
+                gram_k[t] = krow_now;
+                gram_q[t] = qrow_now;
                 const int tn = t + 1 < TOKENS ? t + 1 : t;
                 krow_coords[1] = tn; qrow_coords[1] = TOKENS + tn;
                 next_krow = v_f32_ld_tnsr_b(krow_coords, gram);
@@ -119,20 +152,18 @@ void main(
 #endif
                 ldv = v_f32_mov_vb(ld, 0, ldv, here);
             }
-            const float64 rkv = v_rsqrt_f32(kdiag + 1e-6f);
-            const float64 rqv = v_rsqrt_f32(SWAP_T(qdiag) + 1e-6f) * q_scale;
-            const float64 gv = v_exp_f32(ldv);
+            const float64 rkv = rsqrt_vec_f32(kdiag + 1e-6f);
+            const float64 rqv = rsqrt_vec_f32(SWAP_T(qdiag) + 1e-6f) * q_scale;
+            const float64 gv = exp_vec_f32(ldv);
             // G_t / G_j and G_t as running products of g (no exp per token: special-function LUT reloads made
             // the T16 kernel 4x slower; products also underflow gracefully where exp(cl_t - cl_j) would not)
             float64 ratio = zero;
             float64 Gcur = zero + 1.0f;
-            // ---- coefficients ----
+            // ---- coefficients (reads gram from 1-cycle VLM cache instead of reloading tensor) ----
             #pragma unroll
             for (int t = 0; t < TOKENS; ++t) {
-                int5 krow_coords = {0, t, key_head, batch, 0};
-                const float64 krow = v_f32_ld_tnsr_b(krow_coords, gram);        // lanes j: k_t . k_j
-                int5 qrow_coords = {0, TOKENS + t, key_head, batch, 0};
-                const float64 qrow = v_f32_ld_tnsr_b(qrow_coords, gram);        // lanes j: q_t . k_j
+                const float64 krow = gram_k[t];                                  // lanes j: k_t . k_j
+                const float64 qrow = gram_q[t];                                  // lanes j: q_t . k_j
                 const float64 g_t = v_broadcast_element_f32(gv, t);
                 Gcur = Gcur * g_t;                                               // G_t
                 ratio = ratio * g_t;                                             // lanes j < t: G_t / G_j
@@ -152,6 +183,121 @@ void main(
                 token_coef[t] = coef;
             }
             // ---- phase 1: ds_t and out_t for all rows (masked coefficients zero the j >= t / j > t terms) ----
+#ifdef NO_PHASE2
+            {
+                int5 vc0 = {0, head, 0, batch, 0}, vc1 = {64, head, 0, batch, 0};
+#ifdef RMAT_KH
+                const int rbase = (head % 3) * 128;
+                int5 kc0 = {rbase, 0, key_head, batch, 0}, kc1 = {rbase + 64, 0, key_head, batch, 0};
+                int5 qc0 = {rbase, TOKENS, key_head, batch, 0}, qc1 = {rbase + 64, TOKENS, key_head, batch, 0};
+#else
+                int5 kc0 = {0, 0, head, batch, 0}, kc1 = {64, 0, head, batch, 0};
+                int5 qc0 = {0, TOKENS, head, batch, 0}, qc1 = {64, TOKENS, head, batch, 0};
+#endif
+                float64 nv0 = v_f32_ld_tnsr_b(vc0, vals), nv1 = v_f32_ld_tnsr_b(vc1, vals);
+                float64 nrk0 = v_f32_ld_tnsr_b(kc0, rmat), nrk1 = v_f32_ld_tnsr_b(kc1, rmat);
+                float64 nrq0 = v_f32_ld_tnsr_b(qc0, rmat), nrq1 = v_f32_ld_tnsr_b(qc1, rmat);
+                for (int t = 0; t < TOKENS; ++t) {
+                    const float64 coef = token_coef[t];
+                    const float64 v0 = nv0, v1 = nv1, rk0 = nrk0, rk1 = nrk1, rq0 = nrq0, rq1 = nrq1;
+                    const int tn = t + 1 < TOKENS ? t + 1 : t;
+                    vc0[2] = tn; vc1[2] = tn;
+                    kc0[1] = tn; kc1[1] = tn;
+                    qc0[1] = TOKENS + tn; qc1[1] = TOKENS + tn;
+                    nv0 = v_f32_ld_tnsr_b(vc0, vals); nv1 = v_f32_ld_tnsr_b(vc1, vals);
+                    nrk0 = v_f32_ld_tnsr_b(kc0, rmat); nrk1 = v_f32_ld_tnsr_b(kc1, rmat);
+                    nrq0 = v_f32_ld_tnsr_b(qc0, rmat); nrq1 = v_f32_ld_tnsr_b(qc1, rmat);
+
+                    const float64 c_rkb = v_broadcast_element_f32(coef, L_RKB);
+                    const float64 c_b = v_broadcast_element_f32(coef, L_B);
+                    float64 a0[4] = {v0 * c_rkb - rk0 * c_b, zero, zero, zero};
+                    float64 a1[4] = {v1 * c_rkb - rk1 * c_b, zero, zero, zero};
+                    if (t > 0) {
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const float64 cj = v_broadcast_element_f32(coef, j);
+                            a0[j] = v_f32_mac_b(token_delta[2 * j], cj, a0[j]);
+                            a1[j] = v_f32_mac_b(token_delta[2 * j + 1], cj, a1[j]);
+                        }
+                    }
+                    if (t > 4) {
+                        #pragma unroll
+                        for (int j = 4; j < 8; ++j) {
+                            const float64 cj = v_broadcast_element_f32(coef, j);
+                            a0[j & 3] = v_f32_mac_b(token_delta[2 * j], cj, a0[j & 3]);
+                            a1[j & 3] = v_f32_mac_b(token_delta[2 * j + 1], cj, a1[j & 3]);
+                        }
+                    }
+#if TOKENS == 16
+                    if (t > 8) {
+                        #pragma unroll
+                        for (int j = 8; j < 12; ++j) {
+                            const float64 cj = v_broadcast_element_f32(coef, j);
+                            a0[j & 3] = v_f32_mac_b(token_delta[2 * j], cj, a0[j & 3]);
+                            a1[j & 3] = v_f32_mac_b(token_delta[2 * j + 1], cj, a1[j & 3]);
+                        }
+                    }
+                    if (t > 12) {
+                        #pragma unroll
+                        for (int j = 12; j < 16; ++j) {
+                            const float64 cj = v_broadcast_element_f32(coef, j);
+                            a0[j & 3] = v_f32_mac_b(token_delta[2 * j], cj, a0[j & 3]);
+                            a1[j & 3] = v_f32_mac_b(token_delta[2 * j + 1], cj, a1[j & 3]);
+                        }
+                    }
+#endif
+                    const float64 ds0 = (a0[0] + a0[1]) + (a0[2] + a0[3]);
+                    const float64 ds1 = (a1[0] + a1[1]) + (a1[2] + a1[3]);
+                    token_delta[2 * t] = ds0;
+                    token_delta[2 * t + 1] = ds1;
+#ifdef OUTPUT_DS
+                    {
+                        int5 dc0 = {0, head, t, batch, 0}, dc1 = {64, head, t, batch, 0};
+                        v_f32_st_tnsr(dc0, ds_out, ds0);
+                        v_f32_st_tnsr(dc1, ds_out, ds1);
+                    }
+#endif
+                    const float64 c_c = v_broadcast_element_f32(coef, L_C);
+                    float64 o0[4] = {rq0 * c_c, zero, zero, zero};
+                    float64 o1[4] = {rq1 * c_c, zero, zero, zero};
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float64 ej = v_broadcast_element_f32(coef, TOKENS + j);
+                        o0[j] = v_f32_mac_b(token_delta[2 * j], ej, o0[j]);
+                        o1[j] = v_f32_mac_b(token_delta[2 * j + 1], ej, o1[j]);
+                    }
+                    if (t >= 4) {
+                        #pragma unroll
+                        for (int j = 4; j < 8; ++j) {
+                            const float64 ej = v_broadcast_element_f32(coef, TOKENS + j);
+                            o0[j & 3] = v_f32_mac_b(token_delta[2 * j], ej, o0[j & 3]);
+                            o1[j & 3] = v_f32_mac_b(token_delta[2 * j + 1], ej, o1[j & 3]);
+                        }
+                    }
+#if TOKENS == 16
+                    if (t >= 8) {
+                        #pragma unroll
+                        for (int j = 8; j < 12; ++j) {
+                            const float64 ej = v_broadcast_element_f32(coef, TOKENS + j);
+                            o0[j & 3] = v_f32_mac_b(token_delta[2 * j], ej, o0[j & 3]);
+                            o1[j & 3] = v_f32_mac_b(token_delta[2 * j + 1], ej, o1[j & 3]);
+                        }
+                    }
+                    if (t >= 12) {
+                        #pragma unroll
+                        for (int j = 12; j < 16; ++j) {
+                            const float64 ej = v_broadcast_element_f32(coef, TOKENS + j);
+                            o0[j & 3] = v_f32_mac_b(token_delta[2 * j], ej, o0[j & 3]);
+                            o1[j & 3] = v_f32_mac_b(token_delta[2 * j + 1], ej, o1[j & 3]);
+                        }
+                    }
+#endif
+                    int5 oc0 = {0, head, t, batch, 0}, oc1 = {64, head, t, batch, 0};
+                    v_f32_st_tnsr(oc0, output, (o0[0] + o0[1]) + (o0[2] + o0[3]));
+                    v_f32_st_tnsr(oc1, output, (o1[0] + o1[1]) + (o1[2] + o1[3]));
+                }
+            }
+#else
             #pragma unroll
             for (int part = 0; part < 2; ++part) {
                 // software pipelined: the next token's global loads are issued before this token's chain
@@ -183,6 +329,12 @@ void main(
                         acc[j & 3] = v_f32_mac_b(token_delta[2 * j + part], v_broadcast_element_f32(coef, j), acc[j & 3]);
                     const float64 ds = (acc[0] + acc[1]) + (acc[2] + acc[3]);
                     token_delta[2 * t + part] = ds;
+#ifdef OUTPUT_DS
+                    {
+                        int5 dc = {64 * part, head, t, batch, 0};
+                        v_f32_st_tnsr(dc, ds_out, ds);
+                    }
+#endif
                     const float64 rq_col = rq_now;
                     float64 oc[4];
                     oc[0] = rq_col * v_broadcast_element_f32(coef, L_C);
@@ -196,6 +348,7 @@ void main(
                     v_f32_st_tnsr(out_coords, output, o);
                 }
             }
+#endif
 #if defined(DEFER) && TOKENS == 16
             // ---- deferred: no state update here; ds_t goes to checkpoints[b, t, h, 0, :] (row 0 of each
             // checkpoint), the caller rebuilds the accepted state from S0 and these deltas in the next round ----

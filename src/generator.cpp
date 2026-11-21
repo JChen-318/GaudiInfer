@@ -81,10 +81,32 @@ std::vector<float> Generator::prefill_from(const std::vector<int32_t>& prompt, G
     r.reused_tokens = uint32_t(h);
     const std::span<const int32_t> tail(prompt.data() + h, prompt.size() - h);
     std::vector<float> logits;
+    std::vector<uint32_t> points;
+    if (cache_ && images.empty())
+        for (uint32_t p : snap_points_)
+            if (p > h && p < prompt.size() && p >= PrefixCache::kMinTokens) points.push_back(p);
+    std::sort(points.begin(), points.end());
+    points.erase(std::unique(points.begin(), points.end()), points.end());
     auto append = [&](uint32_t at, uint32_t n) {
-        if (drafter_) drafter_->append_context(model_.features(), model_.feature_stride(), n, at);
-        // a snapshot every kSnapEvery tokens of a long prompt: a shared document resumes there for other questions
         const uint32_t end = at + n;
+        if (drafter_) {
+            uint32_t keep = at;
+            const uint32_t W = drafter_->window();
+            if (W) {
+                uint32_t next_stop = uint32_t(prompt.size());
+                if (cache_ && images.empty()) {
+                    const uint32_t snap = ((end + PrefixCache::kSnapEvery - 1) / PrefixCache::kSnapEvery) * PrefixCache::kSnapEvery;
+                    if (snap < next_stop) next_stop = snap;
+                }
+                for (uint32_t p : points)
+                    if (p >= end && p < next_stop) next_stop = p;
+                const uint32_t win_lo = next_stop > W ? next_stop - W : 0u;
+                keep = std::max(at, std::min(end, win_lo));
+            }
+            if (keep < end)
+                drafter_->append_context(model_.features(), model_.feature_stride(), end - keep, keep, UINT32_MAX, keep - at);
+        }
+        // a snapshot every kSnapEvery tokens of a long prompt: a shared document resumes there for other questions
         if (cache_ && images.empty() && end % PrefixCache::kSnapEvery == 0 && end < prompt.size())
             cache_->snapshot(prompt, end);
     };
@@ -92,12 +114,6 @@ std::vector<float> Generator::prefill_from(const std::vector<int32_t>& prompt, G
         logits = model_.prefill_images(tail, images, append);  // (h == 0: images reset above)
     } else {
         // prefill up to each snapshot point (a message boundary), snapshot, go on
-        std::vector<uint32_t> points;
-        if (cache_)
-            for (uint32_t p : snap_points_)
-                if (p > h && p < prompt.size() && p >= PrefixCache::kMinTokens) points.push_back(p);
-        std::sort(points.begin(), points.end());
-        points.erase(std::unique(points.begin(), points.end()), points.end());
         size_t at = h;
         for (uint32_t p : points) {
             model_.prefill(std::span<const int32_t>(prompt.data() + at, p - at), append);
@@ -394,12 +410,17 @@ void Generator::begin(Task& t) {
     }
     t.at = history_.size();
     t.r.reused_tokens = uint32_t(t.at);
+    if (cache_ && prompt.size() > t.at) {
+        const size_t new_chunks = (prompt.size() - t.at) / PrefixCache::kChunk + 1;
+        if (new_chunks > 1) cache_->prepare_chunks(new_chunks);
+    }
     t.points.clear();
     if (cache_)
         for (uint32_t p : snap_points_)
-            // not near the end (the assistant header): splitting the prompt there costs forwards and a snapshot
-            // for little reuse (the conversation is saved at the end of the request anyway)
-            if (p > t.at && p + 64 <= prompt.size() && p >= PrefixCache::kMinTokens) t.points.push_back(p);
+            // not near the start of the incremental turn or near the end (the assistant header): splitting a short
+            // multi-turn tail (< 256 tokens from t.at) doubles the number of forward passes and adds a synchronous
+            // snapshot copy in the middle of TTFT, while the full turn is saved at the end of the request anyway
+            if (p >= t.at + 256 && p + 64 <= prompt.size() && p >= PrefixCache::kMinTokens) t.points.push_back(p);
     std::sort(t.points.begin(), t.points.end());
     t.points.erase(std::unique(t.points.begin(), t.points.end()), t.points.end());
     snap_points_.clear();
@@ -409,8 +430,24 @@ void Generator::begin(Task& t) {
 void Generator::prefill_segment(Task& t, uint32_t budget) {
     const auto& prompt = t.prompt;
     auto append = [&](uint32_t at, uint32_t n) {
-        if (drafter_) drafter_->append_context(model_.features(), model_.feature_stride(), n, at);
         const uint32_t end = at + n;  // a snapshot every kSnapEvery tokens of a long prompt
+        if (drafter_) {
+            uint32_t keep = at;
+            const uint32_t W = drafter_->window();
+            if (W) {
+                uint32_t next_stop = uint32_t(prompt.size());
+                if (cache_ && t.images.empty()) {
+                    const uint32_t snap = ((end + PrefixCache::kSnapEvery - 1) / PrefixCache::kSnapEvery) * PrefixCache::kSnapEvery;
+                    if (snap < next_stop) next_stop = snap;
+                }
+                for (uint32_t p : t.points)
+                    if (p >= end && p < next_stop) next_stop = p;
+                const uint32_t win_lo = next_stop > W ? next_stop - W : 0u;
+                keep = std::max(at, std::min(end, win_lo));
+            }
+            if (keep < end)
+                drafter_->append_context(model_.features(), model_.feature_stride(), end - keep, keep, UINT32_MAX, keep - at);
+        }
         if (cache_ && end % PrefixCache::kSnapEvery == 0 && end < prompt.size()) cache_->snapshot(prompt, end);
     };
     size_t end = prompt.size();
@@ -455,19 +492,24 @@ void Generator::first_token(Task& t, const std::vector<float>& logits) {
     if (extra || eos || r.tokens.size() >= t.max_new) finish(t);
 }
 
+void Generator::save_prefix() {
+    if (!cache_ || history_images_) return;
+    select();
+    if (model_.position() != history_.size()) return;
+    const auto c0 = std::chrono::steady_clock::now();
+    const double a0 = cache_->stats().alloc_ms;
+    cache_->save(history_);
+    const double ms = ms_since(c0), am = cache_->stats().alloc_ms - a0;
+    if (ms > 20)
+        std::fprintf(stderr, "[g2e] slot %u: prefix cache save of %zu tokens %.0f ms (pinned allocations %.0f ms)\n",
+                     slot_, history_.size(), ms, am);
+}
+
 void Generator::finish(Task& t) {
     t.r.decode_ms = t.phase == Task::Decode ? ms_since(t.t1) : 0.0;
     t.done = true;
     // the conversation so far (prompt + answer whose state is in the caches) for a later request of the same history
-    if (cache_ && !history_images_ && model_.position() == history_.size()) {
-        const auto c0 = std::chrono::steady_clock::now();
-        const double a0 = cache_->stats().alloc_ms;
-        cache_->save(history_);
-        const double ms = ms_since(c0), am = cache_->stats().alloc_ms - a0;
-        if (ms > 20)
-            std::fprintf(stderr, "[g2e] slot %u: prefix cache save of %zu tokens %.0f ms (pinned allocations %.0f ms)\n",
-                         slot_, history_.size(), ms, am);
-    }
+    if (!defer_prefix_save_) save_prefix();
 }
 
 bool Generator::stop_token(const Task& t, int32_t x) const {
@@ -733,12 +775,8 @@ std::vector<bool> Generator::step_batch(std::span<Generator* const> gens) {
         }
     }
     const auto t1 = std::chrono::steady_clock::now();
-    auto append = [&] {  // the drafters' context appends overlap the wait
-        for (size_t b = 0; b < n; ++b) {
-            Generator& g = *gens[in[b]];
-            g.drafter_->select_slot(g.slot_);
-            g.drafter_->append_context(model.features(), model.feature_stride(), Wv, pos[b], 0, uint32_t(b) * Wv);
-        }
+    auto append = [&] {  // the drafters' context appends overlap the wait (one batched launch for all slots)
+        gens[in[0]]->drafter_->append_context_batch(slots, model.features(), model.feature_stride(), Wv, pos, 0);
     };
     std::vector<std::vector<int32_t>> targets;
     std::vector<Qwen35::VerifyTop> tops;

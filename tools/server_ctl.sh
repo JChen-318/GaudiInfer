@@ -20,6 +20,8 @@ stop() {
 }
 start() {
     export G2E_RECIPE_CACHE=/home/a/g2e-data/recipes HABANA_LOGS=/home/a/g2e-data/habana_logs
+    export SCAL_CONFIG_FILE_PATH=/home/a/gaudi2-engine/tools/scal-g2e-direct.json
+    export SCAL_CFG_FILE_PATH=/home/a/gaudi2-engine/tools/scal-g2e-direct.json
     nohup ./build/g2e_server --model-dir /mnt/sas/models/qwen3.8-27b-fp8-mtp \
         --target-pack "$PACKS/qwen3.8-27b.g2w" --draft-pack "$PACKS/dspine-b16.g2w" --vision-pack "$PACKS/vision.g2w" \
         --served-model-name qwen3.8-27b --port "$PORT" --max-model-len "$MAXLEN" --slots "$SLOTS" --kv-cache-gib "$KVGIB" --reasoning-parser qwen3 \

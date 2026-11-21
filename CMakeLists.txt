@@ -13,12 +13,18 @@ find_package(Threads REQUIRED)
 # Custom TPC kernels (GDN decode/verify, fused norm+quant, ...), loaded through GC_KERNEL_PATH at runtime.
 add_subdirectory(tpc/flashinfer_gaudi)
 
-add_library(g2e_core STATIC src/runtime.cpp src/graph.cpp src/weights.cpp src/ops.cpp src/qwen35.cpp src/gdn.cpp src/dspine.cpp src/generator.cpp src/vision.cpp src/image.cpp src/prefix_cache.cpp)
+add_library(g2e_core STATIC src/runtime.cpp src/graph.cpp src/weights.cpp src/ops.cpp src/qwen35.cpp src/gdn.cpp src/dspine.cpp src/generator.cpp src/vision.cpp src/image.cpp src/prefix_cache.cpp src/direct_mme.cpp src/direct_gdn.cpp src/direct_attn.cpp)
 target_include_directories(g2e_core PUBLIC include)
-target_include_directories(g2e_core SYSTEM PRIVATE third_party)
-target_link_libraries(g2e_core PUBLIC SynapseAI::SynapseAI Threads::Threads)
+target_include_directories(g2e_core SYSTEM PRIVATE third_party
+    /usr/include/habanalabs /usr/include/drm
+    /opt/habanalabs/src/hl-thunk/include/uapi /opt/habanalabs/src/hl-thunk/include/specs)
+target_link_libraries(g2e_core PUBLIC SynapseAI::SynapseAI Threads::Threads scal hl-thunk)
+target_link_directories(g2e_core PUBLIC /usr/lib/habanalabs)
 target_compile_options(g2e_core PRIVATE -Wall -Wextra)
-target_compile_definitions(g2e_core PRIVATE G2E_TPC_LIB="$<TARGET_FILE:flashinfer_gaudi_kernels>")
+target_compile_definitions(g2e_core PRIVATE
+    G2E_TPC_LIB="$<TARGET_FILE:flashinfer_gaudi_kernels>"
+    G2E_TPC_OBJ_DIR="$<TARGET_FILE_DIR:flashinfer_gaudi_kernels>"
+    G2E_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_dependencies(g2e_core flashinfer_gaudi_kernels)
 
 # ---- text: tokenizer + chat template (vendored llama.cpp unicode/json/jinja, MIT)
@@ -31,3 +37,4 @@ target_include_directories(g2e_text PUBLIC include third_party PRIVATE third_par
 add_executable(g2e_server apps/g2e_server.cpp src/qwen3_parser.cpp third_party/httplib/httplib.cpp)
 target_include_directories(g2e_server PRIVATE third_party)
 target_link_libraries(g2e_server PRIVATE g2e_core g2e_text)
+

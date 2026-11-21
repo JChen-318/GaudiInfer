@@ -28,8 +28,8 @@ tpc_lib_api::GlueCodeReturn SiluMulQuantBf16Gaudi2::GetGcDefinitions(
     const auto rows = input.maxSizes[1];
     if (input.dims != 2 || silu.dims != 2 || output.dims != 2 || scale.dims != 2 || !rows ||
         rows > std::numeric_limits<int32_t>::max() || width < 256 || width > 17408 || width % 128 ||
-        input.maxSizes[0] != 2 * width || output.maxSizes[1] != rows ||
-        silu.maxSizes[0] != width || silu.maxSizes[1] != rows ||
+        (input.maxSizes[0] != 2 * width && input.maxSizes[0] != width) || output.maxSizes[1] != rows ||
+        (silu.maxSizes[0] != width && silu.maxSizes[0] != 2 * width) || silu.maxSizes[1] != rows ||
         scale.maxSizes[0] != 1 || scale.maxSizes[1] != rows)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;
     instance->indexSpaceRank = 1;
@@ -42,8 +42,8 @@ tpc_lib_api::GlueCodeReturn SiluMulQuantBf16Gaudi2::GetGcDefinitions(
         pattern.mapping[1].indexSpaceDim = 0;
         pattern.mapping[1].a = 1;
     };
-    map_row(instance->inputTensorAccessPattern[0], 2 * width);
-    instance->inputTensorAccessPattern[0].mapping[0].start_b = width;
+    map_row(instance->inputTensorAccessPattern[0], int(input.maxSizes[0]));
+    instance->inputTensorAccessPattern[0].mapping[0].start_b = int(input.maxSizes[0] - width);
     map_row(instance->inputTensorAccessPattern[1], width);
     map_row(instance->outputTensorAccessPattern[0], width);
     map_row(instance->outputTensorAccessPattern[1], 1);

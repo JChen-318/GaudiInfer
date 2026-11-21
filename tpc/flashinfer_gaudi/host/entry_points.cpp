@@ -7,6 +7,7 @@
 #include "gdn_packed_decode_f32_gaudi2.hpp"
 #include "gdn_spec_prep_bf16_gaudi2.hpp"
 #include "masked_softmax_bf16_gaudi2.hpp"
+#include "silu_and_mul_bf16_gaudi2.hpp"
 #include "silu_mul_quant_bf16_gaudi2.hpp"
 #include "spec_conv_bf16_gaudi2.hpp"
 
@@ -28,14 +29,31 @@ struct Entry {
 
 constexpr Entry kKernels[] = {
     {&static_name<AddRmsNormQuantBf16Gaudi2>, &glue<AddRmsNormQuantBf16Gaudi2>},
+    {&static_name<AttnQkvPrepBf16Gaudi2>, &glue<AttnQkvPrepBf16Gaudi2>},
+    {&static_name<AttnQkvPrepF8Gaudi2>, &glue<AttnQkvPrepF8Gaudi2>},
+    {&static_name<DSpineBridgeCodesBf16Gaudi2>, &glue<DSpineBridgeCodesBf16Gaudi2>},
+    {&static_name<DSpineBridgeGateBf16Gaudi2>, &glue<DSpineBridgeGateBf16Gaudi2>},
+    {&static_name<DSpineBridgeNormBf16Gaudi2>, &glue<DSpineBridgeNormBf16Gaudi2>},
+    {&static_name<DSpineBridgePostBf16Gaudi2>, &glue<DSpineBridgePostBf16Gaudi2>},
+    {&static_name<DSpineQkvPrepBf16Gaudi2>, &glue<DSpineQkvPrepBf16Gaudi2>},
     {&static_name<GatedNormQuantBf16Gaudi2>, &glue<GatedNormQuantBf16Gaudi2>},
     {&call_name<GdnPackedDecodeF32Gaudi2>, &glue<GdnPackedDecodeF32Gaudi2>},
     {&static_name<GdnMtpWyo8F32Gaudi2>, &glue<GdnMtpWyo8F32Gaudi2>},
     {&static_name<GdnMtpWyoF32Gaudi2>, &glue<GdnMtpWyoF32Gaudi2>},
+    {&static_name<GdnMtpWyod8F32Gaudi2>, &glue<GdnMtpWyod8F32Gaudi2>},
+    {&static_name<GdnMtpWyodF32Gaudi2>, &glue<GdnMtpWyodF32Gaudi2>},
+    {&static_name<GdnPrefillConvPrepBf16Gaudi2>, &glue<GdnPrefillConvPrepBf16Gaudi2>},
+    {&static_name<GdnPrefillDecayPrepBf16Gaudi2>, &glue<GdnPrefillDecayPrepBf16Gaudi2>},
+    {&static_name<GdnPrefillGateQuantBf16Gaudi2>, &glue<GdnPrefillGateQuantBf16Gaudi2>},
+    {&static_name<GdnSpecPrepBatchBf16Gaudi2>, &glue<GdnSpecPrepBatchBf16Gaudi2>},
     {&static_name<GdnSpecPrepBf16Gaudi2>, &glue<GdnSpecPrepBf16Gaudi2>},
+    {&static_name<GdnStateCommitF32Gaudi2>, &glue<GdnStateCommitF32Gaudi2>},
+    {&static_name<MaskedSoftmaxBf16F8Gaudi2>, &glue<MaskedSoftmaxBf16F8Gaudi2>},
     {&static_name<MaskedSoftmaxBf16Gaudi2>, &glue<MaskedSoftmaxBf16Gaudi2>},
     {&static_name<MaskedSoftmaxF16Gaudi2>, &glue<MaskedSoftmaxF16Gaudi2>},
     {&static_name<RowQuantBf16Gaudi2>, &glue<RowQuantBf16Gaudi2>},
+    {&static_name<RowSoftmaxStatsCmaxF32Gaudi2>, &glue<RowSoftmaxStatsCmaxF32Gaudi2>},
+    {&static_name<SiluAndMulBf16Gaudi2>, &glue<SiluAndMulBf16Gaudi2>},
     {&static_name<SiluMulQuantBf16Gaudi2>, &glue<SiluMulQuantBf16Gaudi2>},
     {&static_name<SiluMulQuantDqBf16Gaudi2>, &glue<SiluMulQuantDqBf16Gaudi2>},
     {&static_name<SpecConvBf16Gaudi2>, &glue<SpecConvBf16Gaudi2>},

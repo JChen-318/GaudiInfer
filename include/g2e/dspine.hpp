@@ -29,6 +29,7 @@ public:
     ~DSpine();
     static constexpr uint32_t kBlock = 16;
     static constexpr uint32_t kFeatures = 5;
+    uint32_t window() const { return window_; }
     const std::vector<uint32_t>& target_layers() const { return target_layers_; }
     void reset();
     // sequence slots (as Qwen35): each owns its context ring and slot positions; slot 0 = the constructor's
@@ -49,6 +50,10 @@ public:
     // src_row: the first features row to read (a batched verification: slot b's rows start at b * kBlock)
     void append_context(const DeviceBuffer& feats, uint64_t slot_stride, uint32_t n, uint32_t pos,
                         uint32_t marked = UINT32_MAX, uint32_t src_row = 0);
+    // Batched append_context for 2..kMaxBatch distinct slots (slot b reads rows b * n .. of feats): one launch when
+    // no slot wraps around the ring, else falls back per slot.
+    void append_context_batch(std::span<const uint32_t> slots, const DeviceBuffer& feats, uint64_t slot_stride,
+                              uint32_t n, std::span<const uint32_t> pos, uint32_t marked = UINT32_MAX);
     void mark(uint32_t pos, uint32_t n);
     // Greedy draft of the block [anchor at pos, mask x 15]: the 15 proposed tokens after the anchor.
     std::vector<int32_t> draft(int32_t anchor, uint32_t pos);
@@ -76,9 +81,10 @@ public:
 
 private:
     Recipe& append_recipe(uint32_t n);
+    Recipe& append_batch_recipe(uint32_t B, uint32_t n);
     Recipe& block_recipe(bool sampled);
     Recipe& block_batch_recipe(uint32_t B, bool sampled);  // draft_batch: B slots x kBlock rows (+ tables)
-    DeviceBuffer ctlb_;                       // draft_batch controls (layout in draft_batch)
+    DeviceBuffer ctlb_, append_rpos_;         // draft_batch controls, append_context_batch RoPE positions
     std::map<uint32_t, DeviceBuffer> topkb_;  // Ops::topk2 constants for B x (kBlock - 1) rows
     void run_block(int32_t anchor, uint32_t pos, bool sampled);  // results in staging_ (cand at 0, idx/table at 4096)
     void build_tables();
@@ -104,7 +110,7 @@ private:
     };
     std::vector<Seq> seqs_ = std::vector<Seq>(1);  // seqs_[active_] is empty: its state is in the members
     uint32_t active_ = 0;
-    DeviceBuffer tg_, tsv_, ctl_, out_idx_;  // out_idx_: cand at 0, idx / table at 4096
+    DeviceBuffer tg_, tsv_, wtw_, qkv_w_, gu_w_, ctl_, out_idx_;  // out_idx_: cand at 0, idx / table at 4096
     DeviceBuffer topk_aux_;                 // Ops::topk2 constants
     // the target's lm_head quantised per row to FP8 (candidate logits only; the candidates are scored with the
     // BF16 rows); G2E_DRAFT_LM_BF16=1 keeps the BF16 product

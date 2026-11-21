@@ -77,6 +77,10 @@ public:
     const std::vector<int32_t>& history() const { return history_; }
     // states of earlier prefixes in host memory / on disk (g2e/prefix_cache.hpp); null: only the last history
     void set_prefix_cache(class PrefixCache* cache) { cache_ = cache; }
+    // when true, finish() does not save the prefix cache inline; the caller invokes save_prefix() after notifying
+    // the client (so SSE [DONE] is never delayed by host KV copies)
+    void set_defer_prefix_save(bool defer) { defer_prefix_save_ = defer; }
+    void save_prefix();
     // prompt positions where the next generate() also takes prefix-cache snapshots (message boundaries: a later
     // request with the same history but another last message, or a thinking model's next turn, resumes there)
     void set_snapshot_points(std::vector<uint32_t> points) { snap_points_ = std::move(points); }
@@ -129,6 +133,7 @@ private:
     void deliver_keep(Task& t, const std::vector<int32_t>& keep);
     void finish(Task& t);
     class PrefixCache* cache_ = nullptr;
+    bool defer_prefix_save_ = false;
     std::vector<uint32_t> snap_points_;
     int32_t sample(const std::vector<float>& logits, const SamplingParams& p);
     // the verification's rows into the drafter's context, unmarked (queued while the verification runs)
