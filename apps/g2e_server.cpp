@@ -109,7 +109,8 @@ struct Server {
     uint64_t sched_tick = 0;
     uint64_t kv_budget = 0;                      // device bytes for the KV caches of all slots
     std::atomic<uint64_t> kv_used{0}, kv_evictions{0};
-    std::atomic<uint32_t> slots_active{0};
+    std::atomic<uint32_t> slots_active{0}, slots_decoding{0}, slots_prefilling{0};
+    std::atomic<uint64_t> live_decode_tokens{0}, live_decode_rounds{0}, live_prefill_tokens{0};
     static constexpr uint32_t kPrefillStep = 2048;      // concurrent prefill step: caps decode inter-token stall
     static constexpr uint32_t kPrefillStepSolo = 4096;  // solo prefill step: unlocks full T=4096 prefill throughput
     std::mutex stats_mu;
@@ -200,7 +201,11 @@ struct Server {
             g.set_snapshot_points(std::move(points));
         }
         Job* jp = job.get();
-        g.start(prompt, job->sp, [jp](std::span<const int32_t> toks) {
+        g.start(prompt, job->sp, [this, jp](std::span<const int32_t> toks) {
+            if (!toks.empty()) {
+                live_decode_tokens.fetch_add(toks.size(), std::memory_order_relaxed);
+                live_decode_rounds.fetch_add(1, std::memory_order_relaxed);
+            }
             std::lock_guard lk(jp->mu);
             jp->tokens.insert(jp->tokens.end(), toks.begin(), toks.end());
             jp->cv.notify_one();
@@ -234,7 +239,11 @@ struct Server {
     void step_job(size_t s, uint32_t prefill_step = kPrefillStep) {
         Generator& g = *gens[s];
         try {
-            if (g.step(prefill_step)) {
+            const size_t p0 = g.prefill_done();
+            const bool done = g.step(prefill_step);
+            const size_t p1 = g.prefill_done();
+            if (p1 > p0) live_prefill_tokens.fetch_add(p1 - p0, std::memory_order_relaxed);
+            if (done) {
                 finish_job(s, g.take_result(), "");
                 save_slot_prefix(s);
             }
@@ -336,10 +345,17 @@ struct Server {
                 else step_batch_jobs(group);
             }
             if (oldest >= 0) step_job(size_t(oldest), has_decoding ? kPrefillStep : kPrefillStepSolo);
-            uint32_t active = 0;
-            for (const auto& r : running) active += r != nullptr;
+            uint32_t active = 0, decoding = 0, prefilling = 0;
+            for (size_t s = 0; s < running.size(); ++s) {
+                if (!running[s]) continue;
+                ++active;
+                if (gens[s]->busy() && gens[s]->prefilling()) ++prefilling;
+                else ++decoding;
+            }
             kv_used = model->kv_total();
             slots_active = active;
+            slots_decoding = decoding;
+            slots_prefilling = prefilling;
         }
     }
 
@@ -740,9 +756,17 @@ int main(int argc, char** argv) {
             j["cached_tokens"] = t.cached_tokens;
             j["token_hit_rate"] = t.prompt_tokens ? double(t.cached_tokens) / double(t.prompt_tokens) : 0.0;
             j["request_hit_rate"] = t.requests ? double(t.cached_requests) / double(t.requests) : 0.0;
-            j["slots"] = {{"total", S.gens.size()}, {"active", S.slots_active.load()}, {"queued", S.queued()},
+            j["slots"] = {{"total", S.gens.size()}, {"active", S.slots_active.load()},
+                          {"decoding", S.slots_decoding.load(std::memory_order_relaxed)},
+                          {"prefilling", S.slots_prefilling.load(std::memory_order_relaxed)},
+                          {"queued", S.queued()},
                           {"kv_used_gib", double(S.kv_used.load()) / (1ull << 30)},
                           {"kv_budget_gib", double(S.kv_budget) / (1ull << 30)}, {"kv_evictions", S.kv_evictions.load()}};
+            j["live"] = {{"decode_tokens", S.live_decode_tokens.load(std::memory_order_relaxed)},
+                         {"decode_rounds", S.live_decode_rounds.load(std::memory_order_relaxed)},
+                         {"prefill_tokens", S.live_prefill_tokens.load(std::memory_order_relaxed)},
+                         {"decoding_slots", S.slots_decoding.load(std::memory_order_relaxed)},
+                         {"prefilling_slots", S.slots_prefilling.load(std::memory_order_relaxed)}};
             if (S.prefix) {
                 const auto& c = S.prefix_stats;
                 j["prefix_cache"] = {{"host_gib", double(c.host_bytes) / (1ull << 30)},

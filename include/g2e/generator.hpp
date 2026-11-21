@@ -59,6 +59,9 @@ public:
     bool step(uint32_t prefill_tokens = 0xffffffffu);
     bool busy() const { return task_ != nullptr; }
     bool prefilling() const { return task_ && task_->phase != Task::Decode; }
+    size_t prefill_done() const {
+        return task_ && task_->at > task_->r.reused_tokens ? task_->at - task_->r.reused_tokens : 0;
+    }
     GenerationResult take_result();
     // drop the running request after an error (the slot starts over with the next one)
     void abort();

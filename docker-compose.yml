@@ -40,3 +40,32 @@ services:
       G2E_SLOTS: ${G2E_SLOTS:-8}
       G2E_KV_CACHE_GIB: ${G2E_KV_CACHE_GIB:-0}
       G2E_REASONING_PARSER: ${G2E_REASONING_PARSER:-qwen3}
+
+  gaudiinfer-monitor:
+    image: ${GAUDIINFER_MONITOR_IMAGE:-python:3.12-slim}
+    container_name: gaudiinfer-monitor
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    command: ["python3", "/app/server.py"]
+    devices:
+      - /dev/accel/accel0:/dev/accel/accel0
+      - /dev/accel/accel_controlD0:/dev/accel/accel_controlD0
+    volumes:
+      - ./monitor:/app:ro
+      - /usr/bin/hl-smi:/usr/bin/hl-smi:ro
+      - /etc/sensors3.conf:/etc/sensors3.conf:ro
+      - /etc/sensors.d:/etc/sensors.d:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      G2E_ENGINE_URL: http://127.0.0.1:${G2E_PORT:-8001}
+      G2E_CONTAINER_NAME: gaudiinfer
+      G2E_MONITOR_HOST: 0.0.0.0
+      G2E_MONITOR_PORT: ${G2E_MONITOR_PORT:-8002}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
