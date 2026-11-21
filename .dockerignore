@@ -1,0 +1,13 @@
+.git
+.gitignore
+build
+build-*
+docs
+HANDOFF.md
+*.log
+*.g2w
+*.bin
+*.npz
+*.safetensors
+__pycache__
+*.pyc

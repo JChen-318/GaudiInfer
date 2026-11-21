@@ -29,18 +29,18 @@
 <text x="736.0" y="300" font-size="11" text-anchor="middle" fill="#8b8a83">128K</text>
 <text x="400.0" y="322" font-size="11" text-anchor="middle" fill="#c3c2b7">prompt length (tokens)</text>
 <text x="14" y="176.0" font-size="11" text-anchor="middle" fill="#c3c2b7" transform="rotate(-90 14 176.0)">tokens/s</text>
-<polygon points="64.0,129.5 148.0,96.0 232.0,116.9 316.0,116.8 400.0,124.2 484.0,130.9 568.0,133.2 652.0,162.5 736.0,172.6 736.0,237.4 652.0,210.6 568.0,183.9 484.0,222.7 400.0,189.8 316.0,155.5 232.0,155.5 148.0,172.6 64.0,165.5" fill="#3987e5" fill-opacity="0.16"/>
-<path d="M64.0,145.5 L148.0,144.7 L232.0,143.6 L316.0,137.4 L400.0,154.9 L484.0,163.6 L568.0,166.8 L652.0,176.0 L736.0,183.8" fill="none" stroke="#3987e5" stroke-width="2" stroke-linejoin="round"/>
-<circle cx="64.0" cy="145.5" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>512: 225 (range 192–252)</title></circle>
-<circle cx="148.0" cy="144.7" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>1K: 227 (range 181–307)</title></circle>
-<circle cx="232.0" cy="143.6" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>2K: 229 (range 209–273)</title></circle>
-<circle cx="316.0" cy="137.4" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>4K: 239 (range 209–273)</title></circle>
-<circle cx="400.0" cy="154.9" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>8K: 210 (range 152–261)</title></circle>
-<circle cx="484.0" cy="163.6" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>16K: 195 (range 98–250)</title></circle>
-<circle cx="568.0" cy="166.8" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>32K: 190 (range 162–246)</title></circle>
-<circle cx="652.0" cy="176.0" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>64K: 175 (range 118–197)</title></circle>
-<circle cx="736.0" cy="183.8" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>128K: 162 (range 74–181)</title></circle>
-<text x="68.0" y="133.5" font-size="12" font-weight="600" text-anchor="start" fill="#f0efec">225</text>
-<text x="400.0" y="142.9" font-size="12" font-weight="600" text-anchor="middle" fill="#f0efec">210</text>
-<text x="732.0" y="171.8" font-size="12" font-weight="600" text-anchor="end" fill="#f0efec">162</text>
+<polygon points="64.0,96.5 148.0,114.4 232.0,96.5 316.0,75.9 400.0,96.4 484.0,116.1 568.0,113.8 652.0,153.8 736.0,170.1 736.0,213.8 652.0,218.4 568.0,230.0 484.0,218.5 400.0,155.8 316.0,169.6 232.0,144.5 148.0,144.7 64.0,142.4" fill="#3987e5" fill-opacity="0.16"/>
+<path d="M64.0,117.3 L148.0,117.2 L232.0,131.1 L316.0,143.9 L400.0,129.8 L484.0,144.1 L568.0,173.5 L652.0,169.3 L736.0,186.2" fill="none" stroke="#3987e5" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="64.0" cy="117.3" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>512: 272 (range 230–306)</title></circle>
+<circle cx="148.0" cy="117.2" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>1K: 272 (range 227–277)</title></circle>
+<circle cx="232.0" cy="131.1" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>2K: 249 (range 227–306)</title></circle>
+<circle cx="316.0" cy="143.9" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>4K: 228 (range 186–340)</title></circle>
+<circle cx="400.0" cy="129.8" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>8K: 251 (range 208–306)</title></circle>
+<circle cx="484.0" cy="144.1" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>16K: 228 (range 105–274)</title></circle>
+<circle cx="568.0" cy="173.5" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>32K: 179 (range 86–278)</title></circle>
+<circle cx="652.0" cy="169.3" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>64K: 186 (range 105–212)</title></circle>
+<circle cx="736.0" cy="186.2" r="4" fill="#3987e5" stroke="#0d1117" stroke-width="2"><title>128K: 158 (range 113–185)</title></circle>
+<text x="68.0" y="105.3" font-size="12" font-weight="600" text-anchor="start" fill="#f0efec">272</text>
+<text x="400.0" y="117.8" font-size="12" font-weight="600" text-anchor="middle" fill="#f0efec">251</text>
+<text x="732.0" y="174.2" font-size="12" font-weight="600" text-anchor="end" fill="#f0efec">158</text>
 </svg>

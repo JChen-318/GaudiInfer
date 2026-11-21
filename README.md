@@ -35,9 +35,9 @@ GaudiInfer (`g2e` in the code) serves **Qwen3.8-27B (FP8)** from a single Gaudi2
 
 Measured with the all-workloads sequence test of **[llm_speedtest](https://github.com/gengchaogit/llm_speedtest)** on one Gaudi2 card: Qwen3.8-27B FP8 with the DSpine-b16 drafter, one request at a time over the OpenAI-compatible API, 6 workloads × 9 prompt lengths from 512 to 131,072 tokens. **All 54 runs succeeded.**
 
-| Decode, single stream | Inter-token latency (P50) | Peak prefill | 128K-token prompt, first token |
+| Decode, single stream | Inter-token latency (mean) | Peak prefill | 128K-token prompt, first token |
 |:---:|:---:|:---:|:---:|
-| **205 tok/s**<br><sub>6-workload average, 189–219</sub> | **24.7 ms**<br><sub>24.5–24.9 across workloads</sub> | **6,161 tok/s**<br><sub>8K prompt</sub> | **36.4 s**<br><sub>General workload</sub> |
+| **222 tok/s**<br><sub>6-workload average, 185–260</sub> | **23.0 ms**<br><sub>22.6–23.3 across workloads</sub> | **8,791 tok/s**<br><sub>4K prompt</sub> | **25.8 s**<br><sub>General workload</sub> |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/prefill-dark.svg">
@@ -54,34 +54,34 @@ Measured with the all-workloads sequence test of **[llm_speedtest](https://githu
   <img alt="Decode throughput by prompt length" src="docs/images/decode-length-light.svg" width="760">
 </picture>
 
-- **Prefill** runs at 5.5–5.8K tok/s for prompts of 2K–32K tokens and still 3.5K tok/s at 128K, where attention dominates.
-- **Decoding** keeps a median above 160 tok/s up to 128K context; the inter-token latency grows only from 23 ms to 30 ms over that range.
-- **Workloads** differ by 1.16×: speculative decoding gains most on math and logic, least on free-form prose.
+- **Prefill** runs at 7.3–8.5K tok/s for prompts of 2K–32K tokens (peaking at 8,791 tok/s at 4K) and still 5.0K tok/s at 128K, where attention dominates.
+- **Decoding** keeps a median of 228–272 tok/s up to 16K context and ~158 tok/s at 128K; the inter-token latency grows only from 21.3 ms to 29.4 ms over that range.
+- **Workloads** differ by 1.41×: speculative decoding gains most on document QA and structured JSON, least on free-form prose.
 
 **By workload**
 
-| Workload | Decode (tok/s) | vs General | TTFT P50 | Inter-token P50 |
+| Workload | Decode (tok/s) | vs General | TTFT mean | Inter-token mean |
 |---|---:|---:|---:|---:|
-| General | 203.96 | baseline | 6,822 ms | 24.9 ms |
-| Code | 200.32 | -1.8% | 6,896 ms | 24.6 ms |
-| Structured JSON | 207.69 | +1.8% | 6,897 ms | 24.7 ms |
-| Prose & QA | 188.82 | -7.4% | 8,118 ms | 24.8 ms |
-| Doc QA | 211.00 | +3.5% | 7,731 ms | 24.7 ms |
-| Math & Logic | 218.95 | +7.3% | 6,911 ms | 24.5 ms |
+| General | 212.34 | baseline | 4,919 ms | 22.6 ms |
+| Code | 222.97 | +5.0% | 4,972 ms | 23.3 ms |
+| Structured JSON | 242.64 | +14.3% | 4,977 ms | 23.0 ms |
+| Prose & QA | 184.83 | -13.0% | 5,796 ms | 23.2 ms |
+| Doc QA | 259.71 | +22.3% | 5,570 ms | 23.2 ms |
+| Math & Logic | 209.49 | -1.3% | 4,984 ms | 23.1 ms |
 
 **By prompt length** (mean of the 6 workloads; decode: median)
 
 | Prompt (tokens) | TTFT | Inter-token | Prefill (tok/s) | Decode (tok/s) |
 |---:|---:|---:|---:|---:|
-| 512 | 156 ms | 22.9 ms | 3,704 | 225 |
-| 1,024 | 235 ms | 23.2 ms | 4,731 | 227 |
-| 2,048 | 390 ms | 23.0 ms | 5,552 | 229 |
-| 4,096 | 741 ms | 23.5 ms | 5,647 | 239 |
-| 8,192 | 1,457 ms | 23.5 ms | 5,847 | 210 |
-| 16,384 | 2,892 ms | 23.9 ms | 5,711 | 195 |
-| 32,768 | 6,201 ms | 25.0 ms | 5,480 | 190 |
-| 65,536 | 14.6 s | 26.6 ms | 4,655 | 175 |
-| 131,072 | 38.6 s | 30.4 ms | 3,524 | 162 |
+| 512 | 107 ms | 22.1 ms | 5,308 | 272 |
+| 1,024 | 172 ms | 22.0 ms | 6,434 | 272 |
+| 2,048 | 278 ms | 21.4 ms | 7,813 | 249 |
+| 4,096 | 506 ms | 21.3 ms | 8,462 | 228 |
+| 8,192 | 1,050 ms | 21.7 ms | 8,125 | 251 |
+| 16,384 | 2,167 ms | 21.5 ms | 7,850 | 228 |
+| 32,768 | 4,652 ms | 22.6 ms | 7,300 | 179 |
+| 65,536 | 10.7 s | 25.3 ms | 6,345 | 186 |
+| 131,072 | 27.2 s | 29.4 ms | 4,997 | 158 |
 
 <details>
 <summary><b>All 54 runs</b></summary>
@@ -91,85 +91,85 @@ Measured with the all-workloads sequence test of **[llm_speedtest](https://githu
 
 | Prompt | TTFT (ms) | Inter-token (ms) | Prefill (tok/s) | Decode (tok/s) |
 |---:|---:|---:|---:|---:|
-| 512 | 101.59 | 23.10 | 5,167.04 | 251.76 |
-| 1,024 | 185.17 | 23.15 | 5,601.95 | 307.09 |
-| 2,048 | 335.01 | 23.47 | 6,155.62 | 272.52 |
-| 4,096 | 668.10 | 24.69 | 6,152.20 | 272.77 |
-| 8,192 | 1,334.70 | 23.54 | 6,160.71 | 247.00 |
-| 16,384 | 2,737.77 | 23.76 | 5,969.91 | 97.90 |
-| 32,768 | 5,873.38 | 25.12 | 5,581.41 | 169.82 |
-| 65,536 | 13,763.80 | 27.09 | 4,755.54 | 143.09 |
-| 131,072 | 36,400.16 | 30.50 | 3,601.10 | 73.63 |
+| 512 | 97.31 | 20.89 | 5,370.56 | 306.20 |
+| 1,024 | 147.16 | 21.45 | 7,055.63 | 248.57 |
+| 2,048 | 248.08 | 21.78 | 8,321.33 | 244.79 |
+| 4,096 | 467.93 | 21.74 | 8,790.80 | 226.40 |
+| 8,192 | 965.52 | 20.83 | 8,502.18 | 276.93 |
+| 16,384 | 2,004.41 | 20.86 | 8,182.12 | 125.19 |
+| 32,768 | 4,413.45 | 22.07 | 7,427.94 | 161.10 |
+| 65,536 | 10,165.83 | 24.74 | 6,447.95 | 191.59 |
+| 131,072 | 25,757.95 | 28.89 | 5,088.99 | 130.27 |
 
 **Code**
 
 | Prompt | TTFT (ms) | Inter-token (ms) | Prefill (tok/s) | Decode (tok/s) |
 |---:|---:|---:|---:|---:|
-| 512 | 150.84 | 23.34 | 3,522.43 | 220.42 |
-| 1,024 | 239.42 | 23.70 | 4,485.58 | 224.97 |
-| 2,048 | 393.45 | 23.55 | 5,336.92 | 208.90 |
-| 4,096 | 730.03 | 23.57 | 5,682.59 | 208.78 |
-| 8,192 | 1,403.01 | 22.93 | 5,873.46 | 169.09 |
-| 16,384 | 2,797.60 | 23.44 | 5,875.69 | 194.96 |
-| 32,768 | 5,959.40 | 24.66 | 5,507.37 | 225.63 |
-| 65,536 | 13,917.90 | 26.69 | 4,712.42 | 169.95 |
-| 131,072 | 36,880.34 | 29.74 | 3,594.26 | 172.09 |
+| 512 | 103.90 | 22.21 | 5,400.95 | 230.44 |
+| 1,024 | 170.33 | 23.18 | 6,316.38 | 275.99 |
+| 2,048 | 271.33 | 20.62 | 7,750.63 | 248.21 |
+| 4,096 | 491.74 | 21.54 | 8,444.48 | 185.62 |
+| 8,192 | 1,017.48 | 23.00 | 8,106.35 | 252.75 |
+| 16,384 | 2,091.24 | 21.77 | 7,861.18 | 226.06 |
+| 32,768 | 4,472.60 | 23.17 | 7,338.59 | 197.25 |
+| 65,536 | 10,268.78 | 24.89 | 6,387.21 | 205.62 |
+| 131,072 | 25,859.74 | 28.85 | 5,070.53 | 184.77 |
 
 **Structured JSON**
 
 | Prompt | TTFT (ms) | Inter-token (ms) | Prefill (tok/s) | Decode (tok/s) |
 |---:|---:|---:|---:|---:|
-| 512 | 162.95 | 23.14 | 3,430.92 | 230.39 |
-| 1,024 | 241.00 | 22.63 | 4,483.09 | 226.19 |
-| 2,048 | 395.29 | 22.55 | 5,313.79 | 210.07 |
-| 4,096 | 730.23 | 23.49 | 5,682.30 | 209.45 |
-| 8,192 | 1,407.15 | 25.07 | 5,860.05 | 260.60 |
-| 16,384 | 2,805.34 | 24.20 | 5,859.58 | 195.86 |
-| 32,768 | 5,953.50 | 24.20 | 5,512.97 | 195.80 |
-| 65,536 | 13,892.25 | 26.32 | 4,721.18 | 180.00 |
-| 131,072 | 36,502.01 | 31.03 | 3,592.17 | 152.73 |
+| 512 | 104.91 | 22.66 | 5,364.04 | 268.88 |
+| 1,024 | 171.05 | 21.02 | 6,295.07 | 276.70 |
+| 2,048 | 272.16 | 21.99 | 7,729.04 | 306.18 |
+| 4,096 | 492.90 | 21.29 | 8,425.29 | 300.47 |
+| 8,192 | 1,020.51 | 21.06 | 8,082.52 | 209.52 |
+| 16,384 | 2,094.99 | 21.46 | 7,847.33 | 229.30 |
+| 32,768 | 4,503.81 | 23.40 | 7,287.83 | 248.44 |
+| 65,536 | 10,265.41 | 25.30 | 6,389.38 | 180.68 |
+| 131,072 | 25,866.77 | 28.98 | 5,069.18 | 163.57 |
 
 **Prose & QA**
 
 | Prompt | TTFT (ms) | Inter-token (ms) | Prefill (tok/s) | Decode (tok/s) |
 |---:|---:|---:|---:|---:|
-| 512 | 181.78 | 22.19 | 3,320.22 | 192.33 |
-| 1,024 | 233.68 | 22.85 | 5,040.11 | 180.62 |
-| 2,048 | 404.62 | 23.08 | 5,740.24 | 226.05 |
-| 4,096 | 817.83 | 23.82 | 5,672.01 | 260.52 |
-| 8,192 | 1,636.13 | 23.34 | 5,633.61 | 210.06 |
-| 16,384 | 3,153.77 | 23.57 | 5,040.91 | 226.22 |
-| 32,768 | 6,900.97 | 25.49 | 5,361.60 | 161.93 |
-| 65,536 | 16,299.45 | 27.13 | 4,533.99 | 117.94 |
-| 131,072 | 43,849.19 | 30.93 | 3,394.15 | 114.92 |
+| 512 | 113.11 | 23.26 | 5,332.78 | 305.59 |
+| 1,024 | 189.13 | 21.54 | 6,368.41 | 269.92 |
+| 2,048 | 311.05 | 20.88 | 7,623.37 | 226.99 |
+| 4,096 | 545.15 | 21.45 | 8,479.07 | 229.50 |
+| 8,192 | 1,160.54 | 21.93 | 7,997.51 | 208.38 |
+| 16,384 | 2,391.38 | 21.43 | 7,740.80 | 104.76 |
+| 32,768 | 5,102.73 | 22.25 | 7,225.41 | 100.93 |
+| 65,536 | 11,840.41 | 24.89 | 6,208.61 | 104.92 |
+| 131,072 | 30,509.85 | 30.74 | 4,830.31 | 112.52 |
 
 **Doc QA**
 
 | Prompt | TTFT (ms) | Inter-token (ms) | Prefill (tok/s) | Decode (tok/s) |
 |---:|---:|---:|---:|---:|
-| 512 | 165.42 | 23.42 | 3,623.69 | 246.17 |
-| 1,024 | 286.86 | 23.46 | 3,997.82 | 227.28 |
-| 2,048 | 431.47 | 23.07 | 5,227.45 | 231.07 |
-| 4,096 | 787.53 | 22.93 | 5,673.05 | 232.46 |
-| 8,192 | 1,533.54 | 22.71 | 5,769.71 | 152.26 |
-| 16,384 | 3,009.24 | 24.42 | 5,751.92 | 249.52 |
-| 32,768 | 6,547.09 | 24.70 | 5,422.93 | 184.43 |
-| 65,536 | 15,491.90 | 26.22 | 4,503.54 | 195.20 |
-| 131,072 | 41,260.62 | 30.80 | 3,451.12 | 180.62 |
+| 512 | 114.62 | 22.16 | 5,218.56 | 275.00 |
+| 1,024 | 179.22 | 22.22 | 6,423.35 | 274.09 |
+| 2,048 | 291.15 | 21.10 | 7,761.97 | 252.71 |
+| 4,096 | 542.22 | 20.89 | 8,247.23 | 340.21 |
+| 8,192 | 1,111.52 | 21.97 | 7,992.93 | 306.49 |
+| 16,384 | 2,300.34 | 21.50 | 7,724.95 | 246.36 |
+| 32,768 | 4,941.10 | 23.03 | 7,185.67 | 277.74 |
+| 65,536 | 11,355.82 | 26.28 | 6,253.15 | 211.71 |
+| 131,072 | 29,292.92 | 29.86 | 4,861.11 | 153.09 |
 
 **Math & Logic**
 
 | Prompt | TTFT (ms) | Inter-token (ms) | Prefill (tok/s) | Decode (tok/s) |
 |---:|---:|---:|---:|---:|
-| 512 | 176.31 | 22.45 | 3,159.70 | 211.07 |
-| 1,024 | 224.84 | 23.63 | 4,776.96 | 270.72 |
-| 2,048 | 379.25 | 22.49 | 5,536.05 | 247.37 |
-| 4,096 | 712.69 | 22.71 | 5,022.32 | 244.95 |
-| 8,192 | 1,424.67 | 23.49 | 5,786.17 | 209.45 |
-| 16,384 | 2,850.73 | 23.95 | 5,765.30 | 172.33 |
-| 32,768 | 5,974.09 | 26.03 | 5,492.70 | 245.72 |
-| 65,536 | 13,945.72 | 25.95 | 4,702.09 | 197.26 |
-| 131,072 | 36,531.26 | 29.62 | 3,509.22 | 171.65 |
+| 512 | 108.24 | 21.57 | 5,160.14 | 247.13 |
+| 1,024 | 174.60 | 22.58 | 6,148.08 | 226.68 |
+| 2,048 | 273.43 | 22.24 | 7,689.91 | 250.13 |
+| 4,096 | 495.19 | 20.86 | 8,383.07 | 211.54 |
+| 8,192 | 1,021.91 | 21.18 | 8,068.93 | 249.72 |
+| 16,384 | 2,122.59 | 22.24 | 7,744.83 | 273.92 |
+| 32,768 | 4,476.08 | 21.92 | 7,332.66 | 85.88 |
+| 65,536 | 10,277.36 | 25.81 | 6,381.69 | 177.09 |
+| 131,072 | 25,902.46 | 29.01 | 5,062.09 | 163.36 |
 
 </details>
 
@@ -179,7 +179,7 @@ Our previous tuned vLLM-gaudi deployment on the same card, same model:
 
 | | vLLM-gaudi | **GaudiInfer** |
 |---|---:|---:|
-| Prefill, 8K / 32K / 64K prompt | 1.46 / 6.49 / 14.89 s | **1.34 / 5.78 / 13.65 s** |
+| Prefill, 8K / 32K / 64K prompt | 1.46 / 6.49 / 14.89 s | **0.97 / 4.41 / 10.17 s** |
 | Single-stream decoding, chat prompt | ~180 tok/s | **~357 tok/s** (greedy) |
 | Verification round at 105K context | 37.5 ms | **29.5 ms** |
 
@@ -262,6 +262,17 @@ sudo ./build/g2e_server \
 
 Set `G2E_RECIPE_CACHE=/path/to/dir` to keep compiled graphs across restarts. The first start compiles them, which takes about 10 minutes. `tools/server_ctl.sh start|stop|restart` wraps this command as a background service.
 
+### Docker
+
+A multi-stage `Dockerfile` (pure C++ Ubuntu 24.04 + SynapseAI runtime, no PyTorch) and `docker-compose.yml` are included:
+
+```bash
+docker compose build
+docker compose up -d
+```
+
+Override host paths or serving options via environment variables (`G2E_HOST_MODEL_DIR`, `G2E_HOST_PACKS_DIR`, `G2E_HOST_RECIPES_DIR`, `G2E_PORT`, `G2E_MAX_MODEL_LEN`, `G2E_SLOTS`, `HABANA_VERSION`). When `/dev/shm/g2e/*.g2w` is present on the host (`ipc: host`), the entrypoint automatically loads the RAM-cached packs.
+
 | Option | Default | Meaning |
 |---|---|---|
 | `--max-model-len` | 32768 | Longest prompt + completion (up to 262144) |
@@ -320,8 +331,8 @@ GaudiInfer is under active development and targets one model on one card.
 - [x] Continuous batching with batched verification and drafting
 - [x] Prefix cache, image input, OpenAI-compatible API
 - [x] Optional FP8 KV cache
+- [x] Fused long-context attention (Direct MME + SRAM engine, scores and probabilities kept in SRAM)
 - [ ] Tree speculation (several draft branches per round)
-- [ ] Fused long-context attention (scores and probabilities kept in SRAM)
 - [ ] ≥ 1000 tok/s aggregate decoding with 8 lanes
 
 ## Acknowledgements

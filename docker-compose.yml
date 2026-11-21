@@ -1,0 +1,42 @@
+services:
+  gaudiinfer:
+    image: ${GAUDIINFER_IMAGE:-gaudiinfer:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HABANA_VERSION: ${HABANA_VERSION:-1.24.1-482}
+    container_name: gaudiinfer
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - label=disable
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    stop_grace_period: 30s
+    devices:
+      - /dev/accel/accel0:/dev/accel/accel0
+      - /dev/accel/accel_controlD0:/dev/accel/accel_controlD0
+      - /dev/infiniband/uverbs0:/dev/infiniband/uverbs0
+    volumes:
+      - ${G2E_HOST_MODEL_DIR:-/mnt/sas/models/qwen3.8-27b-fp8-mtp}:/models/qwen3.8-27b-fp8-mtp:ro
+      - ${G2E_HOST_PACKS_DIR:-/mnt/sas/g2e}:/packs:ro
+      - ${G2E_HOST_RECIPES_DIR:-/home/a/g2e-data/recipes}:/data/recipes
+      - ${G2E_HOST_LOGS_DIR:-/home/a/g2e-data/habana_logs}:/data/habana_logs
+    environment:
+      G2E_MODEL_DIR: /models/qwen3.8-27b-fp8-mtp
+      G2E_PACKS_DIR: /packs
+      G2E_SHM_PACKS_DIR: /dev/shm/g2e
+      G2E_SERVED_MODEL_NAME: ${G2E_SERVED_MODEL_NAME:-qwen3.8-27b}
+      G2E_HOST: ${G2E_HOST:-0.0.0.0}
+      G2E_PORT: ${G2E_PORT:-8001}
+      G2E_MAX_MODEL_LEN: ${G2E_MAX_MODEL_LEN:-262144}
+      G2E_SLOTS: ${G2E_SLOTS:-8}
+      G2E_KV_CACHE_GIB: ${G2E_KV_CACHE_GIB:-0}
+      G2E_REASONING_PARSER: ${G2E_REASONING_PARSER:-qwen3}
