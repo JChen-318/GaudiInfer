@@ -306,6 +306,7 @@ void Qwen35::save_kv(uint32_t r0, uint32_t n, const HostBuffer& dst, uint64_t of
 }
 
 void Qwen35::load_kv(uint32_t r0, uint32_t n, const HostBuffer& src, uint64_t off) {
+    last_used_direct_b1_ = false;
     const uint64_t D = cfg_.head_dim, row = D * kv_es(), KV = cfg_.kv_heads;
     if (r0 + n > cap_) throw std::out_of_range("qwen35: load_kv past the context");
     for (size_t s = 0; s < k_cache_.size(); ++s)
@@ -329,6 +330,7 @@ void Qwen35::save_state(const HostBuffer& dst, uint64_t off) const {
 }
 
 void Qwen35::load_state(const HostBuffer& src, uint64_t off, uint32_t pos) {
+    last_used_direct_b1_ = false;
     if (pos > cap_) throw std::out_of_range("qwen35: load_state past the context");
     for (uint32_t s = 0; s < num_gdn_; ++s) {
         stream_.upload(src, off, conv_all_[conv_side_[s]], uint64_t(s) * conv_bytes_, conv_bytes_);
@@ -453,11 +455,13 @@ void Qwen35::set_capacity(uint32_t capacity) {
         throw;
     }
     cap_ = capacity;
+    last_used_direct_b1_ = false;
 }
 
 void Qwen35::select_slot(uint32_t slot) {
     if (slot >= seqs_.size()) throw std::out_of_range("qwen35: no such slot");
     if (slot == active_slot_) return;
+    last_used_direct_b1_ = false;
     // a pending verification travels with its slot (its stash region is its own: stash_b_)
     swap_seq(seqs_[active_slot_]);  // park the selected slot
     swap_seq(seqs_[slot]);          // take the other one out
@@ -467,6 +471,7 @@ void Qwen35::select_slot(uint32_t slot) {
 void Qwen35::reset() {
     // K/V rows past the position are masked, so stale (finite) rows are harmless: the caches are zeroed once, when
     // allocated (fresh device memory may hold NaN patterns). The recurrent states start from zero every time.
+    last_used_direct_b1_ = false;
     pos_ = 0;
     pending_T_ = 0;
     rope_delta_ = 0;
@@ -2506,6 +2511,7 @@ void Qwen35::accept(uint32_t a) {
     b.push_back({"ssm_out", &ssm_all_[ssm_side_[0] ^ 1], 0});
     b.push_back({"conv_out", &conv_all_[conv_side_[0] ^ 1], 0});
     spec_commit_recipe(T, pending_wy_).enqueue(stream_, b);
+    last_used_direct_b1_ = false;
     for (auto& side : ssm_side_) side ^= 1;
     for (auto& side : conv_side_) side ^= 1;
     pending_T_ = 0;
@@ -2997,6 +3003,7 @@ void Qwen35::accept_batch(std::span<const uint32_t> slots, std::span<const uint3
     if (accepted.size() != B) throw std::invalid_argument("qwen35: accept_batch sizes");
     // park the selected slot: every slot's state is in seqs_
     const uint32_t keep = active_slot_;
+    last_used_direct_b1_ = false;
     swap_seq(seqs_[keep]);
     struct Unpark {
         Qwen35& m;
@@ -3088,6 +3095,7 @@ void Qwen35::accept_batch(std::span<const uint32_t> slots, std::span<const uint3
         bnd.push_back({"conv_out" + x, &q.conv[dc ? q.conv_side[0] : (q.conv_side[0] ^ 1)], 0});
     }
     spec_commit_batch_recipe(B, T, wy).enqueue(stream_, bnd);
+    last_used_direct_b1_ = false;
     for (uint32_t b = 0; b < B; ++b) {
         Seq& q = *sq[b];
         for (auto& side : q.ssm_side) side ^= 1;
@@ -3149,6 +3157,7 @@ std::vector<std::vector<float>> Qwen35::prefill_batch(std::span<const uint32_t> 
             if (slots[c] == slots[b]) throw std::invalid_argument("qwen35: prefill_batch slots must differ");
     }
     const uint32_t keep = active_slot_;
+    last_used_direct_b1_ = false;
     swap_seq(seqs_[keep]);
     struct Unpark {
         Qwen35& m;
@@ -3652,6 +3661,7 @@ Qwen35::BatchOut Qwen35::batch_verify(std::span<const uint32_t> slots, std::span
     }
     // park the selected slot: every slot's state is in seqs_ while this runs
     const uint32_t keep = active_slot_;
+    last_used_direct_b1_ = false;
     swap_seq(seqs_[keep]);
     struct Unpark {
         Qwen35& m;
@@ -4139,6 +4149,9 @@ void Qwen35::run_layers(std::span<const int32_t> tokens, bool spec, std::vector<
             }
         }
         if (b1_ok) {
+            // Ensure any prior async Synapse stream_ ops (e.g. PrefixCache::restore load_kv/load_state or
+            // Synapse accept/accept_batch) have landed in HBM before Direct SCAL reads KV/GDN state.
+            if (!last_used_direct_b1_) stream_.synchronize();
             direct_shared_->rt->flush_patches_and_upload(all_plans, ids_.address(),
                                                          staging_.as<uint8_t>() + kIdsStage, ids_up);
             const double patch_ms = std::chrono::duration<double, std::milli>(clk::now() - td0).count();

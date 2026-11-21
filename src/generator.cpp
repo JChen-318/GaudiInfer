@@ -242,7 +242,11 @@ void Generator::resolve_sampled(const Qwen35::VerifyTop& v, const SamplingParams
             if (keep) { prow[t].push_back({v.ids[t * C + j], pf}); kept += pf; }
             before += pf;
         }
-        for (auto& [id, pr] : prow[t]) pr /= kept;
+        if (prow[t].empty()) {
+            prow[t].push_back({v.ids[t * C + order[0]], 1.0});
+        } else {
+            for (auto& [id, pr] : prow[t]) pr /= kept;
+        }
     }
     auto p_of = [&](uint32_t t, int32_t id) {
         for (const auto& [i, pr] : prow[t]) if (i == id) return pr;

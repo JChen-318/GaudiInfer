@@ -148,8 +148,11 @@ DirectAttnCore::DirectAttnCore(DirectRuntime& rt, const DirectAttnAssets& assets
         // Align monitor indices across all sub-plans so mon_cfg cache hits 100% (avoids re-config LBWs)!
         const uint32_t init_mon = (base > 0 && pack_q_from_hbm) ? 2u : 0u;
         auto plan = std::make_unique<DirectPlan>(rt, init_mon);
-        uint32_t s0 = 0;  // MME completion SOB
-        uint32_t s2 = 0;  // TPC completion SOB
+        // 4 parity-isolated SOBs prevent cross-parity MME/TPC race in double-buffered pipeline:
+        //   sob 0, 1: MME completion for parity 0, 1
+        //   sob 2, 3: TPC completion for parity 0, 1
+        uint32_t s_mme[2] = {0, 0};
+        uint32_t s_tpc[2] = {0, 0};
 
         // Optional Q pack from HBM [8, 16, 24, 256] -> SRAM [8, 4, 96, 256] (first sub-plan only)
         const bool do_pack = (base == 0 && pack_q_from_hbm);
@@ -160,7 +163,7 @@ DirectAttnCore::DirectAttnCore(DirectRuntime& rt, const DirectAttnAssets& assets
             };
             const int tags[2] = {kTagQIn, -1};
             plan->add_tpc(isa_pack, t, {}, kRowsAll, kTpcs, -1, 0, 2, tpc_cmd, tags);
-            s2 += kTpcs;
+            s_tpc[0] += kTpcs;
         }
 
         auto emit_qk = [&](uint32_t local_k, uint32_t parity, int wait_sob, uint32_t wait_val) {
@@ -169,14 +172,15 @@ DirectAttnCore::DirectAttnCore(DirectRuntime& rt, const DirectAttnAssets& assets
             const auto& tmpl = qk_tmpl(td.width);
             const uint64_t s_head_bytes = uint64_t(kRHead) * td.width * 2ull;
             const uint64_t q_slot_base = s_q_sram + uint64_t(td.slot) * q_slot_bytes;
+            const int sig_sob = int(parity);
             for (uint32_t h = 0; h < kKV; ++h) {
                 const uint64_t q_addr = q_slot_base + uint64_t(h) * q_head_bytes;
                 const uint64_t k_addr = init_args.k_cache[td.slot][h] + uint64_t(td.col_start) * kD * kv_es;
                 const uint64_t s_addr = s_S[parity] + uint64_t(h) * s_head_bytes;
                 plan->add_mme(tmpl, q_addr, k_addr, s_addr, 0,
-                              h == 0 ? wait_sob : -1, h == 0 ? wait_val : 0, 0,
+                              h == 0 ? wait_sob : -1, h == 0 ? wait_val : 0, sig_sob,
                               {-1, tag_k(tidx, h), -1, -1});
-                s0 += tmpl.signal_count;
+                s_mme[parity] += tmpl.signal_count;
             }
         };
 
@@ -186,6 +190,7 @@ DirectAttnCore::DirectAttnCore(DirectRuntime& rt, const DirectAttnAssets& assets
             const auto& tmpl = pv_tmpl(td.width);
             const uint64_t p_head_bytes = uint64_t(kRHead) * td.width * kv_es;
             const uint64_t pv_head_bytes = uint64_t(kRHead) * kD * 4ull;
+            const int sig_sob = int(parity);
             // Dual-engine head-parallel PV: MME0 runs heads 0,2 while MME1 runs heads 1,3 simultaneously (2x faster)!
             for (uint32_t hp = 0; hp < kKV; hp += 2) {
                 const uint32_t h0 = hp, h1 = hp + 1;
@@ -196,10 +201,10 @@ DirectAttnCore::DirectAttnCore(DirectRuntime& rt, const DirectAttnAssets& assets
                 const uint64_t v1 = init_args.v_cache[td.slot][h1] + uint64_t(td.col_start) * kD * kv_es;
                 const uint64_t o1 = s_PV[parity] + uint64_t(h1) * pv_head_bytes;
                 plan->add_mme_pair(tmpl, p0, v0, o0, p1, v1, o1,
-                                   hp == 0 ? wait_sob : -1, hp == 0 ? wait_val : 0, 0,
+                                   hp == 0 ? wait_sob : -1, hp == 0 ? wait_val : 0, sig_sob,
                                    {-1, tag_v(tidx, h0), -1, -1},
                                    {-1, tag_v(tidx, h1), -1, -1});
-                s0 += 2u;  // 1 engine-0 signal + 1 engine-1 signal per pair
+                s_mme[parity] += 2u;  // 1 engine-0 signal + 1 engine-1 signal per pair
             }
         };
 
@@ -240,37 +245,40 @@ DirectAttnCore::DirectAttnCore(DirectRuntime& rt, const DirectAttnAssets& assets
                 flags_acc,
             };
             plan->add_tpc(isa_step, t, srfs, kRowsAll, kTpcs, wait_sob, wait_val, sig_sob, tpc_cmd, t_tags);
-            if (sig_sob == 2) s2 += kTpcs;
+            if (sig_sob == 2) s_tpc[0] += kTpcs;
+            else if (sig_sob == 3) s_tpc[1] += kTpcs;
         };
 
         if (count == 1) {
-            emit_qk(0, 0, do_pack ? 2 : -1, do_pack ? s2 : 0);
-            const uint32_t qk0_done = s0;
+            emit_qk(0, 0, do_pack ? 2 : -1, do_pack ? s_tpc[0] : 0);
+            const uint32_t qk0_done = s_mme[0];
             emit_tpc_step(0, -1, 0, 0, qk0_done, 2);
-            emit_pv(0, 0, 2, s2);
-            const uint32_t pv0_done = s0;
+            emit_pv(0, 0, 2, s_tpc[0]);
+            const uint32_t pv0_done = s_mme[0];
             emit_tpc_step(-1, 0, 0, 0, pv0_done, -1);
         } else {
-            // Double-buffered zero-bubble MME || TPC pipeline!
-            std::vector<uint32_t> s0_ready(count + 2, 0);
-            // Prologue: QK(0) -> S[0], QK(1) -> S[1] back-to-back on MME
-            emit_qk(0, 0, do_pack ? 2 : -1, do_pack ? s2 : 0);
-            s0_ready[0] = s0;
+            // Double-buffered zero-bubble MME || TPC pipeline with parity-isolated SOBs (zero cross-parity race)!
+            std::vector<uint32_t> mme_ready(count + 2, 0);
+            // Prologue: QK(0) -> S[0] (sob 0), QK(1) -> S[1] (sob 1) back-to-back on MME
+            emit_qk(0, 0, do_pack ? 2 : -1, do_pack ? s_tpc[0] : 0);
+            mme_ready[0] = s_mme[0];
             emit_qk(1, 1, -1, 0);
-            s0_ready[1] = s0;
+            mme_ready[1] = s_mme[1];
 
             for (uint32_t k = 0; k < count; ++k) {
                 const uint32_t p = k & 1u;
-                // TPC(k): SM(k) on S[p]->P[p] + (if k>=2) ACC(k-2) on PV[p]->O_acc
-                emit_tpc_step(int(k), k >= 2 ? int(k - 2) : -1, p, 0, s0_ready[k], 2);
-                // MME_next(k): waits TPC(k), runs PV(k) on P[p]->PV[p] + (if k+2<count) QK(k+2) -> S[p]
-                emit_pv(k, p, 2, s2);
+                // TPC(k): waits sob[p] (MME parity p), runs SM(k) + ACC(k-2), signals sob[2+p] (TPC parity p)
+                emit_tpc_step(int(k), k >= 2 ? int(k - 2) : -1, p, int(p), mme_ready[k], int(2u + p));
+                // MME_next(k): waits sob[2+p] (TPC parity p), runs PV(k) + QK(k+2), signals sob[p] (MME parity p)
+                emit_pv(k, p, int(2u + p), s_tpc[p]);
                 if (k + 2 < count) emit_qk(k + 2, p, -1, 0);
-                s0_ready[k + 2] = s0;
+                mme_ready[k + 2] = s_mme[p];
             }
-            // Epilogue: ACC(count-2) and ACC(count-1)
-            emit_tpc_step(-1, int(count - 2), (count - 2) & 1u, 0, s0_ready[count], 2);
-            emit_tpc_step(-1, int(count - 1), (count - 1) & 1u, 0, s0_ready[count + 1], -1);
+            // Epilogue: ACC(count-2) and ACC(count-1) wait on their own parity's MME SOB
+            const uint32_t pe0 = (count - 2) & 1u;
+            const uint32_t pe1 = (count - 1) & 1u;
+            emit_tpc_step(-1, int(count - 2), pe0, int(pe0), mme_ready[count], int(2u + pe0));
+            emit_tpc_step(-1, int(count - 1), pe1, int(pe1), mme_ready[count + 1], -1);
         }
 
         plan->prepare();

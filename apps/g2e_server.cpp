@@ -110,7 +110,8 @@ struct Server {
     uint64_t kv_budget = 0;                      // device bytes for the KV caches of all slots
     std::atomic<uint64_t> kv_used{0}, kv_evictions{0};
     std::atomic<uint32_t> slots_active{0};
-    static constexpr uint32_t kPrefillStep = 2048;  // prefill tokens per step: long prompts do not stall the others
+    static constexpr uint32_t kPrefillStep = 2048;      // concurrent prefill step: caps decode inter-token stall
+    static constexpr uint32_t kPrefillStepSolo = 4096;  // solo prefill step: unlocks full T=4096 prefill throughput
     std::mutex stats_mu;
     PrefixCache::Stats prefix_stats;
 
@@ -230,10 +231,10 @@ struct Server {
             std::fprintf(stderr, "[g2e] slot %zu: prefix cache save failed: %s\n", s, e.what());
         }
     }
-    void step_job(size_t s) {
+    void step_job(size_t s, uint32_t prefill_step = kPrefillStep) {
         Generator& g = *gens[s];
         try {
-            if (g.step(kPrefillStep)) {
+            if (g.step(prefill_step)) {
                 finish_job(s, g.take_result(), "");
                 save_slot_prefix(s);
             }
@@ -314,14 +315,17 @@ struct Server {
             // kMaxBatch slots (the dense layers read their weights once); the others step one by one
             static const bool no_batch = std::getenv("G2E_NO_BATCH") != nullptr;
             int oldest = -1;
+            bool has_decoding = false;
             std::vector<size_t> batch;
             for (size_t s = 0; s < gens.size(); ++s) {
                 if (!running[s] || !gens[s]->busy()) continue;
                 if (gens[s]->prefilling()) {
                     if (oldest < 0 || slot_used[s] < slot_used[size_t(oldest)]) oldest = int(s);
                 } else if (!no_batch && gens[s]->batchable()) {
+                    has_decoding = true;
                     batch.push_back(s);
                 } else {
+                    has_decoding = true;
                     step_job(s);
                 }
             }
@@ -331,7 +335,7 @@ struct Server {
                 if (group.size() == 1) step_job(group[0]);
                 else step_batch_jobs(group);
             }
-            if (oldest >= 0) step_job(size_t(oldest));
+            if (oldest >= 0) step_job(size_t(oldest), has_decoding ? kPrefillStep : kPrefillStepSolo);
             uint32_t active = 0;
             for (const auto& r : running) active += r != nullptr;
             kv_used = model->kv_total();
