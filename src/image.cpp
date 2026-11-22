@@ -5,6 +5,9 @@
 #include <cfenv>
 #include <cmath>
 #include <cstring>
+#include <dlfcn.h>
+#include <memory>
+#include <mutex>
 #include <png.h>
 #include <stdexcept>
 
@@ -139,9 +142,46 @@ std::vector<uint8_t> encode_png_impl(const uint8_t* px, int width, int height, i
     return out;
 }
 
+bool is_webp(const uint8_t* data, size_t size) {
+    return data && size >= 12 && std::memcmp(data, "RIFF", 4) == 0 && std::memcmp(data + 8, "WEBP", 4) == 0;
+}
+
+std::vector<uint8_t> decode_webp(const uint8_t* data, size_t size, int& width, int& height, int channels) {
+    using DecodeFn = uint8_t* (*)(const uint8_t*, size_t, int*, int*);
+    using FreeFn = void (*)(void*);
+    struct WebpApi {
+        DecodeFn decode_rgb = nullptr;
+        DecodeFn decode_rgba = nullptr;
+        FreeFn free_fn = nullptr;
+    };
+    static WebpApi api;
+    static std::once_flag init_flag;
+    std::call_once(init_flag, []() {
+        void* handle = dlopen("libwebp.so.7", RTLD_LAZY);
+        if (!handle) handle = dlopen("libwebp.so.6", RTLD_LAZY);
+        if (!handle) handle = dlopen("libwebp.so", RTLD_LAZY);
+        if (handle) {
+            api.decode_rgb = reinterpret_cast<DecodeFn>(dlsym(handle, "WebPDecodeRGB"));
+            api.decode_rgba = reinterpret_cast<DecodeFn>(dlsym(handle, "WebPDecodeRGBA"));
+            api.free_fn = reinterpret_cast<FreeFn>(dlsym(handle, "WebPFree"));
+        }
+    });
+    const DecodeFn fn = (channels == 4) ? api.decode_rgba : api.decode_rgb;
+    if (!fn || !api.free_fn) {
+        throw std::invalid_argument("cannot decode the image: WebP image requires libwebp (libwebp.so.7)");
+    }
+    uint8_t* px = fn(data, size, &width, &height);
+    std::unique_ptr<uint8_t, FreeFn> guard(px, api.free_fn);
+    if (!px || width <= 0 || height <= 0) {
+        throw std::invalid_argument("cannot decode the image: invalid or corrupt WebP");
+    }
+    return std::vector<uint8_t>(px, px + size_t(width) * size_t(height) * size_t(channels));
+}
+
 }  // namespace
 
 std::vector<uint8_t> decode_image(const uint8_t* data, size_t size, int& width, int& height) {
+    if (is_webp(data, size)) return decode_webp(data, size, width, height, 3);
     int channels = 0;
     stbi_uc* px = stbi_load_from_memory(data, int(size), &width, &height, &channels, 3);
     if (!px) throw std::invalid_argument(std::string("cannot decode the image: ") + stbi_failure_reason());
@@ -151,6 +191,7 @@ std::vector<uint8_t> decode_image(const uint8_t* data, size_t size, int& width, 
 }
 
 std::vector<uint8_t> decode_image_rgba(const uint8_t* data, size_t size, int& width, int& height) {
+    if (is_webp(data, size)) return decode_webp(data, size, width, height, 4);
     int channels = 0;
     stbi_uc* px = stbi_load_from_memory(data, int(size), &width, &height, &channels, 4);
     if (!px) throw std::invalid_argument(std::string("cannot decode the image: ") + stbi_failure_reason());

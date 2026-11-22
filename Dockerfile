@@ -57,7 +57,7 @@ RUN cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 FROM base AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libcurl3t64-gnutls libpng16-16t64 ffmpeg \
+        libcurl3t64-gnutls libpng16-16t64 libwebp7 ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data/recipes /data/habana_logs
 

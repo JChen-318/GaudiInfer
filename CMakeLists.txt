@@ -18,7 +18,7 @@ target_include_directories(g2e_core PUBLIC include)
 target_include_directories(g2e_core SYSTEM PRIVATE third_party
     /usr/include/habanalabs /usr/include/drm /usr/include/libpng16
     /opt/habanalabs/src/hl-thunk/include/uapi /opt/habanalabs/src/hl-thunk/include/specs)
-target_link_libraries(g2e_core PUBLIC SynapseAI::SynapseAI Threads::Threads scal hl-thunk png16)
+target_link_libraries(g2e_core PUBLIC SynapseAI::SynapseAI Threads::Threads ${CMAKE_DL_LIBS} scal hl-thunk png16)
 target_link_directories(g2e_core PUBLIC /usr/lib/habanalabs)
 target_compile_options(g2e_core PRIVATE -Wall -Wextra)
 target_compile_definitions(g2e_core PRIVATE
