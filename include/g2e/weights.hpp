@@ -46,6 +46,9 @@ public:
     // Allocate the whole arena but copy only the selected weights (tests and bisection).
     UploadStats upload_subset(const Device& device, const Stream& stream,
                               const std::function<bool(const WeightEntry&)>& select);
+    // Re-upload selected weights from disk into the already-allocated arena in place (e.g. LoRA swap restore).
+    UploadStats reload_subset_in_place(const Device& device, const Stream& stream,
+                                       const std::function<bool(const WeightEntry&)>& select) const;
     const DeviceBuffer& arena() const;
     // Bind recipe tensor `tensor` to weight `weight` (shape/dtype are checked against the recipe at enqueue time
     // only by size; use check() for an exact match).

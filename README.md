@@ -2,15 +2,15 @@
 
 # GaudiInfer
 
-**A high-performance, high-throughput LLM inference engine purpose-built for Intel® Gaudi®2**
+**A high-performance native C++ multimodal inference engine purpose-built for Intel® Gaudi®2**
 
-Native C++ on SynapseAI · DSpine speculative decoding · continuous batching · custom TPC kernels
+Native C++ on SynapseAI · Direct MME + SRAM · Custom TPC kernels · LLM/VLM · Image & Video Diffusion · Unified Studio WebUI
 
 [![Hardware](https://img.shields.io/badge/hardware-Intel%20Gaudi2-0071C5)](#requirements)
 [![Language](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)](#build)
 [![SDK](https://img.shields.io/badge/SynapseAI-1.24-6E40C9)](#requirements)
-[![API](https://img.shields.io/badge/API-OpenAI%20compatible-10A37F)](#api)
-[![Model](https://img.shields.io/badge/model-Qwen3.8--27B%20FP8-FF6A00)](#models)
+[![API](https://img.shields.io/badge/API-OpenAI%20%2F%20ComfyUI-10A37F)](#api)
+[![Models](https://img.shields.io/badge/models-Qwen3.8--27B%20%7C%20Qwen--Image--2.1%20%7C%20MiniMax--H3-FF6A00)](#models)
 
 **English** · [简体中文](README.zh-CN.md)
 
@@ -18,7 +18,13 @@ Native C++ on SynapseAI · DSpine speculative decoding · continuous batching ·
 
 ---
 
-GaudiInfer (`g2e` in the code) serves **Qwen3.8-27B (FP8)** from a single Gaudi2 card. It talks straight to the SynapseAI graph API: no PyTorch, no Python on the serving path. It accelerates generation with the **DSpine** speculative drafter, and runs up to 8 requests at once with batched verification and drafting.
+GaudiInfer (`g2e` in the code) runs four native C++ inference engines on a **single Intel Gaudi2 (96 GiB HBM2E)** card — directly on SynapseAI + custom TPC-C kernels + Direct MME/SRAM execution, with zero PyTorch or Python on the inference path:
+
+- **Qwen3.8-27B (FP8 + DSpine-b16 + Vision)** — 262K-context LLM/VLM with speculative decoding and continuous batching (`g2e_server`).
+- **Qwen-Image-2.1-Turbo (FP8 DiT + BF16 VAE/VLM)** — 8-step text-to-image & 1–4 reference image editing (`g2e_qwen21_server`).
+- **MiniMax-H3-Image (33.1B FP8 DiT + 2D VAE)** — 6-step PDD 2K / 4K (16 MP) text-to-image & 1–16 reference image editing (`g2e_h3_image_server`).
+- **MiniMax-H3 Video + Stereo Audio (FP8 DiT + 3D VideoVAE + AudioVAE)** — T2VA / I2VA / FL2VA video-audio generation with runtime-swappable 4-step & 8-step Turbo LoRA (`g2e_h3_server`, `g2e_h3_cli`).
+- **GaudiInfer Studio & Monitor WebUI (`:8002`)** — unified bilingual (中文 / English) workbench with real-time Gaudi2 hardware telemetry, one-click single-card engine switching, persistent media gallery, and cross-model handoff.
 
 ## Highlights
 
@@ -187,6 +193,28 @@ Our previous tuned vLLM-gaudi deployment on the same card, same model:
 
 > Throughput in tokens/s depends on how many draft tokens the target accepts, so it varies with the content; per-round latencies are the steadier comparison.
 
+### Multimodal Image & Video Diffusion (Single Gaudi2)
+
+All diffusion servers expose OpenAI-compatible (`/v1/images/generations`, `/v1/images/edits`) and ComfyUI-compatible HTTP endpoints with zero Python on the inference path:
+
+| Engine | Server Binary | HBM | Measured End-to-End HTTP Latency | Capabilities |
+|---|---|---:|---|---|
+| **Qwen-Image-2.1-Turbo** | `g2e_qwen21_server` (`:8098`) | 22.6 GiB | **2.34 s** (1024² T2I, 8 steps) · **4.2 s** (1–4 ref edit) | FP8 DiT + BF16 3D VAE + Qwen3.5-VL-4B |
+| **MiniMax-H3-Image** | `g2e_h3_image_server` (`:8099`) | 56.9 GiB | **4.67 s** (2K T2I, 6-step PDD) · **22.4 s** (4K 16 MP) | 33.1B FP8 DiT + 2D VAE (0.91 s) + 1–16 ref edit |
+| **MiniMax-H3 Video** | `g2e_h3_server` (`:8097`) | ~62 GiB | **~10–30 s** (480p/768p 5 s, 4/8-step Turbo LoRA) | DirectH3Attn + Streaming VideoVAE + Stereo AudioVAE, T2VA / I2VA / FL2VA |
+
+### Unified Studio & Monitor WebUI
+
+A zero-dependency Python 3 stdlib workbench (`monitor/server.py`, port `8002`) integrates all four engines and real-time `hl-smi` telemetry:
+
+```bash
+./monitor/studio_ctl.sh start   # opens on http://<host>:8002
+```
+
+- **Monitor-first landing page**: real-time Gaudi2 AIP utilization, HBM, 54V+12V power, temperature, SoC clock, live throughput charts, engine logs, and one-click single-card engine switcher.
+- **Multimodal creation workspaces**: 27B Chat + Vision, Qwen-Image-2.1 T2I/Edit, MiniMax-H3-Image 2K/4K & Multi-Ref Edit, MiniMax-H3 T2VA/I2VA/FL2VA Video+Audio, and a persistent Gallery with one-click cross-model handoff (image → edit / video first-frame / 27B vision analysis).
+- **Bilingual UI & Light/Dark themes**: instant **中 / EN** toggle in the top bar.
+
 ## Architecture
 
 ```mermaid
@@ -315,23 +343,25 @@ Requests and responses follow vLLM's OpenAI-compatible server, so existing clien
 ## Repository layout
 
 ```
-apps/                 g2e_server: HTTP server, scheduler, OpenAI request/response handling
-include/g2e/, src/    engine: runtime, graph builder, ops, Qwen3.8 target, GDN, DSpine drafter,
-                      generator, prefix cache, tokenizer, vision encoder, Qwen3 parser
-tpc/flashinfer_gaudi/ custom TPC-C kernels and their Synapse glue
-tools/                weight converters (.g2w packs) and the server launcher
+apps/                 g2e_server (27B LLM/VLM), g2e_qwen21_server, g2e_h3_image_server,
+                      g2e_h3_server, g2e_h3_cli
+include/g2e/, src/    core SynapseAI + Direct MME/SRAM engines (Qwen3.8-27B + GDN + DSpine,
+                      Qwen-Image-2.1, MiniMax-H3-Image, MiniMax-H3 Video & Audio)
+tpc/flashinfer_gaudi/ custom TPC-C kernels (GDN, norm+quant, softmax, H3 AdaLN/RoPE/DirectAttn)
+monitor/              GaudiInfer Studio & Monitor WebUI (bilingual ZH/EN, zero pip deps)
+tools/                weight converters (.g2w packs), MME descriptors, and launchers
 third_party/          cpp-httplib, nlohmann/json, stb_image, llama.cpp unicode / jinja (vendored)
 ```
 
 ## Status and roadmap
 
-GaudiInfer is under active development and targets one model on one card.
+GaudiInfer is under active development and targets single-card Gaudi2 deployments.
 
-- [x] FP8 target, DSpine speculation (greedy and sampled), 262K context
-- [x] Continuous batching with batched verification and drafting
-- [x] Prefix cache, image input, OpenAI-compatible API
-- [x] Optional FP8 KV cache
+- [x] Qwen3.8-27B FP8 target, DSpine speculation (greedy and sampled), 262K context, continuous batching, prefix cache, vision input, optional FP8 KV cache
 - [x] Fused long-context attention (Direct MME + SRAM engine, scores and probabilities kept in SRAM)
+- [x] Native MiniMax-H3 Video + Stereo Audio engine (DirectH3Attn, streaming VideoVAE, runtime 4/8-step Turbo LoRA, FL2VA)
+- [x] Native Qwen-Image-2.1-Turbo (1024² in 2.34 s) & MiniMax-H3-Image (2K in 4.67 s, 4K 16 MP in 22.4 s)
+- [x] Unified bilingual (ZH/EN) Studio & Monitor WebUI with single-card engine switching and persistent gallery
 - [ ] Tree speculation (several draft branches per round)
 - [ ] ≥ 1000 tok/s aggregate decoding with 8 lanes
 

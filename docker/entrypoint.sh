@@ -3,6 +3,67 @@ set -euo pipefail
 
 BIN="/opt/gaudiinfer/bin/g2e_server"
 
+if [ "${G2E_MODE:-llm}" = "h3" ]; then
+    BIN="/opt/gaudiinfer/bin/g2e_h3_server"
+    mkdir -p "${G2E_RECIPE_CACHE:-/data/recipes}" "${HABANA_LOGS:-/data/habana_logs}"
+    if [ "$#" -gt 0 ]; then
+        exec "$BIN" "$@"
+    fi
+    H3_DIR="${G2E_H3_PACKS_DIR:-/packs}"
+    H3_SHM="${G2E_H3_SHM_DIR:-/dev/shm/h3}"
+    if [ -f "${H3_SHM}/h3_dit_base_fp8.g2w" ]; then H3_DIR="${H3_SHM}"; fi
+    VVAE="${G2E_H3_VVAE:-${H3_DIR}/h3_video_vae_dec_fp8.g2w}"
+    if [ ! -f "${VVAE}" ]; then VVAE="${H3_DIR}/h3_video_vae_dec.g2w"; fi
+    H3_ARGS=(
+        --host "${G2E_HOST:-0.0.0.0}"
+        --port "${G2E_PORT:-8097}"
+        --served-model-name "${G2E_SERVED_MODEL_NAME:-MiniMaxAI/MiniMax-H3}"
+        --dit "${G2E_H3_DIT:-${H3_DIR}/h3_dit_base_fp8.g2w}"
+        --text-enc "${G2E_H3_TEXT:-${H3_DIR}/h3_text_encoder_fp8.g2w}"
+        --vvae "${VVAE}"
+        --avae "${G2E_H3_AVAE:-${H3_DIR}/h3_audio_vae_dec.g2w}"
+        --tokenizer "${G2E_H3_TOKENIZER:-/models/minimax-h3/FL2VA/tokenizer/tokenizer.json}"
+        --ffmpeg "${G2E_H3_FFMPEG:-ffmpeg}"
+    )
+    if [ -n "${G2E_H3_LORA:-}" ]; then H3_ARGS+=(--lora "${G2E_H3_LORA}"); fi
+    echo "[gaudiinfer] starting g2e_h3_server (packs=${H3_DIR}, port=${G2E_PORT:-8097})"
+    exec "$BIN" "${H3_ARGS[@]}"
+fi
+
+if [ "${G2E_MODE:-llm}" = "qwen21" ]; then
+    BIN="/opt/gaudiinfer/bin/g2e_qwen21_server"
+    mkdir -p "${G2E_RECIPE_CACHE:-/data/recipes}" "${HABANA_LOGS:-/data/habana_logs}"
+    if [ "$#" -gt 0 ]; then
+        exec "$BIN" "$@"
+    fi
+    PDIR="${G2E_PACKS_DIR:-/packs}"
+    exec "$BIN" \
+        --host "${G2E_HOST:-0.0.0.0}" \
+        --port "${G2E_PORT:-8098}" \
+        --served-model-name "${G2E_SERVED_MODEL_NAME:-Qwen/Qwen-Image-2.1-Turbo}" \
+        --dit "${G2E_QWEN21_DIT:-${PDIR}/qwen21_dit_fp8.g2w}" \
+        --text-enc "${G2E_QWEN21_TEXT:-${PDIR}/qwen21_text_encoder_bf16.g2w}" \
+        --vae "${G2E_QWEN21_VAE:-${PDIR}/qwen21_vae_bf16.g2w}" \
+        --tokenizer "${G2E_QWEN21_TOKENIZER:-/models/qwen-image-2.1-turbo/processor/tokenizer.json}"
+fi
+
+if [ "${G2E_MODE:-llm}" = "h3_image" ]; then
+    BIN="/opt/gaudiinfer/bin/g2e_h3_image_server"
+    mkdir -p "${G2E_RECIPE_CACHE:-/data/recipes}" "${HABANA_LOGS:-/data/habana_logs}"
+    if [ "$#" -gt 0 ]; then
+        exec "$BIN" "$@"
+    fi
+    PDIR="${G2E_PACKS_DIR:-/packs}"
+    exec "$BIN" \
+        --host "${G2E_HOST:-0.0.0.0}" \
+        --port "${G2E_PORT:-8099}" \
+        --served-model-name "${G2E_SERVED_MODEL_NAME:-MiniMaxAI/MiniMax-H3-Image}" \
+        --dit "${G2E_H3I_DIT:-${PDIR}/h3_image_dit_fp8.g2w}" \
+        --text-enc "${G2E_H3I_TEXT:-${PDIR}/h3_text_encoder_fp8.g2w}" \
+        --vae "${G2E_H3I_VAE:-${PDIR}/h3_image_vae_fp8.g2w}" \
+        --tokenizer "${G2E_H3I_TOKENIZER:-/models/minimax-h3/FL2VA/tokenizer/tokenizer.json}"
+fi
+
 # Allow passing raw g2e_server CLI flags directly.
 if [ "$#" -gt 0 ]; then
     exec "$BIN" "$@"

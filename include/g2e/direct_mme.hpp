@@ -44,6 +44,10 @@ class DirectPlan;
 // Process-wide SCAL direct-dispatch context borrowing the existing Synapse device.
 class DirectRuntime {
 public:
+    // Ensure SCAL_CONFIG_FILE_PATH points to scal-g2e-direct.json BEFORE Device construction.
+    // Returns true if a valid SCAL direct config is now active in the process environment.
+    static bool ensure_scal_config();
+
     explicit DirectRuntime(const Device& dev);
     ~DirectRuntime();
     DirectRuntime(const DirectRuntime&) = delete;
@@ -67,10 +71,16 @@ public:
     void flush_patches(std::span<DirectPlan* const> plans);
     // Same as flush_patches, plus one extra HBM upload (e.g., ids_ control block) in the same PDMA sync.
     void flush_patches_and_upload(std::span<DirectPlan* const> plans, uint64_t dst_addr, const void* src, size_t bytes);
+    // Async versions for double-buffered CPU-patch/PDMA || GPU-chain overlap!
+    void flush_patches_and_upload_async(std::span<DirectPlan* const> plans, uint64_t dst_addr, const void* src, size_t bytes);
+    void wait_patches();
 
     // Execute a sequence of prepared DirectPlans back-to-back on-device via SM2 SOB -> Scheduler ARC FENCE_WAIT
     // chaining (eliminates inter-plan host submit/wait_fence round-trips). Returns total elapsed us.
     double run_chain(std::span<DirectPlan* const> plans);
+    // Non-blocking submit + wait for double-buffered chain pipelining (requires plans fit in <= 1 chunk when pipelining).
+    uint32_t submit_chain(std::span<DirectPlan* const> plans);
+    void wait_chain(uint32_t in_flight);
 
     bool chain_enabled() const;
 

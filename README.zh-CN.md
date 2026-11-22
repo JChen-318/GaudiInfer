@@ -2,15 +2,15 @@
 
 # GaudiInfer
 
-**为 Intel® Gaudi®2 打造的高性能、高吞吐大模型推理引擎**
+**为 Intel® Gaudi®2 打造的高性能原生 C++ 多模态推理引擎**
 
-原生 C++ · 直接调用 SynapseAI · DSpine 投机解码 · 连续批处理 · 自研 TPC 内核
+原生 C++ · SynapseAI · Direct MME + SRAM · 自研 TPC 内核 · LLM/VLM · 图像与音视频扩散 · 一体化工作台 WebUI
 
 [![Hardware](https://img.shields.io/badge/hardware-Intel%20Gaudi2-0071C5)](#环境要求)
 [![Language](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)](#编译)
 [![SDK](https://img.shields.io/badge/SynapseAI-1.24-6E40C9)](#环境要求)
-[![API](https://img.shields.io/badge/API-OpenAI%20compatible-10A37F)](#api)
-[![Model](https://img.shields.io/badge/model-Qwen3.8--27B%20FP8-FF6A00)](#模型准备)
+[![API](https://img.shields.io/badge/API-OpenAI%20%2F%20ComfyUI-10A37F)](#api)
+[![Models](https://img.shields.io/badge/models-Qwen3.8--27B%20%7C%20Qwen--Image--2.1%20%7C%20MiniMax--H3-FF6A00)](#模型准备)
 
 [English](README.md) · **简体中文**
 
@@ -18,7 +18,13 @@
 
 ---
 
-GaudiInfer（代码里叫 `g2e`）在单张 Gaudi2 上运行 **Qwen3.8-27B（FP8）**。它直接调用 SynapseAI 的图接口，服务路径上不用 PyTorch，也没有 Python。生成时用 **DSpine** 投机草稿模型加速，最多 8 个请求同时运行，各请求的验证和起草都合批执行。
+GaudiInfer（代码里叫 `g2e`）在**单张 Intel Gaudi2（96 GiB HBM2E）**上提供四套原生 C++ 推理引擎，直接调用 SynapseAI、自研 TPC-C 内核与 Direct MME/SRAM，推理路径零 PyTorch、零 Python：
+
+- **Qwen3.8-27B（FP8 + DSpine-b16 + Vision）** — 支持 262K 上下文、投机解码与连续批处理的 LLM/VLM 引擎（`g2e_server`）。
+- **Qwen-Image-2.1-Turbo（FP8 DiT + BF16 VAE/VLM）** — 8 步极速文生图与 1–4 张参考图编辑（`g2e_qwen21_server`）。
+- **MiniMax-H3-Image（33.1B FP8 DiT + 2D VAE）** — 6 步 PDD 2K / 4K（16 MP）高清生图与 1–16 参考图编辑（`g2e_h3_image_server`）。
+- **MiniMax-H3 Video + 双声道音频（FP8 DiT + 3D VideoVAE + AudioVAE）** — 支持文生/图生/首尾帧音视频生成与热切换 4 步/8 步 Turbo LoRA（`g2e_h3_server`、`g2e_h3_cli`）。
+- **GaudiInfer Studio & Monitor 一体化工作台（`:8002`）** — 中英双语界面，集成实时 Gaudi2 硬件监控、单卡一键切换四模型、持久化作品画廊与跨模型接力。
 
 ## 亮点
 
@@ -187,6 +193,28 @@ GaudiInfer（代码里叫 `g2e`）在单张 Gaudi2 上运行 **Qwen3.8-27B（FP8
 
 > tok/s 取决于草稿 token 被接受的数量，会随内容变化；每轮耗时是更稳定的比较口径。
 
+### 多模态图像与音视频扩散引擎（单卡 Gaudi2）
+
+所有扩散引擎均提供 OpenAI 兼容（`/v1/images/generations`、`/v1/images/edits`）与 ComfyUI 兼容 HTTP 接口，推理路径无 Python 开销：
+
+| 引擎 | 服务程序 | HBM 占用 | 实测端到端 HTTP 耗时 | 能力特性 |
+|---|---|---:|---|---|
+| **Qwen-Image-2.1-Turbo** | `g2e_qwen21_server` (`:8098`) | 22.6 GiB | **2.34 s**（1024² 文生图 8 步）· **4.2 s**（1–4 图编辑） | FP8 DiT + BF16 3D VAE + Qwen3.5-VL-4B |
+| **MiniMax-H3-Image** | `g2e_h3_image_server` (`:8099`) | 56.9 GiB | **4.67 s**（2K 6 步 PDD）· **22.4 s**（4K 16 MP） | 33.1B FP8 DiT + 2D VAE（0.91 s）+ 1–16 参考图编辑 |
+| **MiniMax-H3 Video** | `g2e_h3_server` (`:8097`) | ~62 GiB | **~10–30 s**（480p/768p 5s，4/8 步 Turbo LoRA） | DirectH3Attn + 流式 VideoVAE + 双声道 AudioVAE，T2VA / I2VA / FL2VA |
+
+### 一体化创作工作台与实时监控 WebUI
+
+纯 Python 3 标准库实现（零 pip 依赖，`monitor/server.py`，端口 `8002`），整合全部四个引擎与实时 `hl-smi` 硬件遥测：
+
+```bash
+./monitor/studio_ctl.sh start   # 浏览器访问 http://<host>:8002
+```
+
+- **默认打开即硬件监控**：实时展示 Gaudi2 AIP 利用率、HBM、54V+12V 总功耗、温度、SoC 频率、吞吐折线图、引擎日志，以及监控页顶部的单卡四模型一键切换条。
+- **多模态创作工作区**：内置 27B 对话/看图、Qwen-Image-2.1 生图与编辑、MiniMax-H3-Image 2K/4K 多图编辑、MiniMax-H3 音视频生成与持久化作品画廊，支持一键跨模型接力（生图 → 编辑 / 首帧生成视频 / 27B 看图分析）。
+- **中英文双语与明暗主题**：顶部栏一键切换 **`中 / EN`** 与浅色/深色主题。
+
 ## 架构
 
 ```mermaid
@@ -315,23 +343,25 @@ curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/jso
 ## 目录结构
 
 ```
-apps/                 g2e_server：HTTP 服务、调度器、OpenAI 请求和响应处理
-include/g2e/, src/    引擎：运行时、图构建、算子、Qwen3.8 目标模型、GDN、DSpine 草稿模型、
-                      Generator、前缀缓存、分词器、视觉编码器、Qwen3 解析器
-tpc/flashinfer_gaudi/ 自研 TPC-C 内核及其 Synapse 接入代码
-tools/                权重转换（生成 .g2w 权重包）和服务启动脚本
+apps/                 g2e_server（27B LLM/VLM）、g2e_qwen21_server、g2e_h3_image_server、
+                      g2e_h3_server、g2e_h3_cli
+include/g2e/, src/    核心 SynapseAI + Direct MME/SRAM 引擎（Qwen3.8-27B + GDN + DSpine、
+                      Qwen-Image-2.1、MiniMax-H3-Image、MiniMax-H3 音视频）
+tpc/flashinfer_gaudi/ 自研 TPC-C 内核（GDN、融合归一化量化、Softmax、H3 AdaLN/RoPE/DirectAttn）
+monitor/              GaudiInfer Studio & Monitor 一体化工作台（中英双语、零 pip 依赖）
+tools/                权重转换（生成 .g2w 权重包）、MME 描述符与启动脚本
 third_party/          cpp-httplib、nlohmann/json、stb_image、llama.cpp 的 unicode 和 jinja（随仓库附带）
 ```
 
 ## 进度与计划
 
-GaudiInfer 仍在积极开发中，目前面向单卡、单个模型。
+GaudiInfer 仍在积极开发中，面向单卡 Gaudi2 部署。
 
-- [x] FP8 目标模型、DSpine 投机解码（贪心和采样）、262K 上下文
-- [x] 连续批处理，批量验证和批量起草
-- [x] 前缀缓存、图片输入、OpenAI 兼容 API
-- [x] 可选的 FP8 KV 缓存
+- [x] Qwen3.8-27B FP8 目标模型、DSpine 投机解码（贪心和采样）、262K 上下文、连续批处理、前缀缓存、图片输入、可选 FP8 KV 缓存
 - [x] 融合的长上下文注意力（Direct MME + SRAM 引擎，分数和概率留在 SRAM）
+- [x] 原生 MiniMax-H3 音视频引擎（DirectH3Attn、流式 VideoVAE、热切换 4/8 步 Turbo LoRA、首尾帧 FL2VA）
+- [x] 原生 Qwen-Image-2.1-Turbo（1024² 2.34 s）与 MiniMax-H3-Image（2K 4.67 s、4K 16 MP 22.4 s）
+- [x] 一体化中英双语 Studio & Monitor WebUI（单卡引擎切换 + 实时硬件监控 + 作品画廊）
 - [ ] 树形投机（每轮多条草稿分支）
 - [ ] 8 路合计解码 ≥ 1000 tok/s
 

@@ -617,6 +617,27 @@ struct DirectRuntime::Impl {
     }
 };
 
+bool DirectRuntime::ensure_scal_config() {
+    if (const char* cur = std::getenv("SCAL_CONFIG_FILE_PATH"); cur && cur[0] != '\0') return true;
+    if (const char* cur = std::getenv("SCAL_CFG_FILE_PATH"); cur && cur[0] != '\0') {
+        setenv("SCAL_CONFIG_FILE_PATH", cur, 1);
+        return true;
+    }
+    const char* cands[] = {
+        "/opt/gaudiinfer/tools/scal-g2e-direct.json",
+        G2E_SOURCE_DIR "/tools/scal-g2e-direct.json",
+        "tools/scal-g2e-direct.json",
+    };
+    for (const char* p : cands) {
+        if (std::filesystem::exists(p)) {
+            setenv("SCAL_CONFIG_FILE_PATH", p, 1);
+            setenv("SCAL_CFG_FILE_PATH", p, 1);
+            return true;
+        }
+    }
+    return false;
+}
+
 DirectRuntime::DirectRuntime(const Device& dev) : impl_(std::make_unique<Impl>()) {
     auto& s = *impl_;
     s.dev_id = dev.id();
@@ -1201,18 +1222,24 @@ void DirectPlan::prepare() {
 
     std::vector<char> all_code(total_code, 0);
     size_t ecb_idx = 0, code_off = 0;
-    for (auto& st : p.stages) {
-        for (size_t k = 0; k < st.ecbs.size(); ++k) {
-            auto& ecb = st.ecbs[k];
-            ecb.meta_core_addr = mi.core_address + ecb_idx * 512ull;
-            ecb.code_dev_addr = ci.device_address + code_off;
-            DirectRuntime::Impl::fill_ecb_meta(static_cast<char*>(mi.host_address) + ecb_idx * 512ull,
-                                               st.chunks[k], ecb.engine_offsets);
-            std::memcpy(all_code.data() + code_off, ecb.shadow.data(), ecb.shadow.size());
-            code_off += ecb.shadow.size();
-            ++ecb_idx;
+    // Pack MME ECBs contiguously first, then TPC ECBs: allows flush_patches_and_upload to coalesce
+    // all dirty MME ECBs of a plan into ONE single synMemCopyAsync (10-30x fewer PDMA calls)!
+    for (int pass = 0; pass < 2; ++pass) {
+        const uint32_t want_group = (pass == 0) ? SCAL_MME_COMPUTE_GROUP : SCAL_TPC_COMPUTE_GROUP;
+        for (auto& st : p.stages) {
+            if (st.group != want_group) continue;
+            for (size_t k = 0; k < st.ecbs.size(); ++k) {
+                auto& ecb = st.ecbs[k];
+                ecb.meta_core_addr = mi.core_address + ecb_idx * 512ull;
+                ecb.code_dev_addr = ci.device_address + code_off;
+                DirectRuntime::Impl::fill_ecb_meta(static_cast<char*>(mi.host_address) + ecb_idx * 512ull,
+                                                   st.chunks[k], ecb.engine_offsets);
+                std::memcpy(all_code.data() + code_off, ecb.shadow.data(), ecb.shadow.size());
+                code_off += ecb.shadow.size();
+                ++ecb_idx;
+            }
+            st.chunks.clear();
         }
-        st.chunks.clear();
     }
     s.upload_and_verify(all_code, ci.device_address);
     p.prepared = true;
@@ -1396,11 +1423,66 @@ double DirectRuntime::run_chain(std::span<DirectPlan* const> plans) {
     return now_us() - t0;
 }
 
+uint32_t DirectRuntime::submit_chain(std::span<DirectPlan* const> plans) {
+    auto& s = *impl_;
+    if (plans.empty()) return 0u;
+    if (!s.chain_enabled) {
+        run_chain(plans);
+        return 0u;
+    }
+    std::vector<DirectPlan*> active;
+    active.reserve(plans.size());
+    for (DirectPlan* pl : plans) {
+        if (!pl) continue;
+        if (!pl->impl().prepared) pl->prepare();
+        active.push_back(pl);
+    }
+    if (active.empty()) return 0u;
+
+    constexpr uint32_t kChunkBudget = 20480u;
+    const uint64_t base = mmDCORE2_SYNC_MNGR_OBJS_BASE;
+    uint32_t in_flight = 0;
+    s.begin();
+    uint32_t chunk_start_pi = s.pi;
+    for (size_t i = 0; i < active.size(); ++i) {
+        auto& p = active[i]->impl();
+        const bool is_final = (i + 1 == active.size());
+        const uint32_t cur_chunk = s.pi - chunk_start_pi;
+        const uint32_t need_this = est_plan_cmd_bytes(p);
+        const uint32_t need_next = is_final ? 0u : est_plan_cmd_bytes(active[i + 1]->impl());
+        const bool is_chunk_end = !is_final && (cur_chunk + need_this + need_next > kChunkBudget);
+
+        s.lbw(base + s.chain_sob * 4, 0);
+        const uint32_t cmon = is_final ? s.chain_mon_host : (is_chunk_end ? s.chain_mon_both : s.chain_mon_fence);
+        s.arm_only(cmon, s.chain_sob, p.host_credits);
+        emit_plan_stages(s, p);
+        if (!is_final) s.fence_wait(Impl::kChainFenceId, 1);
+
+        if (is_final || is_chunk_end) {
+            s.submit();
+            ++in_flight;
+            if (!is_final) {
+                s.begin();
+                chunk_start_pi = s.pi;
+                if (in_flight >= 2) {
+                    s.wait_fence(1);
+                    --in_flight;
+                }
+            }
+        }
+    }
+    return in_flight;
+}
+
+void DirectRuntime::wait_chain(uint32_t in_flight) {
+    if (in_flight > 0) impl_->wait_fence(in_flight);
+}
+
 void DirectRuntime::flush_patches(std::span<DirectPlan* const> plans) {
     flush_patches_and_upload(plans, 0, nullptr, 0);
 }
 
-void DirectRuntime::flush_patches_and_upload(std::span<DirectPlan* const> plans, uint64_t dst_addr, const void* src, size_t bytes) {
+void DirectRuntime::flush_patches_and_upload_async(std::span<DirectPlan* const> plans, uint64_t dst_addr, const void* src, size_t bytes) {
     auto& s = *impl_;
     size_t total = bytes;
     for (DirectPlan* pl : plans) {
@@ -1430,18 +1512,36 @@ void DirectRuntime::flush_patches_and_upload(std::span<DirectPlan* const> plans,
         if (!pl) continue;
         auto& p = pl->impl();
         if (!p.any_dirty) continue;
-        for (PreparedEcb* ecb : p.dirty_ecbs) {
-            std::memcpy(static_cast<char*>(s.patch_stage) + off, ecb->shadow.data(), ecb->shadow.size());
-            check(synMemCopyAsync(s.patch_stream, reinterpret_cast<uintptr_t>(s.patch_stage) + off,
-                                  ecb->shadow.size(), ecb->code_dev_addr, HOST_TO_DRAM),
+        std::sort(p.dirty_ecbs.begin(), p.dirty_ecbs.end(),
+                  [](const PreparedEcb* a, const PreparedEcb* b) { return a->code_dev_addr < b->code_dev_addr; });
+        size_t i = 0;
+        while (i < p.dirty_ecbs.size()) {
+            const uint64_t run_dst = p.dirty_ecbs[i]->code_dev_addr;
+            const size_t run_off = off;
+            uint64_t run_bytes = 0;
+            while (i < p.dirty_ecbs.size() && p.dirty_ecbs[i]->code_dev_addr == run_dst + run_bytes) {
+                auto* ecb = p.dirty_ecbs[i++];
+                std::memcpy(static_cast<char*>(s.patch_stage) + off, ecb->shadow.data(), ecb->shadow.size());
+                off += ecb->shadow.size();
+                run_bytes += ecb->shadow.size();
+                ecb->dirty = false;
+            }
+            check(synMemCopyAsync(s.patch_stream, reinterpret_cast<uintptr_t>(s.patch_stage) + run_off,
+                                  run_bytes, run_dst, HOST_TO_DRAM),
                   "direct_mme batch patch upload");
-            off += ecb->shadow.size();
-            ecb->dirty = false;
         }
         p.dirty_ecbs.clear();
         p.any_dirty = false;
     }
-    check(synStreamSynchronize(s.patch_stream), "direct_mme batch patch sync");
+}
+
+void DirectRuntime::wait_patches() {
+    check(synStreamSynchronize(impl_->patch_stream), "direct_mme batch patch sync");
+}
+
+void DirectRuntime::flush_patches_and_upload(std::span<DirectPlan* const> plans, uint64_t dst_addr, const void* src, size_t bytes) {
+    flush_patches_and_upload_async(plans, dst_addr, src, bytes);
+    wait_patches();
 }
 
 }  // namespace g2e

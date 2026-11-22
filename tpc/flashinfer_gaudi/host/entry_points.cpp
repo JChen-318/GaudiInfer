@@ -6,6 +6,7 @@
 #include "gated_norm_quant_bf16_gaudi2.hpp"
 #include "gdn_packed_decode_f32_gaudi2.hpp"
 #include "gdn_spec_prep_bf16_gaudi2.hpp"
+#include "h3_adaln_bf16_gaudi2.hpp"
 #include "masked_softmax_bf16_gaudi2.hpp"
 #include "silu_and_mul_bf16_gaudi2.hpp"
 #include "silu_mul_quant_bf16_gaudi2.hpp"
@@ -48,6 +49,20 @@ constexpr Entry kKernels[] = {
     {&static_name<GdnSpecPrepBatchBf16Gaudi2>, &glue<GdnSpecPrepBatchBf16Gaudi2>},
     {&static_name<GdnSpecPrepBf16Gaudi2>, &glue<GdnSpecPrepBf16Gaudi2>},
     {&static_name<GdnStateCommitF32Gaudi2>, &glue<GdnStateCommitF32Gaudi2>},
+    {&static_name<H3AdalnRmsNormQuantBf16Gaudi2>, &glue<H3AdalnRmsNormQuantBf16Gaudi2>},
+    {&static_name<H3FastSoftmaxFp8Gaudi2>, &glue<H3FastSoftmaxFp8Gaudi2>},
+    {&static_name<H3GateAdalnRmsNormQuantBf16Gaudi2>, &glue<H3GateAdalnRmsNormQuantBf16Gaudi2>},
+    {&static_name<H3GateResidualBf16Gaudi2>, &glue<H3GateResidualBf16Gaudi2>},
+    {&static_name<H3MaxFreeExpBf16Gaudi2>, &glue<H3MaxFreeExpBf16Gaudi2>},
+    {&static_name<H3QkNormRopeBf16Gaudi2>, &glue<H3QkNormRopeBf16Gaudi2>},
+    {&static_name<H3QkNormRopePrepBf16Gaudi2>, &glue<H3QkNormRopePrepBf16Gaudi2>},
+    {&static_name<H3QuantV256Bf16Gaudi2>, &glue<H3QuantV256Bf16Gaudi2>},
+    {&static_name<H3RowQuantBf16Gaudi2>, &glue<H3RowQuantBf16Gaudi2>},
+    {&static_name<H3SiluMulQuantDualBf16Gaudi2>, &glue<H3SiluMulQuantDualBf16Gaudi2>},
+    {&static_name<H3VvaeBiasSiluMulQuantDqBf16Gaudi2>, &glue<H3VvaeBiasSiluMulQuantDqBf16Gaudi2>},
+    {&static_name<H3VvaeQkNormRopeBf16Gaudi2>, &glue<H3VvaeQkNormRopeBf16Gaudi2>},
+    {&static_name<H3VvaeRmsNormQuantBf16Gaudi2>, &glue<H3VvaeRmsNormQuantBf16Gaudi2>},
+    {&static_name<H3VvaeScaleAddNormQuantBf16Gaudi2>, &glue<H3VvaeScaleAddNormQuantBf16Gaudi2>},
     {&static_name<MaskedSoftmaxBf16F8Gaudi2>, &glue<MaskedSoftmaxBf16F8Gaudi2>},
     {&static_name<MaskedSoftmaxBf16Gaudi2>, &glue<MaskedSoftmaxBf16Gaudi2>},
     {&static_name<MaskedSoftmaxF16Gaudi2>, &glue<MaskedSoftmaxF16Gaudi2>},

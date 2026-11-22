@@ -3,1334 +3,543 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GaudiInfer</title>
+<title>GaudiInfer Studio & Monitor</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231d1d1f'/%3E%3Cpath d='M17 6.5 9.5 18h5.8l-.9 7.5L22.5 14h-5.8z' fill='%23ffffff'/%3E%3C/svg%3E">
-<style>
-:root{
-  --font-display:"SF Pro Display",-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;
-  --font-text:"SF Pro Text",-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;
-  --font-mono:"SF Mono",ui-monospace,Menlo,Monaco,Consolas,monospace;
-  --r-card:20px;
-  --r-inner:12px;
-  --r-pill:999px;
-}
-
-/* Apple Light Mode (macOS Sequoia / apple.com) */
-html[data-theme="light"]{
-  --bg:#f5f5f7;
-  --nav:rgba(245,245,247,.78);
-  --card:#ffffff;
-  --card-2:#f5f5f7;
-  --card-hover:#fafafa;
-  --seg-bg:rgba(118,118,128,.12);
-  --seg-active:#ffffff;
-  --seg-shadow:0 1px 3px rgba(0,0,0,.08),0 1px 1px rgba(0,0,0,.04);
-  --hairline:rgba(0,0,0,.07);
-  --hairline-2:rgba(0,0,0,.11);
-  --text:#1d1d1f;
-  --text-2:#424245;
-  --muted:#6e6e73;
-  --tertiary:#86868b;
-  --grid:rgba(0,0,0,.06);
-  --track:rgba(118,118,128,.16);
-  --card-shadow:0 1px 2px rgba(0,0,0,.03),0 8px 24px -12px rgba(0,0,0,.06);
-  --tip-bg:rgba(255,255,255,.94);
-  --tip-shadow:0 8px 30px rgba(0,0,0,.12),0 0 0 1px rgba(0,0,0,.06);
-  --blue:#0071e3;
-  --cyan:#32ade6;
-  --green:#34c759;
-  --orange:#ff9500;
-  --red:#ff3b30;
-  --indigo:#5856d6;
-  --purple:#af52de;
-  --term-bg:#1c1c1e;
-  --term-bar:#2c2c2e;
-  --term-text:#e5e5ea;
-  --term-muted:#8e8e93;
-}
-
-/* Apple Dark Mode (macOS / iOS System Dark) */
-html[data-theme="dark"]{
-  --bg:#000000;
-  --nav:rgba(22,22,24,.78);
-  --card:#1c1c1e;
-  --card-2:#2c2c2e;
-  --card-hover:#242426;
-  --seg-bg:rgba(118,118,128,.24);
-  --seg-active:#3a3a3c;
-  --seg-shadow:0 1px 3px rgba(0,0,0,.35);
-  --hairline:rgba(255,255,255,.09);
-  --hairline-2:rgba(255,255,255,.15);
-  --text:#f5f5f7;
-  --text-2:#d1d1d6;
-  --muted:#98989d;
-  --tertiary:#636366;
-  --grid:rgba(255,255,255,.08);
-  --track:rgba(118,118,128,.28);
-  --card-shadow:0 1px 0 rgba(255,255,255,.04) inset,0 10px 30px -15px rgba(0,0,0,.6);
-  --tip-bg:rgba(28,28,30,.95);
-  --tip-shadow:0 12px 32px rgba(0,0,0,.55),0 0 0 1px rgba(255,255,255,.1);
-  --blue:#0a84ff;
-  --cyan:#64d2ff;
-  --green:#30d158;
-  --orange:#ff9f0a;
-  --red:#ff453a;
-  --indigo:#5e5ce6;
-  --purple:#bf5af2;
-  --term-bg:#141416;
-  --term-bar:#1c1c1e;
-  --term-text:#e5e5ea;
-  --term-muted:#8e8e93;
-}
-
-*{box-sizing:border-box}
-html,body{margin:0;padding:0}
-body{
-  font-family:var(--font-text);
-  background:var(--bg);
-  color:var(--text);
-  font-size:13px;
-  line-height:1.47;
-  -webkit-font-smoothing:antialiased;
-  -moz-osx-font-smoothing:grayscale;
-  transition:background-color .25s ease,color .25s ease;
-}
-svg.ico{flex:none;display:block}
-
-/* -------- Apple Frosted Global Nav -------- */
-.nav{
-  position:sticky;top:0;z-index:40;
-  background:var(--nav);
-  backdrop-filter:saturate(180%) blur(20px);
-  -webkit-backdrop-filter:saturate(180%) blur(20px);
-  border-bottom:1px solid var(--hairline);
-}
-.nav-in{
-  max-width:1360px;margin:0 auto;height:52px;padding:0 24px;
-  display:flex;align-items:center;justify-content:space-between;gap:16px;
-}
-.nav-brand{display:flex;align-items:center;gap:10px}
-.nav-logo{
-  width:26px;height:26px;border-radius:7px;background:var(--text);color:var(--bg);
-  display:grid;place-items:center;
-}
-.nav-title{font-family:var(--font-display);font-size:15px;font-weight:600;letter-spacing:-.02em}
-.nav-sep{width:1px;height:14px;background:var(--hairline-2);margin:0 2px}
-.nav-status{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);font-weight:500}
-.sdot{width:7px;height:7px;border-radius:50%;background:var(--tertiary);flex:none}
-.sdot.ok{background:var(--green)}
-.sdot.err{background:var(--red)}
-
-.nav-right{display:flex;align-items:center;gap:10px}
-
-/* Apple Segmented Control */
-.seg{
-  display:inline-flex;padding:2px;border-radius:9px;background:var(--seg-bg);
-}
-.seg button{
-  border:0;background:transparent;color:var(--muted);
-  font:inherit;font-size:12px;font-weight:500;padding:4px 10px;border-radius:7px;
-  cursor:pointer;transition:color .15s,background .15s;
-}
-.seg button:hover{color:var(--text)}
-.seg button.on{background:var(--seg-active);color:var(--text);box-shadow:var(--seg-shadow)}
-
-/* Apple Buttons */
-.btn{
-  display:inline-flex;align-items:center;justify-content:center;gap:6px;
-  height:30px;padding:0 12px;border-radius:var(--r-pill);
-  border:1px solid var(--hairline-2);background:var(--card);color:var(--text);
-  font:inherit;font-size:12.5px;font-weight:500;cursor:pointer;
-  transition:background .15s,border-color .15s,opacity .15s,transform .1s;
-}
-.btn:hover{background:var(--card-hover)}
-.btn:active{transform:scale(.98)}
-.btn.icon{width:30px;padding:0}
-.btn.primary{
-  border:0;background:var(--blue);color:#ffffff;font-weight:500;padding:0 14px;
-}
-.btn.primary:hover{filter:brightness(1.06)}
-.btn:disabled{opacity:.45;cursor:not-allowed;transform:none}
-
-/* -------- Page Container & Hero -------- */
-.page{max-width:1360px;margin:0 auto;padding:28px 24px 56px}
-.hero{
-  display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;
-  margin-bottom:24px;
-}
-.hero h1{
-  margin:0;font-family:var(--font-display);font-size:32px;font-weight:700;
-  letter-spacing:-.03em;line-height:1.12;
-}
-.hero-sub{
-  margin-top:6px;font-size:13.5px;color:var(--muted);
-  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-}
-.hero-sub .sep{color:var(--tertiary)}
-.hero-meta{
-  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-}
-.pill{
-  display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 12px;
-  border-radius:var(--r-pill);background:var(--card);border:1px solid var(--hairline);
-  font-size:12px;color:var(--muted);font-weight:500;
-}
-.pill b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
-
-/* -------- Bento Cards -------- */
-.card{
-  background:var(--card);border-radius:var(--r-card);
-  border:1px solid var(--hairline);box-shadow:var(--card-shadow);
-  padding:22px 24px;min-width:0;
-}
-.card-head{
-  display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
-  margin-bottom:18px;
-}
-.card-title{
-  font-family:var(--font-display);font-size:16px;font-weight:600;letter-spacing:-.02em;
-}
-.card-sub{font-size:12px;color:var(--muted);margin-top:2px;font-weight:400}
-
-/* -------- KPI Bento Row -------- */
-.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:16px}
-.kpi{padding:20px 22px 0;overflow:hidden;display:flex;flex-direction:column}
-.kpi-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
-.kpi-label{font-size:12.5px;font-weight:600;color:var(--muted);letter-spacing:-.01em}
-.kpi-tag{
-  font-size:11px;font-weight:500;color:var(--tertiary);
-  font-variant-numeric:tabular-nums;
-}
-.kpi-num{
-  margin-top:10px;display:flex;align-items:baseline;gap:5px;
-  font-family:var(--font-display);font-variant-numeric:tabular-nums;
-}
-.kpi-num span{font-size:38px;font-weight:600;letter-spacing:-.04em;line-height:1.05}
-.kpi-num small{font-size:14px;font-weight:500;color:var(--muted)}
-.kpi-foot{
-  margin-top:10px;display:flex;gap:14px;flex-wrap:wrap;
-  font-size:12px;color:var(--muted);
-}
-.kpi-foot b{color:var(--text);font-weight:600;margin-left:4px;font-variant-numeric:tabular-nums}
-.spark{display:block;width:calc(100% + 44px);height:48px;margin:14px -22px 0}
-
-/* -------- Main Grid -------- */
-.grid-main{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:16px;margin-bottom:16px}
-.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-bottom:16px}
-@media (max-width:1120px){
-  .kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
-  .grid-main,.grid-2{grid-template-columns:1fr}
-}
-@media (max-width:640px){
-  .kpis{grid-template-columns:1fr}
-  .page{padding:18px 16px 40px}
-  .nav-in{padding:0 16px}
-  .hero h1{font-size:26px}
-}
-
-/* -------- Apple Activity Gauges -------- */
-.rings{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:18px}
-@media (max-width:680px){.rings{grid-template-columns:repeat(2,minmax(0,1fr))}}
-.ring-box{
-  display:flex;flex-direction:column;align-items:center;
-  padding:16px 8px 14px;border-radius:16px;background:var(--card-2);
-}
-.ring-wrap{position:relative;width:96px;height:96px}
-.ring-wrap svg{width:100%;height:100%;display:block;transform:rotate(-90deg)}
-.ring-bg{fill:none;stroke:var(--track);stroke-width:7}
-.ring-fg{fill:none;stroke-width:7;stroke-linecap:round;transition:stroke-dasharray .7s cubic-bezier(.2,.8,.2,1)}
-.ring-mid{
-  position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
-  font-family:var(--font-display);font-variant-numeric:tabular-nums;
-}
-.ring-val{font-size:22px;font-weight:600;letter-spacing:-.03em;line-height:1}
-.ring-unit{font-size:10.5px;color:var(--muted);margin-top:3px;font-weight:500}
-.ring-name{font-size:12px;font-weight:600;color:var(--text);margin-top:10px}
-.ring-sub{font-size:11px;color:var(--muted);margin-top:1px;font-variant-numeric:tabular-nums}
-
-.specs{
-  display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;
-  background:var(--hairline);border-radius:12px;overflow:hidden;margin-bottom:18px;
-  border:1px solid var(--hairline);
-}
-.spec{background:var(--card);padding:10px 14px;min-width:0}
-.spec span{display:block;font-size:11px;color:var(--muted)}
-.spec b{
-  display:block;margin-top:2px;font-size:13px;font-weight:600;color:var(--text);
-  font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-}
-@media (max-width:680px){.specs{grid-template-columns:repeat(2,1fr)}}
-
-/* -------- Charts (Apple Stocks / Health style) -------- */
-.legend{display:flex;align-items:center;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
-.legend span{display:inline-flex;align-items:center;gap:6px}
-.legend i{width:8px;height:8px;border-radius:50%;display:inline-block}
-.chart-box{position:relative;height:216px}
-.chart-box canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair}
-.tip{
-  position:absolute;left:0;top:0;z-index:10;pointer-events:none;opacity:0;transition:opacity .12s;
-  min-width:160px;padding:10px 12px;border-radius:12px;
-  background:var(--tip-bg);box-shadow:var(--tip-shadow);
-  backdrop-filter:saturate(180%) blur(16px);-webkit-backdrop-filter:saturate(180%) blur(16px);
-  font-size:12px;
-}
-.tip-t{font-size:11px;font-weight:600;color:var(--muted);margin-bottom:6px;font-variant-numeric:tabular-nums}
-.tip-r{display:flex;align-items:center;justify-content:space-between;gap:16px;line-height:1.75;color:var(--text-2)}
-.tip-r i{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:7px}
-.tip-r b{font-weight:600;color:var(--text);font-variant-numeric:tabular-nums}
-.tip-x{margin-top:6px;padding-top:6px;border-top:1px solid var(--hairline);color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
-
-/* -------- Capacity & Slots (macOS Storage style) -------- */
-.slots{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:20px}
-.slot{
-  height:46px;padding:0 12px;border-radius:12px;background:var(--card-2);
-  display:flex;align-items:center;justify-content:space-between;
-  font-size:12px;font-weight:500;color:var(--muted);
-  transition:background .25s,color .25s;
-}
-.slot .sd{width:7px;height:7px;border-radius:50%;background:var(--track)}
-.slot.on{background:color-mix(in srgb,var(--green) 14%,transparent);color:var(--text);font-weight:600}
-.slot.on .sd{background:var(--green)}
-
-.meter{margin-bottom:15px}
-.meter-head{display:flex;justify-content:space-between;gap:8px;margin-bottom:7px;font-size:12.5px}
-.meter-head span:first-child{font-weight:500;color:var(--text)}
-.meter-head span:last-child{color:var(--muted);font-variant-numeric:tabular-nums}
-.track{height:6px;border-radius:var(--r-pill);background:var(--track);overflow:hidden}
-.fill{height:100%;width:0;border-radius:var(--r-pill);background:var(--blue);transition:width .65s cubic-bezier(.2,.8,.2,1)}
-
-.totals{
-  display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;
-  margin-top:20px;padding-top:18px;border-top:1px solid var(--hairline);
-}
-.tot{padding:10px 12px;border-radius:12px;background:var(--card-2)}
-.tot span{display:block;font-size:11.5px;color:var(--muted)}
-.tot b{
-  display:block;margin-top:2px;font-family:var(--font-display);font-size:20px;font-weight:600;
-  letter-spacing:-.025em;font-variant-numeric:tabular-nums;
-}
-
-/* -------- Bottom Tabbed Section -------- */
-.tabs-bar{
-  display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
-  margin-bottom:18px;
-}
-.tabs-seg{display:inline-flex;padding:3px;border-radius:11px;background:var(--seg-bg)}
-.tabs-seg button{
-  display:inline-flex;align-items:center;gap:6px;border:0;background:transparent;
-  color:var(--muted);font:inherit;font-size:13px;font-weight:500;padding:6px 14px;border-radius:8px;
-  cursor:pointer;transition:color .15s,background .15s;white-space:nowrap;
-}
-.tabs-seg button:hover{color:var(--text)}
-.tabs-seg button.on{background:var(--seg-active);color:var(--text);font-weight:600;box-shadow:var(--seg-shadow)}
-.cnt{
-  font-size:11px;font-weight:600;padding:1px 6px;border-radius:6px;
-  background:var(--seg-bg);color:var(--muted);font-variant-numeric:tabular-nums;
-}
-.tabs-seg button.on .cnt{color:var(--blue);background:color-mix(in srgb,var(--blue) 12%,transparent)}
-.pane{display:none}
-.pane.on{display:block}
-
-/* -------- Apple Clean Table -------- */
-.table-wrap{max-height:420px;overflow:auto}
-table{width:100%;border-collapse:collapse;font-size:12.5px}
-th{
-  position:sticky;top:0;z-index:1;background:var(--card);
-  text-align:right;padding:10px 14px;font-size:11.5px;font-weight:600;color:var(--muted);
-  border-bottom:1px solid var(--hairline-2);white-space:nowrap;
-}
-td{
-  text-align:right;padding:12px 14px;border-bottom:1px solid var(--hairline);
-  font-variant-numeric:tabular-nums;color:var(--text-2);white-space:nowrap;
-}
-th:first-child,td:first-child{text-align:left;padding-left:6px}
-th:last-child,td:last-child{padding-right:6px}
-tbody tr:last-child td{border-bottom:0}
-tbody tr:hover td{background:var(--card-hover)}
-td .u{color:var(--tertiary);margin-left:3px;font-size:11.5px}
-.badge{
-  display:inline-flex;align-items:center;padding:2px 9px;border-radius:var(--r-pill);
-  font-size:11.5px;font-weight:500;
-}
-.badge.ok{color:var(--green);background:color-mix(in srgb,var(--green) 13%,transparent)}
-.badge.warn{color:var(--orange);background:color-mix(in srgb,var(--orange) 13%,transparent)}
-.badge.dim{color:var(--tertiary);background:var(--card-2)}
-.bar-cell{display:inline-flex;align-items:center;gap:10px;justify-content:flex-end}
-.bar-cell i{position:relative;display:block;width:64px;height:5px;border-radius:99px;background:var(--track);overflow:hidden}
-.bar-cell i::after{content:"";position:absolute;inset:0 auto 0 0;width:var(--w);border-radius:99px;background:var(--blue)}
-.bar-cell b{min-width:48px;color:var(--text);font-weight:600}
-.empty{padding:48px 16px;text-align:center;color:var(--muted);font-size:13px}
-.empty b{display:block;color:var(--text);font-size:14px;font-weight:600;margin-bottom:4px}
-
-/* -------- macOS Console Logs -------- */
-.console{border-radius:14px;overflow:hidden;border:1px solid var(--hairline-2);background:var(--term-bg)}
-.console-bar{
-  display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
-  padding:10px 14px;background:var(--term-bar);border-bottom:1px solid rgba(255,255,255,.08);
-}
-.console-left{display:flex;align-items:center;gap:10px}
-.dots{display:flex;gap:6px}
-.dots i{width:10px;height:10px;border-radius:50%}
-.dots i:nth-child(1){background:#ff5f57}
-.dots i:nth-child(2){background:#febc2e}
-.dots i:nth-child(3){background:#28c840}
-.console-name{font-family:var(--font-mono);font-size:11.5px;color:var(--term-muted)}
-.console-right{display:flex;align-items:center;gap:12px}
-.console-right input[type="text"]{
-  height:27px;width:220px;padding:0 10px;border-radius:7px;outline:none;
-  border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.07);
-  color:#f5f5f7;font:inherit;font-size:12px;
-}
-.console-right input[type="text"]:focus{border-color:var(--blue)}
-.console-body{
-  height:420px;overflow:auto;padding:12px 16px;
-  font-family:var(--font-mono);font-size:11.8px;line-height:1.72;color:var(--term-text);
-}
-.ln{display:flex;gap:14px}
-.ln .ts{flex:none;color:#636366;user-select:none}
-.ln .msg{white-space:pre-wrap;word-break:break-word}
-.ln.err .msg{color:#ff6961}
-.ln.req .msg{color:#64d2ff}
-.ln.ok .msg{color:#30d158}
-.ln.dim .msg{color:#8e8e93}
-
-/* iOS Toggle */
-.ios-sw{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--term-muted);cursor:pointer;user-select:none}
-.ios-sw input{display:none}
-.ios-sw i{position:relative;width:32px;height:18px;border-radius:99px;background:rgba(120,120,128,.45);transition:.2s}
-.ios-sw i::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.3);transition:.2s}
-.ios-sw input:checked + i{background:var(--green)}
-.ios-sw input:checked + i::after{left:16px}
-
-/* -------- Online Probe (Apple clean composer) -------- */
-.probe{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.35fr);gap:20px}
-@media (max-width:960px){.probe{grid-template-columns:1fr}}
-.fld label{display:block;font-size:12px;font-weight:500;color:var(--muted);margin-bottom:6px}
-.fld textarea,.fld .inp{
-  width:100%;padding:10px 12px;border-radius:12px;outline:none;
-  border:1px solid var(--hairline-2);background:var(--card-2);color:var(--text);
-  font:inherit;font-size:13px;transition:border-color .15s,background .15s;
-}
-.fld textarea{min-height:120px;resize:vertical;line-height:1.6}
-.fld textarea:focus,.fld .inp:focus{border-color:var(--blue);background:var(--card)}
-.fld select.inp{cursor:pointer}
-.presets{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 14px}
-.preset{
-  border:1px solid var(--hairline-2);background:var(--card);color:var(--text-2);
-  border-radius:var(--r-pill);padding:4px 12px;font:inherit;font-size:12px;cursor:pointer;transition:.15s;
-}
-.preset:hover{border-color:var(--blue);color:var(--blue)}
-.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
-
-.pstats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:12px}
-@media (max-width:640px){.pstats{grid-template-columns:repeat(2,1fr)}}
-.pstat{padding:11px 13px;border-radius:12px;background:var(--card-2)}
-.pstat span{display:block;font-size:11px;color:var(--muted)}
-.pstat b{
-  display:block;margin-top:2px;font-family:var(--font-display);font-size:19px;font-weight:600;
-  letter-spacing:-.02em;font-variant-numeric:tabular-nums;
-}
-.pstat em{font-style:normal;font-size:11px;color:var(--muted);font-weight:400;margin-left:3px}
-
-.think{
-  margin-bottom:10px;padding:0 14px;border-radius:12px;background:var(--card-2);
-}
-.think summary{
-  cursor:pointer;padding:10px 0;font-size:12px;font-weight:600;color:var(--muted);
-  list-style:none;display:flex;align-items:center;justify-content:space-between;
-}
-.think summary::-webkit-details-marker{display:none}
-.think pre{
-  margin:0 0 12px;max-height:180px;overflow:auto;white-space:pre-wrap;
-  font-family:var(--font-text);font-size:12.5px;line-height:1.65;color:var(--muted);
-}
-.bubble{
-  min-height:190px;max-height:360px;overflow:auto;padding:16px 18px;border-radius:14px;
-  background:var(--card-2);white-space:pre-wrap;font-size:14px;line-height:1.7;color:var(--text);
-}
-.bubble .ph{color:var(--tertiary);font-size:13px}
-.typing::after{content:"";display:inline-block;width:2px;height:14px;background:var(--blue);vertical-align:-2px;margin-left:2px;animation:blink 1s steps(2) infinite}
-@keyframes blink{50%{opacity:0}}
-
-/* -------- System Settings List -------- */
-.info{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
-@media (max-width:960px){.info{grid-template-columns:1fr}}
-.group{border-radius:14px;background:var(--card-2);padding:16px 18px}
-.group h4{margin:0 0 8px;font-family:var(--font-display);font-size:13.5px;font-weight:600;color:var(--text)}
-.kv{display:flex;justify-content:space-between;gap:14px;padding:8px 0;border-bottom:1px solid var(--hairline);font-size:12.5px}
-.kv:last-child{border-bottom:0;padding-bottom:2px}
-.kv span{color:var(--muted);white-space:nowrap}
-.kv b{font-weight:500;color:var(--text);text-align:right;font-variant-numeric:tabular-nums;word-break:break-all}
-
-/* -------- Footer -------- */
-.foot{
-  margin-top:24px;padding-top:16px;border-top:1px solid var(--hairline);
-  display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;
-  font-size:12px;color:var(--tertiary);
-}
-.foot b{color:var(--muted);font-weight:500;font-variant-numeric:tabular-nums}
-</style>
+<link rel="stylesheet" href="/studio.css">
 </head>
 <body>
 
 <nav class="nav">
   <div class="nav-in">
     <div class="nav-brand">
-      <div class="nav-logo"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg></div>
+      <div class="nav-logo"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg></div>
       <span class="nav-title">GaudiInfer</span>
       <span class="nav-sep"></span>
       <span class="nav-status"><i class="sdot" id="stDot"></i><span id="stText">连接中…</span></span>
     </div>
+
+    <div class="nav-tabs" id="navTabs">
+      <button data-v="monitor" class="on"><span data-i18n="nav_monitor">硬件监控</span></button>
+      <button data-v="llm"><i class="dot-mini"></i><span data-i18n="nav_llm">27B 对话</span></button>
+      <button data-v="qwen21"><i class="dot-mini"></i><span data-i18n="nav_qwen21">Qwen 2.1 生图</span></button>
+      <button data-v="h3_image"><i class="dot-mini"></i><span data-i18n="nav_h3i">H3 图像</span></button>
+      <button data-v="h3"><i class="dot-mini"></i><span data-i18n="nav_h3">H3 视频</span></button>
+      <button data-v="gallery"><span data-i18n="nav_gallery">作品画廊</span> <span class="cnt" id="cntGal">0</span></button>
+    </div>
+
     <div class="nav-right">
-      <div class="seg" id="segInt">
-        <button data-v="1000" class="on">1s</button>
-        <button data-v="2000">2s</button>
-        <button data-v="5000">5s</button>
+      <div class="hw-mini" id="hwMini" data-i18n-title="hw_mini_tip" title="点击查看完整硬件监控">
+        <span>AIP<b id="mnUtil">–</b></span>
+        <span>HBM<b id="mnHbm">–</b></span>
+        <span><b id="mnTemp">–</b></span>
+        <span><b id="mnPow">–</b></span>
       </div>
-      <button class="btn icon" id="btnPause" title="暂停 / 继续"><i data-ic="pause"></i></button>
-      <button class="btn icon" id="btnTheme" title="深色 / 浅色外观"><i data-ic="moon"></i></button>
-      <button class="btn primary" id="btnQuick">测速</button>
+      <div class="seg" id="segLang" title="中文 / English">
+        <button data-l="zh" class="on">中</button>
+        <button data-l="en">EN</button>
+      </div>
+      <button class="btn icon" id="btnTheme" data-i18n-title="theme_tip" title="切换深浅色主题"><i data-ic="moon"></i></button>
     </div>
   </div>
 </nav>
 
 <main class="page">
-  <header class="hero">
-    <div>
-      <h1>系统概览</h1>
-      <div class="hero-sub">
-        <span id="chModel">qwen3.8-27b</span>
-        <span class="sep">·</span>
-        <span id="chEngine">Direct MME + SRAM</span>
-        <span class="sep">·</span>
-        <span id="hwSub">Intel Gaudi2 HL-225</span>
+  <!-- Live Switching / Loading Progress Banner -->
+  <section class="load-banner" id="loadBanner">
+    <div style="min-width:0;flex:1">
+      <div style="display:flex;align-items:center;gap:10px;font-weight:600;font-size:13.5px">
+        <span class="spinner" id="loadSpin" style="width:16px;height:16px;border-width:2px"></span>
+        <span id="loadMsg">正在切换引擎…</span>
+        <span class="pill" id="loadElapsed" style="display:none"><span data-i18n="elapsed">耗时</span> <b id="loadSec">0s</b></span>
       </div>
+      <div class="load-log" id="loadLog"></div>
     </div>
-    <div class="hero-meta">
-      <span class="pill">最大上下文 <b id="chCtx">–</b></span>
-      <span class="pill">运行时间 <b id="chUp">–</b></span>
-      <span class="pill">更新于 <b id="lastUpd">–</b></span>
-    </div>
-  </header>
-
-  <!-- 4 Primary KPIs -->
-  <section class="kpis">
-    <div class="card kpi">
-      <div class="kpi-head"><span class="kpi-label">Decode 吞吐</span><span class="kpi-tag" id="bDecode">0 req</span></div>
-      <div class="kpi-num"><span id="vDecode">–</span><small>tok/s</small></div>
-      <div class="kpi-foot"><span>近 20 均值<b id="mDecAvg">–</b></span><span>峰值<b id="mDecMax">–</b></span></div>
-      <svg class="spark" id="spDecode" preserveAspectRatio="none"></svg>
-    </div>
-    <div class="card kpi">
-      <div class="kpi-head"><span class="kpi-label">Prefill 吞吐</span><span class="kpi-tag" id="bPrefill">未命中部分</span></div>
-      <div class="kpi-num"><span id="vPrefill">–</span><small>tok/s</small></div>
-      <div class="kpi-foot"><span>峰值<b id="mPreMax">–</b></span><span>Prompt<b id="mPreLen">–</b></span></div>
-      <svg class="spark" id="spPrefill" preserveAspectRatio="none"></svg>
-    </div>
-    <div class="card kpi">
-      <div class="kpi-head"><span class="kpi-label">首字延迟 TTFT</span><span class="kpi-tag">服务端</span></div>
-      <div class="kpi-num"><span id="vTtft">–</span><small>ms</small></div>
-      <div class="kpi-foot"><span>近 20 均值<b id="mTtftAvg">–</b></span><span>前缀命中<b id="mTtftHit">–</b></span></div>
-      <svg class="spark" id="spTtft" preserveAspectRatio="none"></svg>
-    </div>
-    <div class="card kpi">
-      <div class="kpi-head"><span class="kpi-label">投机接受效率</span><span class="kpi-tag">DSpine-b16</span></div>
-      <div class="kpi-num"><span id="vSpec">–</span><small>tok/轮</small></div>
-      <div class="kpi-foot"><span>近 20 均值<b id="mSpecAvg">–</b></span><span>本次轮数<b id="mSpecRounds">–</b></span></div>
-      <svg class="spark" id="spSpec" preserveAspectRatio="none"></svg>
-    </div>
+    <button class="btn sm" id="btnViewLogs" data-i18n="view_logs">查看日志</button>
   </section>
 
-  <!-- Hardware & Capacity -->
-  <section class="grid-main">
-    <div class="card">
-      <div class="card-head">
-        <div>
-          <div class="card-title">Gaudi2 加速器</div>
-          <div class="card-sub" id="hwName">–</div>
-        </div>
-        <div class="legend" id="lgHw"></div>
-      </div>
-
-      <div class="rings">
-        <div class="ring-box">
-          <div class="ring-wrap">
-            <svg viewBox="0 0 100 100"><circle class="ring-bg" cx="50" cy="50" r="42"/><circle class="ring-fg" id="rUtil" cx="50" cy="50" r="42" stroke="var(--blue)" stroke-dasharray="0 264"/></svg>
-            <div class="ring-mid"><div class="ring-val" id="gUtilVal">–</div><div class="ring-unit">%</div></div>
-          </div>
-          <div class="ring-name">AIP 利用率</div>
-          <div class="ring-sub" id="gUtilSub">–</div>
-        </div>
-        <div class="ring-box">
-          <div class="ring-wrap">
-            <svg viewBox="0 0 100 100"><circle class="ring-bg" cx="50" cy="50" r="42"/><circle class="ring-fg" id="rPow" cx="50" cy="50" r="42" stroke="var(--orange)" stroke-dasharray="0 264"/></svg>
-            <div class="ring-mid"><div class="ring-val" id="gPowVal">–</div><div class="ring-unit">W</div></div>
-          </div>
-          <div class="ring-name">整卡功耗</div>
-          <div class="ring-sub" id="gPowSub">–</div>
-        </div>
-        <div class="ring-box">
-          <div class="ring-wrap">
-            <svg viewBox="0 0 100 100"><circle class="ring-bg" cx="50" cy="50" r="42"/><circle class="ring-fg" id="rTemp" cx="50" cy="50" r="42" stroke="var(--red)" stroke-dasharray="0 264"/></svg>
-            <div class="ring-mid"><div class="ring-val" id="gTempVal">–</div><div class="ring-unit">°C</div></div>
-          </div>
-          <div class="ring-name">AIP 温度</div>
-          <div class="ring-sub" id="gTempSub">–</div>
-        </div>
-        <div class="ring-box">
-          <div class="ring-wrap">
-            <svg viewBox="0 0 100 100"><circle class="ring-bg" cx="50" cy="50" r="42"/><circle class="ring-fg" id="rClk" cx="50" cy="50" r="42" stroke="var(--indigo)" stroke-dasharray="0 264"/></svg>
-            <div class="ring-mid"><div class="ring-val" id="gClkVal">–</div><div class="ring-unit">MHz</div></div>
-          </div>
-          <div class="ring-name">SoC 频率</div>
-          <div class="ring-sub" id="gClkSub">–</div>
-        </div>
-      </div>
-
-      <div class="specs">
-        <div class="spec"><span>HBM2E</span><b id="sHbm">–</b></div>
-        <div class="spec"><span>PCIe 链路</span><b id="sPcie">–</b></div>
-        <div class="spec"><span>驱动版本</span><b id="sDrv">–</b></div>
-        <div class="spec"><span>硬重置</span><b id="sReset">–</b></div>
-      </div>
-
-      <div class="chart-box" id="chHw"></div>
+  <!-- ==================== VIEW 1: 27B CHAT + VLM ==================== -->
+  <section class="view" id="v-llm">
+    <div class="need-engine" id="need-llm">
+      <div><b data-i18n="need_llm_t">Qwen3.8-27B 当前未加载</b><div class="card-sub" data-i18n="need_llm_s">单卡 Gaudi2 每次常驻一个模型，点击右侧按钮一键切换（/dev/shm 加载极速就绪）</div></div>
+      <button class="btn primary" onclick="switchEngine('llm')" data-i18n="launch_llm">一键启动 Qwen3.8-27B</button>
     </div>
-
-    <div class="card">
-      <div class="card-head">
-        <div>
-          <div class="card-title">服务容量与缓存</div>
-          <div class="card-sub" id="capSub">–</div>
+    <div class="chat-wrap">
+      <div class="card">
+        <div class="card-head" style="margin-bottom:12px">
+          <div><div class="card-title" data-i18n="chat_cfg_t">Qwen3.8-27B 设置</div><div class="card-sub" data-i18n="chat_cfg_s">FP8 + DSpine-b16 · 视觉多模态</div></div>
+          <button class="btn sm" id="chatClear" data-i18n="chat_new">新对话</button>
         </div>
-        <span class="badge dim" id="capQueue">排队 0</span>
+        <div class="fld">
+          <label><span data-i18n="chat_think">开启深度思考 (Thinking)</span><label class="ios-sw"><input type="checkbox" id="chatThink" checked><i></i></label></label>
+        </div>
+        <div class="row2">
+          <div class="fld"><label data-i18n="chat_temp">温度 Temp</label><input class="inp" id="chatTemp" type="number" value="0.7" min="0" max="2" step="0.1"></div>
+          <div class="fld"><label data-i18n="chat_max">最大输出</label><input class="inp" id="chatMax" type="number" value="2048" min="64" max="8192" step="128"></div>
+        </div>
+        <div class="fld">
+          <label data-i18n="chat_sys">系统提示词 (可选)</label>
+          <textarea id="chatSys" style="min-height:76px" data-i18n-ph="chat_sys_ph" placeholder="例如：你是一个专业视觉与代码助手，回答简洁直接。"></textarea>
+        </div>
+        <div class="fld" style="margin-bottom:0">
+          <label data-i18n="quick_presets">快捷提示</label>
+          <div class="chips" id="chatPresets"></div>
+        </div>
       </div>
 
-      <div class="slots" id="slots"></div>
-
-      <div class="meter">
-        <div class="meter-head"><span>KV Cache（HBM）</span><span id="mtKv">–</span></div>
-        <div class="track"><div class="fill" id="fKv" style="background:var(--blue)"></div></div>
-      </div>
-      <div class="meter">
-        <div class="meter-head"><span>Prefix Cache（Host）</span><span id="mtPc">–</span></div>
-        <div class="track"><div class="fill" id="fPc" style="background:var(--green)"></div></div>
-      </div>
-      <div class="meter">
-        <div class="meter-head"><span>前缀命中率</span><span id="mtHit">–</span></div>
-        <div class="track"><div class="fill" id="fHit" style="background:var(--indigo)"></div></div>
-      </div>
-      <div class="meter">
-        <div class="meter-head"><span>宿主机内存</span><span id="mtRam">–</span></div>
-        <div class="track"><div class="fill" id="fRam" style="background:var(--orange)"></div></div>
-      </div>
-
-      <div class="totals">
-        <div class="tot"><span>累计请求</span><b id="sReq">–</b></div>
-        <div class="tot"><span>累计 Prompt Tokens</span><b id="sPt">–</b></div>
-        <div class="tot"><span>缓存复用 Tokens</span><b id="sCt">–</b></div>
-        <div class="tot"><span>KV 驱逐</span><b id="sEv">–</b></div>
+      <div class="card chat-box">
+        <div class="chat-msgs" id="chatMsgs"></div>
+        <div class="chat-compose">
+          <div class="thumbs" id="chatThumbs" style="margin:0 0 8px"></div>
+          <div class="chat-input-row">
+            <input type="file" id="chatFile" accept="image/*" multiple hidden>
+            <button class="btn" id="chatAddImg" data-i18n="chat_add_img" data-i18n-title="chat_add_img_tip" title="上传图片给 27B 分析">📎 图片</button>
+            <textarea id="chatInput" rows="2" data-i18n-ph="chat_in_ph" placeholder="输入消息…（Enter 发送，Shift+Enter 换行，支持 Ctrl+V 粘贴图片）"></textarea>
+            <button class="btn primary lg" id="chatSend" data-i18n="send">发送</button>
+          </div>
+        </div>
       </div>
     </div>
   </section>
 
-  <!-- Secondary Charts -->
-  <section class="grid-2">
-    <div class="card">
-      <div class="card-head">
-        <div>
-          <div class="card-title">实时吞吐与请求性能</div>
-          <div class="card-sub" id="perfSub">近 5 分钟每秒实时吞吐 · 悬停查看详情</div>
-        </div>
-        <div class="seg" id="segPerf">
-          <button data-v="live" class="on">实时</button>
-          <button data-v="decode">Decode</button>
-          <button data-v="prefill">Prefill</button>
-          <button data-v="ttft">TTFT</button>
-        </div>
-      </div>
-      <div class="legend" id="lgPerf" style="margin:-6px 0 12px"></div>
-      <div class="chart-box" id="chPerf"></div>
+  <!-- ==================== VIEW 2: QWEN-IMAGE-2.1-TURBO ==================== -->
+  <section class="view" id="v-qwen21">
+    <div class="need-engine" id="need-qwen21">
+      <div><b data-i18n="need_q21_t">Qwen-Image-2.1-Turbo 当前未加载</b><div class="card-sub" data-i18n="need_q21_s">1024² 文生图 2.3s、1–4 图编辑 4.2s（占用 22.6 GiB HBM）</div></div>
+      <button class="btn primary" onclick="switchEngine('qwen21')" data-i18n="launch_q21">一键启动 Qwen 2.1 生图</button>
     </div>
-
-    <div class="card">
-      <div class="card-head">
-        <div>
-          <div class="card-title">缓存与并发趋势</div>
-          <div class="card-sub">近 5 分钟实时采样</div>
+    <div class="studio-grid">
+      <div class="card">
+        <div class="card-head" style="margin-bottom:12px">
+          <div><div class="card-title">Qwen-Image-2.1-Turbo</div><div class="card-sub" data-i18n="q21_sub">8 步极速文生图 &amp; 1–4 参考图编辑</div></div>
+          <span class="badge ok" id="q21ModeBadge">文生图 T2I</span>
         </div>
-        <span class="kpi-tag" id="kvNow">–</span>
+        <div class="fld">
+          <label><span data-i18n="q21_prompt_lbl">提示词 (中英文皆可，文字排版能力极强)</span></label>
+          <textarea id="q21Prompt" data-i18n-ph="q21_prompt_ph" placeholder="描述你想生成的画面，或添加参考图后描述如何修改…">一张极简高级商业摄影海报，清晨暖阳照进日式原木咖啡馆，桌上放着一杯拿铁拉花和可颂面包，墙面海报清晰写着“早安咖啡”，浅景深，柔和电影光影</textarea>
+        </div>
+        <div class="chips" id="q21Presets"></div>
+        <div class="fld">
+          <label><span data-i18n="q21_ref_lbl">参考图（可选，最多 4 张 · 放入即自动切换为图像编辑）</span><button class="btn sm" id="q21ClearImgs" style="display:none" data-i18n="clear">清空</button></label>
+          <div class="dropzone" id="q21Drop">
+            <input type="file" id="q21File" accept="image/*" multiple hidden>
+            <b data-i18n="drop_title">点击选择 / 拖拽图片到此处</b>
+            <small data-i18n="q21_drop_sub">无参考图 = 文生图；1–4 张参考图 = 保持主体编辑</small>
+            <div class="thumbs" id="q21Thumbs"></div>
+          </div>
+        </div>
+        <div class="fld">
+          <label data-i18n="res_presets">分辨率预设</label>
+          <div class="chips" id="q21Sizes">
+            <button class="chip on" data-w="1024" data-h="1024">1024² (1:1 · ~2.3s)</button>
+            <button class="chip" data-w="1280" data-h="768">1280×768 (5:3)</button>
+            <button class="chip" data-w="768" data-h="1280">768×1280 (3:5)</button>
+            <button class="chip" data-w="1536" data-h="1024">1536×1024 (3:2)</button>
+            <button class="chip" data-w="1024" data-h="1536">1024×1536 (2:3)</button>
+          </div>
+        </div>
+        <div class="row3">
+          <div class="fld"><label data-i18n="width_lbl">宽 W</label><input class="inp" id="q21W" type="number" value="1024" min="256" max="2048" step="32"></div>
+          <div class="fld"><label data-i18n="height_lbl">高 H</label><input class="inp" id="q21H" type="number" value="1024" min="256" max="2048" step="32"></div>
+          <div class="fld"><label data-i18n="steps_lbl">步数</label><input class="inp" id="q21Steps" type="number" value="8" min="4" max="30"></div>
+        </div>
+        <div class="fld">
+          <label><span data-i18n="seed_lbl">随机种子 Seed</span><button class="btn sm" id="q21RandSeed" data-i18n="rand_seed">🎲 随机</button></label>
+          <input class="inp" id="q21Seed" type="number" value="42">
+        </div>
+        <button class="btn primary lg" id="q21Run" style="width:100%" data-i18n="q21_run">生成图像</button>
       </div>
-      <div class="legend" id="lgKv" style="margin:-6px 0 12px"></div>
-      <div class="chart-box" id="chKv"></div>
+
+      <div class="card">
+        <div class="stage" id="q21Stage">
+          <div class="stage-busy" id="q21Busy"><div class="spinner"></div><b id="q21BusyTxt">正在 Gaudi2 上极速生成…</b></div>
+          <div class="stage-empty" id="q21Empty"><b data-i18n="q21_stage_t">Qwen-Image-2.1-Turbo 画布</b><span data-i18n="q21_stage_s">点击左侧「生成图像」，1024² 约 2.3 秒直出</span></div>
+          <img id="q21OutImg" style="display:none" alt="Qwen2.1 output">
+        </div>
+        <div class="stage-bar" id="q21Bar" style="display:none">
+          <div class="timing-pills" id="q21Timing"></div>
+          <div class="actions" id="q21Actions"></div>
+        </div>
+      </div>
     </div>
   </section>
 
-  <!-- Bottom Tabs -->
-  <section class="card">
-    <div class="tabs-bar">
-      <div class="tabs-seg" id="tabs">
-        <button class="on" data-t="reqs">请求明细 <span class="cnt" id="cntReq">0</span></button>
-        <button data-t="logs">容器日志</button>
-        <button data-t="probe">在线测速</button>
-        <button data-t="info">系统信息</button>
-      </div>
+  <!-- ==================== VIEW 3: MINIMAX-H3-IMAGE ==================== -->
+  <section class="view" id="v-h3_image">
+    <div class="need-engine" id="need-h3_image">
+      <div><b data-i18n="need_h3i_t">MiniMax-H3-Image 当前未加载</b><div class="card-sub" data-i18n="need_h3i_s">33.1B 原生 2K（4.6s）&amp; 4K 16MP（22s）摄影级画质，支持 1–16 张参考图编辑</div></div>
+      <button class="btn primary" onclick="switchEngine('h3_image')" data-i18n="launch_h3i">一键启动 H3 图像</button>
     </div>
-
-    <div class="pane on" id="p-reqs">
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr><th>时间</th><th>Prompt</th><th>前缀命中</th><th>TTFT</th><th>Prefill</th><th>输出</th><th>Decode</th><th>投机</th><th>状态</th></tr>
-          </thead>
-          <tbody id="tbReq"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="pane" id="p-logs">
-      <div class="console">
-        <div class="console-bar">
-          <div class="console-left">
-            <div class="dots"><i></i><i></i><i></i></div>
-            <span class="console-name">gaudiinfer — logs</span>
-          </div>
-          <div class="console-right">
-            <input type="text" id="lgFilter" placeholder="搜索日志…">
-            <label class="ios-sw"><input type="checkbox" id="lgAuto" checked><i></i>自动滚动</label>
+    <div class="studio-grid">
+      <div class="card">
+        <div class="card-head" style="margin-bottom:12px">
+          <div><div class="card-title">MiniMax-H3-Image</div><div class="card-sub" data-i18n="h3i_sub">6 步 PDD · 原生 2K / 4K 16MP · 最多 16 图编辑</div></div>
+          <span class="badge ok" id="h3iModeBadge">文生图 T2I</span>
+        </div>
+        <div class="fld">
+          <label><span data-i18n="h3i_prompt_lbl">提示词（编辑时可用 Picture 1 / Picture 2 指代参考图）</span></label>
+          <textarea id="h3iPrompt" data-i18n-ph="h3i_prompt_ph" placeholder="描述你想生成的 2K/4K 画面，或结合 Picture 1 描述精准编辑…">A photorealistic fine-art photograph of a sunlit Kyoto wooden tea house veranda overlooking a lush moss garden with a small stone koi pond, a handmade ceramic matcha bowl and bamboo whisk resting on a tatami mat, delicate golden afternoon sunlight filtering through maple leaves, ultra-sharp natural lens texture.</textarea>
+        </div>
+        <div class="chips" id="h3iPresets"></div>
+        <div class="fld">
+          <label><span data-i18n="h3i_ref_lbl">参考图（可选，最多 16 张 · 按顺序编号为 Picture 1…16）</span><button class="btn sm" id="h3iClearImgs" style="display:none" data-i18n="clear">清空</button></label>
+          <div class="dropzone" id="h3iDrop">
+            <input type="file" id="h3iFile" accept="image/*" multiple hidden>
+            <b data-i18n="drop_title">点击选择 / 拖拽参考图到此处</b>
+            <small data-i18n="h3i_drop_sub">支持 1–16 张多图融合或单图精准光照/材质/人物编辑</small>
+            <div class="thumbs" id="h3iThumbs"></div>
           </div>
         </div>
-        <div class="console-body" id="lgBody"></div>
+        <div class="fld">
+          <label data-i18n="res_presets">分辨率预设</label>
+          <div class="chips" id="h3iSizes">
+            <button class="chip on" data-w="2048" data-h="2048">2K 1:1 (2048² · ~4.6s)</button>
+            <button class="chip" data-w="2560" data-h="1440">2K 16:9 (2560×1440)</button>
+            <button class="chip" data-w="1440" data-h="2560">2K 9:16 (1440×2560)</button>
+            <button class="chip" data-w="4096" data-h="4096">4K 16MP (4096² · ~22s)</button>
+            <button class="chip" data-w="5120" data-h="2880">16MP 16:9 (5120×2880)</button>
+            <button class="chip" data-w="6272" data-h="2688">16MP 21:9 (6272×2688)</button>
+          </div>
+        </div>
+        <div class="row2">
+          <div class="fld"><label data-i18n="width_lbl">宽 W</label><input class="inp" id="h3iW" type="number" value="2048" min="512" max="6400" step="32"></div>
+          <div class="fld"><label data-i18n="height_lbl">高 H</label><input class="inp" id="h3iH" type="number" value="2048" min="512" max="6400" step="32"></div>
+        </div>
+        <div class="fld">
+          <label><span data-i18n="seed_lbl">随机种子 Seed</span><button class="btn sm" id="h3iRandSeed" data-i18n="rand_seed">🎲 随机</button></label>
+          <input class="inp" id="h3iSeed" type="number" value="101">
+        </div>
+        <button class="btn primary lg" id="h3iRun" style="width:100%" data-i18n="h3i_run">生成 2K / 4K 图像</button>
+      </div>
+
+      <div class="card">
+        <div class="stage" id="h3iStage">
+          <div class="stage-busy" id="h3iBusy"><div class="spinner"></div><b id="h3iBusyTxt">正在 Gaudi2 上渲染高清图像…</b></div>
+          <div class="stage-empty" id="h3iEmpty"><b data-i18n="h3i_stage_t">MiniMax-H3-Image 高清画布</b><span data-i18n="h3i_stage_s">支持原生 2K（4.6s）到 4K 16MP（22s）直出，无需放大器</span></div>
+          <img id="h3iOutImg" style="display:none" alt="H3-Image output">
+        </div>
+        <div class="stage-bar" id="h3iBar" style="display:none">
+          <div class="timing-pills" id="h3iTiming"></div>
+          <div class="actions" id="h3iActions"></div>
+        </div>
       </div>
     </div>
+  </section>
 
-    <div class="pane" id="p-probe">
-      <div class="probe">
-        <div>
+  <!-- ==================== VIEW 4: MINIMAX-H3 VIDEO ==================== -->
+  <section class="view" id="v-h3">
+    <div class="need-engine" id="need-h3">
+      <div><b data-i18n="need_h3_t">MiniMax-H3 视频引擎当前未加载</b><div class="card-sub" data-i18n="need_h3_s">支持文生音视频（T2VA）、首帧生视频（I2VA）与首尾帧过渡（FL2VA），同步生成双声道音频</div></div>
+      <button class="btn primary" onclick="switchEngine('h3')" data-i18n="launch_h3">一键启动 H3 视频</button>
+    </div>
+    <div class="studio-grid">
+      <div class="card">
+        <div class="card-head" style="margin-bottom:12px">
+          <div><div class="card-title" data-i18n="h3_title">MiniMax-H3 音视频工作台</div><div class="card-sub" data-i18n="h3_sub">Direct MME + SRAM · 同步 32kHz 立体声</div></div>
+          <span class="badge ok" id="h3ModeBadge">文生音视频 T2VA</span>
+        </div>
+        <div class="fld">
+          <label data-i18n="h3_prompt_lbl">视频与声音描述 (Prompt)</label>
+          <textarea id="h3Prompt" data-i18n-ph="h3_prompt_ph" placeholder="描述画面运动、镜头语言以及希望听到的环境音/人声/配乐…">A cinematic slow tracking shot of a tranquil Japanese wooden tea house in autumn rain, warm golden paper lanterns glowing softly, maple leaves gently drifting down into a koi pond, soothing sound of gentle rain drops and distant wind chimes.</textarea>
+        </div>
+        <div class="chips" id="h3Presets"></div>
+        <div class="row2" style="margin-bottom:12px">
+          <div>
+            <div class="fld" style="margin-bottom:0">
+              <label><span data-i18n="h3_first_lbl">首帧图 (可选)</span><button class="btn sm" id="h3ClrFirst" style="display:none" data-i18n="clear">清除</button></label>
+              <div class="dropzone" id="h3DropFirst" style="padding:10px">
+                <input type="file" id="h3FileFirst" accept="image/*" hidden>
+                <div id="h3FirstPreview"><small data-i18n="h3_first_ph">点击/拖入首帧</small></div>
+              </div>
+            </div>
+          </div>
+          <div>
+            <div class="fld" style="margin-bottom:0">
+              <label><span data-i18n="h3_last_lbl">尾帧图 (可选)</span><button class="btn sm" id="h3ClrLast" style="display:none" data-i18n="clear">清除</button></label>
+              <div class="dropzone" id="h3DropLast" style="padding:10px">
+                <input type="file" id="h3FileLast" accept="image/*" hidden>
+                <div id="h3LastPreview"><small data-i18n="h3_last_ph">点击/拖入尾帧</small></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="fld">
+          <label data-i18n="h3_lora_lbl">加速 LoRA 预设（单请求热切换）</label>
+          <select class="inp" id="h3Lora"></select>
+        </div>
+        <div class="fld">
+          <label data-i18n="res_presets">分辨率预设</label>
+          <div class="chips" id="h3Sizes">
+            <button class="chip" data-w="832" data-h="480" data-i18n="h3_sz_480h">480p 横屏 (832×480)</button>
+            <button class="chip" data-w="480" data-h="832" data-i18n="h3_sz_480v">480p 竖屏 (480×832)</button>
+            <button class="chip on" data-w="1280" data-h="768">768p 16:9 (1280×768)</button>
+            <button class="chip" data-w="1344" data-h="768" data-i18n="h3_sz_768c">768p 电影 (1344×768)</button>
+            <button class="chip" data-w="768" data-h="1280" data-i18n="h3_sz_768v">768p 竖屏 (768×1280)</button>
+          </div>
+        </div>
+        <div class="row3">
+          <div class="fld"><label data-i18n="width_lbl">宽 W</label><input class="inp" id="h3W" type="number" value="1280" min="320" max="1536" step="32"></div>
+          <div class="fld"><label data-i18n="height_lbl">高 H</label><input class="inp" id="h3H" type="number" value="768" min="320" max="1536" step="32"></div>
+          <div class="fld"><label data-i18n="steps_lbl">步数</label><input class="inp" id="h3Steps" type="number" value="8" min="1" max="50"></div>
+        </div>
+        <div class="row2">
           <div class="fld">
-            <label>输入 Prompt</label>
-            <textarea id="pbPrompt">用三句话解释投机解码（Speculative Decoding）的原理与优势。</textarea>
+            <label><span data-i18n="duration_lbl">时长 Duration</span><b id="h3DurVal">5.0 s</b></label>
+            <input type="range" id="h3Dur" min="3" max="15" step="0.5" value="5" style="width:100%">
           </div>
-          <div class="presets">
-            <button class="preset" data-p="用一句话介绍 Intel Gaudi2。">短问答</button>
-            <button class="preset" data-p="写一篇 350 字左右的科普短文，介绍大模型推理中的 KV Cache 与前缀缓存。">长文生成</button>
-            <button class="preset" data-p="用 Python 实现一个线程安全的 LRU Cache，并附上简洁示例。">代码生成</button>
-            <button class="preset" data-p="进水管 6 小时注满水池，出水管 8 小时放空水池，两管同时打开多久注满？给出推理过程。">数学推理</button>
+          <div class="fld">
+            <label><span data-i18n="seed_lbl">随机种子 Seed</span><button class="btn sm" id="h3RandSeed">🎲</button></label>
+            <input class="inp" id="h3Seed" type="number" value="42">
           </div>
-          <div class="row2">
-            <div class="fld"><label>最大输出 Tokens</label><input class="inp" id="pbMax" type="number" value="256" min="16" max="1024"></div>
-            <div class="fld"><label>采样策略</label><select class="inp" id="pbTemp"><option value="0">贪心 (T = 0)</option><option value="0.7">采样 (T = 0.7)</option><option value="1.0">采样 (T = 1.0)</option></select></div>
-          </div>
-          <button class="btn primary" id="pbRun" style="width:100%;height:38px;font-size:13px">发送流式测试</button>
         </div>
-
-        <div>
-          <div class="pstats">
-            <div class="pstat"><span>TTFT</span><b><span id="pTtft">–</span><em>ms</em></b></div>
-            <div class="pstat"><span>Decode</span><b><span id="pTps">–</span><em>tok/s</em></b></div>
-            <div class="pstat"><span>输出</span><b><span id="pTok">–</span><em>tok</em></b></div>
-            <div class="pstat"><span>总耗时</span><b><span id="pTotal">–</span><em>ms</em></b></div>
-          </div>
-          <details class="think" id="pThinkBox" style="display:none" open>
-            <summary><span>思考过程</span><span id="pThinkLen" style="font-weight:400"></span></summary>
-            <pre id="pThink"></pre>
-          </details>
-          <div class="bubble" id="pOut"><span class="ph">点击「发送流式测试」，模型的实时输出和延迟指标会显示在这里。</span></div>
-        </div>
+        <button class="btn primary lg" id="h3Run" style="width:100%" data-i18n="h3_run">生成音视频 MP4</button>
       </div>
-    </div>
 
-    <div class="pane" id="p-info">
-      <div class="info">
-        <div class="group"><h4>Intel Gaudi2 加速器</h4><div id="iHw"></div></div>
-        <div class="group"><h4>GaudiInfer 推理引擎</h4><div id="iEng"></div></div>
-        <div class="group"><h4>容器与宿主机</h4><div id="iSys"></div></div>
+      <div class="card">
+        <div class="stage" id="h3Stage">
+          <div class="stage-busy" id="h3Busy"><div class="spinner"></div><b id="h3BusyTxt">正在生成视频与双声道音频…</b><span class="card-sub" id="h3BusySub"></span></div>
+          <div class="stage-empty" id="h3Empty"><b data-i18n="h3_stage_t">MiniMax-H3 音视频放映厅</b><span data-i18n="h3_stage_s">支持 480p / 768p、3–15 秒、同步双声道音频，成片自动存入作品画廊</span></div>
+          <video id="h3OutVid" controls loop playsinline style="display:none"></video>
+        </div>
+        <div class="stage-bar" id="h3Bar" style="display:none">
+          <div class="timing-pills" id="h3Timing"></div>
+          <div class="actions" id="h3Actions"></div>
+        </div>
       </div>
     </div>
   </section>
 
-  <footer class="foot">
-    <span>GaudiInfer · Qwen3.8-27B FP8 + DSpine-b16 · Intel Gaudi2</span>
-    <span><b id="footUrl">127.0.0.1:8001</b></span>
-  </footer>
+  <!-- ==================== VIEW 5: GALLERY ==================== -->
+  <section class="view" id="v-gallery">
+    <div class="card">
+      <div class="card-head">
+        <div><div class="card-title" data-i18n="gal_title">作品画廊</div><div class="card-sub" data-i18n="gal_sub">所有生成的 2K/4K 图像与 H3 音视频均持久化保存，可一键转发至任意工作台继续编辑或生成视频</div></div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <div class="seg" id="galFilter">
+            <button data-f="all" class="on" data-i18n="gal_all">全部</button>
+            <button data-f="qwen21">Qwen 2.1</button>
+            <button data-f="h3_image" data-i18n="nav_h3i">H3 图像</button>
+            <button data-f="h3" data-i18n="nav_h3">H3 视频</button>
+          </div>
+          <button class="btn sm" id="galRefresh" data-i18n="refresh">刷新</button>
+        </div>
+      </div>
+      <div class="gal-grid" id="galGrid"></div>
+    </div>
+  </section>
+
+  <!-- ==================== VIEW 6: MONITOR (FULL TELEMETRY) ==================== -->
+  <section class="view on" id="v-monitor">
+    <!-- Unified Single-Card 4-Engine Switcher Strip (Monitor page only) -->
+    <section class="eng-strip" id="engStrip"></section>
+    <header class="hero">
+      <div>
+        <h1 data-i18n="mon_title">Gaudi2 实时监控</h1>
+        <div class="hero-sub">
+          <span id="chModel">–</span>
+          <span>·</span>
+          <span id="chEngine">Direct MME + SRAM</span>
+          <span>·</span>
+          <span id="hwSub">Intel Gaudi2 HL-225</span>
+        </div>
+      </div>
+      <div class="hero-meta">
+        <div class="seg" id="segInt">
+          <button data-v="1000" class="on">1s</button>
+          <button data-v="2000">2s</button>
+          <button data-v="5000">5s</button>
+        </div>
+        <button class="btn icon" id="btnPause" data-i18n-title="pause_tip" title="暂停 / 继续"><i data-ic="pause"></i></button>
+        <span class="pill"><span data-i18n="status_lbl">状态</span> <b id="chCtx">–</b></span>
+        <span class="pill"><span data-i18n="updated_lbl">更新于</span> <b id="lastUpd">–</b></span>
+      </div>
+    </header>
+
+    <!-- 4 Adaptive Primary KPIs -->
+    <section class="kpis">
+      <div class="card kpi">
+        <div class="kpi-head"><span class="kpi-label" id="kl0">Decode 吞吐</span><span class="kpi-tag" id="bDecode">–</span></div>
+        <div class="kpi-num"><span id="vDecode">–</span><small id="ku0">tok/s</small></div>
+        <div class="kpi-foot"><span><span data-i18n="kpi_avg">均值</span><b id="mDecAvg">–</b></span><span><span data-i18n="kpi_peak">极值</span><b id="mDecMax">–</b></span></div>
+        <svg class="spark" id="spDecode" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="card kpi">
+        <div class="kpi-head"><span class="kpi-label" id="kl1">Prefill 吞吐</span><span class="kpi-tag" id="bPrefill">–</span></div>
+        <div class="kpi-num"><span id="vPrefill">–</span><small id="ku1">tok/s</small></div>
+        <div class="kpi-foot"><span><span data-i18n="kpi_spec">规格</span><b id="mPreMax">–</b></span><span><span data-i18n="kpi_detail">详情</span><b id="mPreLen">–</b></span></div>
+        <svg class="spark" id="spPrefill" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="card kpi">
+        <div class="kpi-head"><span class="kpi-label" id="kl2">首字延迟 TTFT</span><span class="kpi-tag" id="bTtft" data-i18n="server_side">服务端</span></div>
+        <div class="kpi-num"><span id="vTtft">–</span><small id="ku2">ms</small></div>
+        <div class="kpi-foot"><span><span data-i18n="kpi_sub">副指标</span><b id="mTtftAvg">–</b></span><span><span data-i18n="kpi_hit">命中/编码</span><b id="mTtftHit">–</b></span></div>
+        <svg class="spark" id="spTtft" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="card kpi">
+        <div class="kpi-head"><span class="kpi-label" id="kl3">投机接受效率</span><span class="kpi-tag" id="bSpec">–</span></div>
+        <div class="kpi-num"><span id="vSpec">–</span><small id="ku3">tok/轮</small></div>
+        <div class="kpi-foot"><span><span data-i18n="kpi_stat">统计</span><b id="mSpecAvg">–</b></span><span><span data-i18n="kpi_queue">轮数/排队</span><b id="mSpecRounds">–</b></span></div>
+        <svg class="spark" id="spSpec" preserveAspectRatio="none"></svg>
+      </div>
+    </section>
+
+    <section class="grid-main">
+      <div class="card">
+        <div class="card-head">
+          <div><div class="card-title" data-i18n="hw_card_t">Gaudi2 加速器</div><div class="card-sub" id="hwName">–</div></div>
+          <div class="legend" id="lgHw"></div>
+        </div>
+        <div class="rings">
+          <div class="ring-box">
+            <div class="ring-wrap">
+              <svg viewBox="0 0 100 100"><circle class="ring-bg" cx="50" cy="50" r="42"/><circle class="ring-fg" id="rUtil" cx="50" cy="50" r="42" stroke="var(--blue)" stroke-dasharray="0 264"/></svg>
+              <div class="ring-mid"><div class="ring-val" id="gUtilVal">–</div><div class="ring-unit">%</div></div>
+            </div>
+            <div class="ring-name" data-i18n="ring_util">AIP 利用率</div>
+            <div class="ring-sub" id="gUtilSub">–</div>
+          </div>
+          <div class="ring-box">
+            <div class="ring-wrap">
+              <svg viewBox="0 0 100 100"><circle class="ring-bg" cx="50" cy="50" r="42"/><circle class="ring-fg" id="rPow" cx="50" cy="50" r="42" stroke="var(--orange)" stroke-dasharray="0 264"/></svg>
+              <div class="ring-mid"><div class="ring-val" id="gPowVal">–</div><div class="ring-unit">W</div></div>
+            </div>
+            <div class="ring-name" data-i18n="ring_pow">整卡功耗</div>
+            <div class="ring-sub" id="gPowSub">–</div>
+          </div>
+          <div class="ring-box">
+            <div class="ring-wrap">
+              <svg viewBox="0 0 100 100"><circle class="ring-bg" cx="50" cy="50" r="42"/><circle class="ring-fg" id="rTemp" cx="50" cy="50" r="42" stroke="var(--red)" stroke-dasharray="0 264"/></svg>
+              <div class="ring-mid"><div class="ring-val" id="gTempVal">–</div><div class="ring-unit">°C</div></div>
+            </div>
+            <div class="ring-name" data-i18n="ring_temp">AIP 温度</div>
+            <div class="ring-sub" id="gTempSub">–</div>
+          </div>
+          <div class="ring-box">
+            <div class="ring-wrap">
+              <svg viewBox="0 0 100 100"><circle class="ring-bg" cx="50" cy="50" r="42"/><circle class="ring-fg" id="rClk" cx="50" cy="50" r="42" stroke="var(--indigo)" stroke-dasharray="0 264"/></svg>
+              <div class="ring-mid"><div class="ring-val" id="gClkVal">–</div><div class="ring-unit">MHz</div></div>
+            </div>
+            <div class="ring-name" data-i18n="ring_clk">SoC 频率</div>
+            <div class="ring-sub" id="gClkSub">–</div>
+          </div>
+        </div>
+        <div class="specs">
+          <div class="spec"><span data-i18n="spec_hbm">HBM2E 已用</span><b id="sHbm">–</b></div>
+          <div class="spec"><span data-i18n="spec_pcie">PCIe 链路</span><b id="sPcie">–</b></div>
+          <div class="spec"><span data-i18n="spec_drv">驱动版本</span><b id="sDrv">–</b></div>
+          <div class="spec"><span data-i18n="spec_rst">硬重置</span><b id="sReset">–</b></div>
+        </div>
+        <div class="chart-box" id="chHw"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div><div class="card-title" data-i18n="cap_title">资源与显存占用</div><div class="card-sub" id="capSub">–</div></div>
+          <span class="badge dim" id="capQueue">空闲</span>
+        </div>
+        <div class="slots" id="slots"></div>
+        <div class="meter">
+          <div class="meter-head"><span>Gaudi2 HBM2E</span><span id="mtHbm">–</span></div>
+          <div class="track"><div class="fill" id="fHbm" style="background:var(--purple)"></div></div>
+        </div>
+        <div class="meter">
+          <div class="meter-head"><span>KV Cache (27B)</span><span id="mtKv">–</span></div>
+          <div class="track"><div class="fill" id="fKv" style="background:var(--blue)"></div></div>
+        </div>
+        <div class="meter">
+          <div class="meter-head"><span>Host Prefix Cache</span><span id="mtPc">–</span></div>
+          <div class="track"><div class="fill" id="fPc" style="background:var(--green)"></div></div>
+        </div>
+        <div class="meter">
+          <div class="meter-head"><span data-i18n="host_ram">宿主机内存</span><span id="mtRam">–</span></div>
+          <div class="track"><div class="fill" id="fRam" style="background:var(--orange)"></div></div>
+        </div>
+        <div class="totals">
+          <div class="tot"><span data-i18n="tot_req">累计请求/任务</span><b id="sReq">–</b></div>
+          <div class="tot"><span data-i18n="tot_cpu">宿主机 CPU</span><b id="sCpu">–</b></div>
+          <div class="tot"><span data-i18n="tot_shm">/dev/shm 缓存</span><b id="sShm">–</b></div>
+          <div class="tot"><span data-i18n="tot_gal">画廊作品数</span><b id="sGal">–</b></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="card">
+        <div class="card-head">
+          <div><div class="card-title" data-i18n="perf_title">实时吞吐曲线</div><div class="card-sub" id="perfSub" data-i18n="perf_sub">近 5 分钟每秒实时采样</div></div>
+          <div class="seg" id="segPerf">
+            <button data-v="live" class="on" data-i18n="perf_live">实时</button>
+            <button data-v="decode">Decode</button>
+            <button data-v="prefill">Prefill</button>
+            <button data-v="ttft">TTFT</button>
+          </div>
+        </div>
+        <div class="legend" id="lgPerf" style="margin:-6px 0 12px"></div>
+        <div class="chart-box" id="chPerf"></div>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <div><div class="card-title" data-i18n="kv_title">HBM 与缓存趋势</div><div class="card-sub" data-i18n="perf_sub">近 5 分钟每秒实时采样</div></div>
+          <span class="kpi-tag" id="kvNow">–</span>
+        </div>
+        <div class="legend" id="lgKv" style="margin:-6px 0 12px"></div>
+        <div class="chart-box" id="chKv"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="tabs-bar">
+        <div class="tabs-seg" id="tabs">
+          <button class="on" data-t="reqs"><span data-i18n="tab_reqs">请求 / 任务明细</span> <span class="cnt" id="cntReq">0</span></button>
+          <button data-t="logs" data-i18n="tab_logs">引擎实时日志</button>
+          <button data-t="info" data-i18n="tab_info">系统信息</button>
+        </div>
+      </div>
+
+      <div class="pane on" id="p-reqs">
+        <div class="table-wrap">
+          <table>
+            <thead><tr id="reqHead"></tr></thead>
+            <tbody id="tbReq"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="pane" id="p-logs">
+        <div class="console">
+          <div class="console-bar">
+            <div class="console-left"><div class="dots"><i></i><i></i><i></i></div><span class="console-name" id="logTitle">gaudiinfer — live logs</span></div>
+            <div class="console-right">
+              <input type="text" id="lgFilter" data-i18n-ph="log_filter_ph" placeholder="搜索日志…">
+              <label class="ios-sw"><input type="checkbox" id="lgAuto" checked><i></i><span data-i18n="auto_scroll">自动滚动</span></label>
+            </div>
+          </div>
+          <div class="console-body" id="lgBody"></div>
+        </div>
+      </div>
+
+      <div class="pane" id="p-info">
+        <div class="info">
+          <div class="group"><h4 data-i18n="info_hw">Intel Gaudi2 加速器</h4><div id="iHw"></div></div>
+          <div class="group"><h4 data-i18n="info_eng">当前活跃推理引擎</h4><div id="iEng"></div></div>
+          <div class="group"><h4 data-i18n="info_sys">宿主机与存储</h4><div id="iSys"></div></div>
+        </div>
+      </div>
+    </section>
+  </section>
 </main>
 
-<script>
-const ICONS = {
-  pause:'<path d="M9 5v14M15 5v14"/>',
-  play:'<path d="m7 4 13 8-13 8z"/>',
-  sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
-  moon:'<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>',
-};
-const ico = (n, s = 14) => `<svg class="ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${ICONS[n] || ''}</svg>`;
-document.querySelectorAll('[data-ic]').forEach(el => { el.outerHTML = ico(el.dataset.ic, +(el.dataset.s || 14)); });
+<!-- Fullscreen Lightbox -->
+<div class="modal" id="lightbox">
+  <div class="modal-in" onclick="event.stopPropagation()">
+    <img id="lbImg" style="display:none" alt="">
+    <video id="lbVid" controls loop playsinline style="display:none"></video>
+    <div class="modal-cap" id="lbCap"></div>
+    <button class="btn" onclick="closeLightbox()" data-i18n="close_esc">关闭 (Esc)</button>
+  </div>
+</div>
 
-const $ = id => document.getElementById(id);
-const cssv = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const fmt = (v, d = 0) => (v == null || isNaN(v)) ? '–' : Number(v).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
-const toDate = t => typeof t === 'number' ? new Date(t * 1000) : new Date(t);
-const hms = t => { const d = toDate(t); return isNaN(d) ? '–' : d.toLocaleTimeString('zh-CN', { hour12: false }); };
-const hm = t => { const d = toDate(t); return isNaN(d) ? '' : d.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' }); };
-const uptime = iso => {
-  if (!iso) return '–';
-  const s = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
-  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
-  return d ? `${d}天 ${h}时` : h ? `${h}时 ${m}分` : `${m}分 ${s % 60}秒`;
-};
-const avg = (a, f) => a.length ? a.reduce((s, x) => s + f(x), 0) / a.length : null;
-function alpha(c, a) {
-  if (!c || c[0] !== '#') return c;
-  let h = c.slice(1); if (h.length === 3) h = h.split('').map(x => x + x).join('');
-  const n = parseInt(h, 16); return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`;
-}
-function niceMax(v) {
-  if (!(v > 0)) return 1;
-  v *= 1.12; const p = Math.pow(10, Math.floor(Math.log10(v))), m = v / p;
-  return [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].find(s => s >= m - 1e-9) * p;
-}
-function shortNum(v) {
-  const a = Math.abs(v);
-  if (a >= 10000) return (v / 1000).toFixed(0) + 'k';
-  if (a >= 1000) return (v / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
-  if (a >= 10 || Number.isInteger(v)) return String(Math.round(v));
-  return v.toFixed(1);
-}
-function tween(el, to, dec = 0) {
-  if (to == null || isNaN(to)) { el.textContent = '–'; el._v = null; return; }
-  const from = el._v ?? to; el._v = to;
-  cancelAnimationFrame(el._raf);
-  const t0 = performance.now(), dur = 450;
-  const step = now => {
-    const k = Math.min(1, (now - t0) / dur), e = 1 - Math.pow(1 - k, 3);
-    el.textContent = fmt(from + (to - from) * e, dec);
-    if (k < 1) el._raf = requestAnimationFrame(step);
-  };
-  el._raf = requestAnimationFrame(step);
-}
+<div class="toast" id="toast"></div>
 
-function spark(svg, values, color) {
-  const w = Math.max(40, svg.clientWidth || 300), h = 48;
-  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
-  if (!values.length) { svg.innerHTML = ''; return; }
-  const vs = values.length === 1 ? [values[0], values[0]] : values;
-  const max = Math.max(...vs) * 1.18 || 1;
-  const pts = vs.map((v, i) => [i * w / (vs.length - 1), h - 4 - (v / max) * (h - 12)]);
-  let d = `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
-  for (let i = 1; i < pts.length; i++) {
-    const [x0, y0] = pts[i - 1], [x1, y1] = pts[i], mx = (x0 + x1) / 2;
-    d += ` C${mx.toFixed(1)},${y0.toFixed(1)} ${mx.toFixed(1)},${y1.toFixed(1)} ${x1.toFixed(1)},${y1.toFixed(1)}`;
-  }
-  const id = svg.id + 'G';
-  svg.innerHTML = `<defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${color}" stop-opacity=".18"/><stop offset="1" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>`
-    + `<path d="${d} L${w},${h} L0,${h} Z" fill="url(#${id})"/>`
-    + `<path d="${d}" fill="none" stroke="${color}" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>`;
-}
-
-const RING_C = 2 * Math.PI * 42;
-function setRing(id, ratio, val, sub) {
-  const r = Math.max(0, Math.min(1, ratio || 0));
-  $(id).setAttribute('stroke-dasharray', `${(RING_C * r).toFixed(1)} ${RING_C.toFixed(1)}`);
-  const k = id.slice(1);
-  $(`g${k}Val`).textContent = val;
-  $(`g${k}Sub`).textContent = sub;
-}
-function legend(el, series) {
-  el.innerHTML = series.map(s => `<span><i style="background:${cssv(s.color)}"></i>${esc(s.label)}</span>`).join('');
-}
-
-/* -------- Clean Apple Canvas Chart -------- */
-function smooth(ctx, pts) {
-  ctx.moveTo(pts[0][0], pts[0][1]);
-  for (let i = 1; i < pts.length; i++) {
-    const [x0, y0] = pts[i - 1], [x1, y1] = pts[i], mx = (x0 + x1) / 2;
-    ctx.bezierCurveTo(mx, y0, mx, y1, x1, y1);
-  }
-}
-function roundTop(ctx, x, y, w, h, r) {
-  ctx.beginPath(); if (h <= 0.5) return;
-  r = Math.min(r, h, w / 2);
-  ctx.moveTo(x, y + h); ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
-  ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r); ctx.lineTo(x + w, y + h); ctx.closePath();
-}
-
-class Chart {
-  constructor(box, opts) {
-    this.box = box; this.o = opts; this.data = []; this.mx = null;
-    this.cv = document.createElement('canvas'); box.appendChild(this.cv);
-    this.tip = document.createElement('div'); this.tip.className = 'tip'; box.appendChild(this.tip);
-    this.cv.addEventListener('mousemove', e => { const r = this.cv.getBoundingClientRect(); this.mx = e.clientX - r.left; this.my = e.clientY - r.top; this.draw(); });
-    this.cv.addEventListener('mouseleave', () => { this.mx = null; this.tip.style.opacity = 0; this.draw(); });
-  }
-  set(data, patch) { this.data = data || []; if (patch) Object.assign(this.o, patch); this.draw(); }
-  draw() {
-    const o = this.o, data = this.data, cv = this.cv;
-    const W = this.box.clientWidth, H = this.box.clientHeight; if (!W || !H) return;
-    const dpr = window.devicePixelRatio || 1;
-    if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
-    const ctx = cv.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
-    const series = o.series.map(s => ({ ...s, axis: s.axis || 'l', col: cssv(s.color) }));
-    const hasR = series.some(s => s.axis === 'r');
-    const P = { l: 42, r: hasR ? 38 : 10, t: 10, b: 24 }, pw = W - P.l - P.r, ph = H - P.t - P.b;
-    const grid = cssv('--grid'), tert = cssv('--tertiary'), fnt = cssv('--font-text');
-    const n = data.length;
-    if (!n) {
-      ctx.fillStyle = cssv('--muted'); ctx.font = `13px ${fnt}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(o.empty || '等待采样数据…', W / 2, H / 2); this.tip.style.opacity = 0; return;
-    }
-    const vals = ax => series.filter(s => s.axis === ax).flatMap(s => data.map(d => +s.get(d) || 0));
-    const lMax = o.lMax ? o.lMax(data) : niceMax(Math.max(0, ...vals('l')));
-    const rMax = hasR ? (o.rMax ? o.rMax(data) : niceMax(Math.max(0, ...vals('r')))) : 1;
-
-    ctx.font = `11px ${fnt}`; ctx.lineWidth = 1;
-    for (let i = 0; i <= 4; i++) {
-      const y = Math.round(P.t + ph * i / 4) + .5;
-      ctx.strokeStyle = grid;
-      ctx.beginPath(); ctx.moveTo(P.l, y); ctx.lineTo(W - P.r, y); ctx.stroke();
-      ctx.fillStyle = tert; ctx.textBaseline = 'middle';
-      ctx.textAlign = 'right'; ctx.fillText(shortNum(lMax * (1 - i / 4)), P.l - 8, y);
-      if (hasR) { ctx.textAlign = 'left'; ctx.fillText(shortNum(rMax * (1 - i / 4)), W - P.r + 8, y); }
-    }
-
-    const cat = o.mode === 'cat', slot = pw / n;
-    const X = i => cat ? P.l + slot * (i + .5) : (n === 1 ? P.l + pw / 2 : P.l + pw * i / (n - 1));
-    const Y = (v, ax) => { const m = ax === 'r' ? rMax : lMax; return P.t + ph * (1 - Math.max(0, Math.min(v, m)) / m); };
-
-    let hi = -1;
-    if (this.mx != null && this.mx >= P.l - 10 && this.mx <= W - P.r + 10) {
-      hi = cat ? Math.floor((this.mx - P.l) / slot) : Math.round((this.mx - P.l) / pw * (n - 1));
-      hi = Math.max(0, Math.min(n - 1, hi));
-    }
-
-    ctx.fillStyle = tert; ctx.textBaseline = 'top';
-    const ticks = Math.min(n, cat ? 6 : 5);
-    for (let k = 0; k < ticks; k++) {
-      const i = ticks === 1 ? n - 1 : Math.round(k * (n - 1) / (ticks - 1));
-      ctx.textAlign = cat ? 'center' : (k === 0 ? 'left' : k === ticks - 1 ? 'right' : 'center');
-      ctx.fillText(o.xLabel(data[i], i), X(i), H - P.b + 8);
-    }
-
-    if (hi >= 0 && cat) {
-      ctx.fillStyle = alpha(cssv('--text'), .04);
-      ctx.fillRect(X(hi) - slot / 2, P.t, slot, ph);
-    }
-
-    series.filter(s => s.type === 'bar').forEach(s => {
-      const bw = Math.max(4, Math.min(20, slot * .56));
-      data.forEach((d, i) => {
-        const y = Y(+s.get(d) || 0, s.axis), x = X(i) - bw / 2, h = P.t + ph - y;
-        ctx.fillStyle = alpha(s.col, hi === i ? 1 : .78);
-        roundTop(ctx, x, y, bw, h, 4); ctx.fill();
-      });
-    });
-
-    series.filter(s => s.type !== 'bar').forEach(s => {
-      const pts = data.map((d, i) => [X(i), Y(+s.get(d) || 0, s.axis)]);
-      if (s.type === 'area' && pts.length > 1) {
-        const g = ctx.createLinearGradient(0, P.t, 0, P.t + ph);
-        g.addColorStop(0, alpha(s.col, .16)); g.addColorStop(1, alpha(s.col, 0));
-        ctx.beginPath(); smooth(ctx, pts); ctx.lineTo(pts[pts.length - 1][0], P.t + ph); ctx.lineTo(pts[0][0], P.t + ph); ctx.closePath();
-        ctx.fillStyle = g; ctx.fill();
-      }
-      ctx.beginPath(); smooth(ctx, pts);
-      ctx.strokeStyle = s.col; ctx.lineWidth = s.width || 2; ctx.lineJoin = 'round';
-      ctx.setLineDash(s.dash || []); ctx.stroke(); ctx.setLineDash([]);
-      if (cat || pts.length === 1) pts.forEach(([x, y]) => { ctx.beginPath(); ctx.arc(x, y, 2.5, 0, 7); ctx.fillStyle = s.col; ctx.fill(); });
-    });
-
-    if (hi < 0) { this.tip.style.opacity = 0; return; }
-    const x = X(hi);
-    if (!cat) {
-      ctx.strokeStyle = cssv('--hairline-2');
-      ctx.beginPath(); ctx.moveTo(Math.round(x) + .5, P.t); ctx.lineTo(Math.round(x) + .5, P.t + ph); ctx.stroke();
-    }
-    series.filter(s => s.type !== 'bar').forEach(s => {
-      ctx.beginPath(); ctx.arc(x, Y(+s.get(data[hi]) || 0, s.axis), 4, 0, 7);
-      ctx.fillStyle = cssv('--card'); ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = s.col; ctx.stroke();
-    });
-
-    const d = data[hi];
-    this.tip.innerHTML = `<div class="tip-t">${esc(o.tipTitle ? o.tipTitle(d, hi) : o.xLabel(d, hi))}</div>`
-      + series.map(s => `<div class="tip-r"><span><i style="background:${s.col}"></i>${esc(s.label)}</span><b>${esc(s.fmt ? s.fmt(s.get(d)) : fmt(s.get(d), 1))}</b></div>`).join('')
-      + (o.tipExtra ? `<div class="tip-x">${o.tipExtra(d)}</div>` : '');
-    this.tip.style.opacity = 1;
-    const tw = this.tip.offsetWidth, th = this.tip.offsetHeight;
-    let tx = x + 14; if (tx + tw > W - 4) tx = x - tw - 14;
-    const ty = Math.max(4, Math.min(H - th - 4, (this.my ?? P.t) - th / 2));
-    this.tip.style.transform = `translate(${Math.max(4, tx)}px,${ty}px)`;
-  }
-}
-
-/* -------- State & Charts -------- */
-const S = { paused: false, interval: 1000, timer: null, snap: null, tab: 'reqs', perf: 'live', probing: false };
-
-const hwSeries = [
-  { label: '功耗', color: '--orange', type: 'area', get: d => d.power, fmt: v => fmt(v) + ' W' },
-  { label: 'AIP 利用率', color: '--blue', axis: 'r', get: d => d.util, fmt: v => fmt(v) + ' %' },
-  { label: '温度', color: '--red', axis: 'r', get: d => d.temp, fmt: v => fmt(v) + ' °C' },
-];
-const chHw = new Chart($('chHw'), {
-  series: hwSeries, xLabel: d => hms(d.t),
-  lMax: d => niceMax(Math.max(100, ...d.map(x => x.power || 0))), rMax: () => 100,
-});
-
-const kvSeries = [
-  { label: 'KV Cache', color: '--blue', type: 'area', get: d => d.kv_gib, fmt: v => fmt(v, 2) + ' GiB' },
-  { label: 'Host Prefix', color: '--green', get: d => d.prefix_gib, fmt: v => fmt(v, 2) + ' GiB' },
-  { label: '活跃槽位', color: '--indigo', axis: 'r', dash: [4, 4], get: d => d.active_slots, fmt: v => fmt(v) },
-];
-const chKv = new Chart($('chKv'), {
-  series: kvSeries, xLabel: d => hms(d.t),
-  lMax: d => niceMax(Math.max(2, ...d.map(x => Math.max(x.kv_gib || 0, x.prefix_gib || 0)))),
-  rMax: () => (S.snap?.engine?.stats?.slots?.total) || 8,
-});
-
-const PERF = {
-  live: [
-    { label: '实时 Decode', color: '--blue', type: 'area', get: d => d.decode_tps || 0, fmt: v => fmt(v, 1) + ' tok/s' },
-    { label: '实时 Prefill', color: '--green', axis: 'r', get: d => d.prefill_tps || 0, fmt: v => fmt(v) + ' tok/s' },
-  ],
-  decode: [
-    { label: 'Decode', color: '--blue', type: 'bar', get: d => d.decode_tps, fmt: v => fmt(v, 1) + ' tok/s' },
-    { label: '投机接受', color: '--indigo', axis: 'r', get: d => d.tok_per_round, fmt: v => fmt(v, 2) + ' tok/轮' },
-  ],
-  prefill: [
-    { label: 'Prefill', color: '--blue', type: 'bar', get: d => d.prefill_tps, fmt: v => fmt(v) + ' tok/s' },
-    { label: 'Prompt', color: '--green', axis: 'r', get: d => d.prompt_tokens, fmt: v => fmt(v) + ' tok' },
-  ],
-  ttft: [
-    { label: 'TTFT', color: '--orange', type: 'bar', get: d => d.prompt_ms, fmt: v => fmt(v) + ' ms' },
-    { label: '前缀命中率', color: '--green', axis: 'r', get: d => d.cached_pct, fmt: v => fmt(v, 1) + ' %' },
-  ],
-};
-const chPerf = new Chart($('chPerf'), {
-  mode: 'time', series: PERF.live, empty: '等待采样数据…',
-  xLabel: d => hms(d.t), tipTitle: d => hms(d.t),
-  tipExtra: null,
-  lMax: d => niceMax(Math.max(100, ...d.map(x => x.decode_tps || 0))),
-  rMax: d => niceMax(Math.max(1000, ...d.map(x => x.prefill_tps || 0))),
-});
-
-function setPerf(mode) {
-  S.perf = mode;
-  document.querySelectorAll('#segPerf button').forEach(b => b.classList.toggle('on', b.dataset.v === mode));
-  chPerf.o.series = PERF[mode];
-  if (mode === 'live') {
-    chPerf.o.mode = 'time';
-    chPerf.o.empty = '等待采样数据…';
-    chPerf.o.xLabel = d => hms(d.t);
-    chPerf.o.tipTitle = d => hms(d.t);
-    chPerf.o.tipExtra = null;
-    chPerf.o.lMax = d => niceMax(Math.max(100, ...d.map(x => x.decode_tps || 0)));
-    chPerf.o.rMax = d => niceMax(Math.max(1000, ...d.map(x => x.prefill_tps || 0)));
-    $('perfSub').textContent = '近 5 分钟每秒实时吞吐 · 悬停查看详情';
-  } else {
-    chPerf.o.mode = 'cat';
-    chPerf.o.empty = '暂无请求，点击右上角「测速」即可体验';
-    chPerf.o.xLabel = d => hm(d.ts);
-    chPerf.o.tipTitle = d => hms(d.ts);
-    chPerf.o.tipExtra = d => `Prompt ${fmt(d.prompt_tokens)} · 命中 ${fmt(d.cached_tokens)} · 输出 ${fmt(d.gen_tokens)}`;
-    chPerf.o.lMax = null;
-    chPerf.o.rMax = mode === 'decode' ? (d => niceMax(Math.max(4, ...d.map(x => x.tok_per_round)))) : mode === 'ttft' ? (() => 100) : null;
-    $('perfSub').textContent = '最近 40 条已完成请求 · 悬停查看详情';
-  }
-  legend($('lgPerf'), PERF[mode]);
-  if (S.snap) chPerf.set(mode === 'live' ? (S.snap.history || []) : (S.snap.requests || []).slice(0, 40).reverse());
-}
-
-const pcieGen = s => { const v = parseFloat(s); return v >= 32 ? 'Gen5' : v >= 16 ? 'Gen4' : v >= 8 ? 'Gen3' : v >= 5 ? 'Gen2' : v ? 'Gen1' : ''; };
-const kvRows = rows => rows.map(([k, v]) => `<div class="kv"><span>${esc(k)}</span><b>${esc(v ?? '–')}</b></div>`).join('');
-let slotKey = '';
-
-function render(snap) {
-  S.snap = snap;
-  const E = snap.engine || {}, st = E.stats || {}, sl = st.slots || {}, pc = st.prefix_cache || {};
-  const hw = snap.hardware || {}, host = snap.host || {}, ct = snap.container || {}, bn = snap.banner || {};
-  const reqs = snap.requests || [], hist = snap.history || [];
-
-  // Nav & Hero
-  $('stDot').className = 'sdot ' + (E.healthy ? 'ok' : 'err');
-  $('stText').textContent = E.healthy ? '运行正常' : '服务离线';
-  $('chModel').textContent = E.model || '–';
-  $('chEngine').textContent = bn.direct_engine ? 'Direct MME + SRAM' : (E.healthy ? 'Synapse Graph' : '–');
-  $('hwSub').textContent = `Intel Gaudi2 ${hw.name || 'HL-225'}`;
-  $('chCtx').textContent = E.max_model_len ? Math.round(E.max_model_len / 1024) + 'K' : '–';
-  $('chUp').textContent = ct.available ? uptime(ct.started_at) : '–';
-  $('lastUpd').textContent = hms(snap.timestamp || Date.now() / 1000);
-  $('footUrl').textContent = (E.url || '').replace(/^https?:\/\//, '');
-
-  // KPIs (real-time live rate when generating/prefilling, smooth 1s sparkline)
-  const lv = snap.live || {};
-  const chron = reqs.slice(0, 40).reverse(), last = reqs[0], recent = reqs.slice(0, 20);
-  const liveDecActive = lv.supported && ((lv.decode_tps || 0) > 0 || (lv.decoding_slots || 0) > 0);
-  const livePreActive = lv.supported && ((lv.prefill_tps || 0) > 0 || (lv.prefilling_slots || 0) > 0);
-
-  if (lv.supported) {
-    tween($('vDecode'), lv.decode_tps || 0, 1);
-    $('bDecode').innerHTML = liveDecActive
-      ? `<span style="color:var(--green);font-weight:600">● 实时 · ${Math.max(1, lv.decoding_slots || 0)} 路</span>`
-      : `空闲 · 上次 ${last ? fmt(last.decode_tps, 1) : '–'}`;
-    spark($('spDecode'), hist.slice(-60).map(p => p.decode_tps || 0), cssv('--blue'));
-  } else {
-    tween($('vDecode'), last?.decode_tps, 1);
-    $('bDecode').textContent = `${reqs.length} 次`;
-    spark($('spDecode'), chron.map(r => r.decode_tps), cssv('--blue'));
-  }
-  $('mDecAvg').textContent = fmt(avg(recent, r => r.decode_tps), 1);
-  $('mDecMax').textContent = reqs.length ? fmt(Math.max(...reqs.map(r => r.decode_tps)), 1) : '–';
-
-  const pre = reqs.filter(r => r.prefill_tps > 0);
-  if (lv.supported) {
-    tween($('vPrefill'), livePreActive ? (lv.prefill_tps || 0) : (pre[0]?.prefill_tps ?? 0), 0);
-    $('bPrefill').innerHTML = livePreActive
-      ? `<span style="color:var(--green);font-weight:600">● 实时</span>`
-      : `最近一次`;
-    spark($('spPrefill'), hist.slice(-60).map(p => p.prefill_tps || 0), cssv('--cyan'));
-  } else {
-    tween($('vPrefill'), pre[0]?.prefill_tps, 0);
-    $('bPrefill').textContent = '未命中部分';
-    spark($('spPrefill'), chron.map(r => r.prefill_tps), cssv('--cyan'));
-  }
-  $('mPreMax').textContent = pre.length ? fmt(Math.max(...pre.map(r => r.prefill_tps))) : '–';
-  $('mPreLen').textContent = pre[0] ? fmt(pre[0].prompt_tokens) : '–';
-
-  tween($('vTtft'), last?.prompt_ms, 0);
-  $('mTtftAvg').textContent = recent.length ? fmt(avg(recent, r => r.prompt_ms)) + ' ms' : '–';
-  $('mTtftHit').textContent = fmt((st.token_hit_rate || 0) * 100, 1) + '%';
-  spark($('spTtft'), chron.map(r => r.prompt_ms), cssv('--orange'));
-
-  tween($('vSpec'), (liveDecActive && lv.tok_per_round > 0) ? lv.tok_per_round : last?.tok_per_round, 2);
-  $('mSpecAvg').textContent = fmt(avg(recent, r => r.tok_per_round), 2);
-  $('mSpecRounds').textContent = last ? fmt(last.rounds) : '–';
-  spark($('spSpec'), chron.map(r => r.tok_per_round), cssv('--indigo'));
-
-  // Hardware Rings
-  const pmax = hw.power_max_w || 600, cmax = hw.clock_max_mhz || hw.clock_mhz || 1;
-  const powSub = (hw.power_54v_w != null && hw.power_12v_w != null)
-    ? `54V ${fmt(hw.power_54v_w)}W + 12V ${fmt(hw.power_12v_w)}W`
-    : `上限 ${fmt(pmax)} W`;
-  setRing('rUtil', (hw.util_pct || 0) / 100, hw.util_pct == null ? '–' : fmt(hw.util_pct), hw.util_pct ? '计算中' : '空闲');
-  setRing('rPow', (hw.power_w || 0) / pmax, hw.power_w == null ? '–' : fmt(hw.power_w), powSub);
-  setRing('rTemp', (hw.temp_c || 0) / 100, hw.temp_c == null ? '–' : fmt(hw.temp_c), hw.temp_c == null ? '–' : hw.temp_c < 65 ? '正常' : hw.temp_c < 85 ? '偏高' : '过热');
-  setRing('rClk', (hw.clock_mhz || 0) / cmax, hw.clock_mhz == null ? '–' : fmt(hw.clock_mhz), `峰值 ${fmt(cmax)}`);
-  $('hwName').textContent = `${hw.name || 'HL-225'} · ${hw.available ? 'hl-smi 实时遥测' : '不可用'}`;
-  $('sHbm').textContent = hw.mem_total_mib ? `${fmt(hw.mem_total_mib / 1024)} GiB` : '–';
-  $('sPcie').textContent = hw.pcie_speed ? `${pcieGen(hw.pcie_speed)} ×${hw.pcie_width}` : '–';
-  $('sDrv').textContent = hw.driver_ver || '–';
-  $('sReset').textContent = hw.hard_reset_cnt ?? '–';
-  legend($('lgHw'), hwSeries);
-  chHw.set(hist);
-
-  // Capacity
-  const tot = sl.total || 8, act = sl.active || 0, q = sl.queued || 0;
-  const key = `${tot}/${act}`;
-  if (key !== slotKey) {
-    slotKey = key;
-    $('slots').innerHTML = Array.from({ length: tot }, (_, i) => `<div class="slot ${i < act ? 'on' : ''}"><span>Slot ${i}</span><i class="sd"></i></div>`).join('');
-  }
-  $('capSub').textContent = `${act} / ${tot} 个活跃槽位 · 连续批处理`;
-  $('capQueue').textContent = `排队 ${q}`;
-  $('capQueue').className = 'badge ' + (q > 0 ? 'warn' : 'dim');
-
-  const kvU = sl.kv_used_gib || 0, kvB = sl.kv_budget_gib || 0;
-  $('mtKv').textContent = `${fmt(kvU, 1)} / ${fmt(kvB, 1)} GiB`;
-  $('fKv').style.width = (kvB ? Math.min(100, kvU / kvB * 100) : 0) + '%';
-
-  const pcBudget = parseFloat((bn.prefix_cache || '').match(/([\d.]+)\s*GiB/)?.[1] || 64);
-  $('mtPc').textContent = `${fmt(pc.host_gib || 0, 1)} / ${fmt(pcBudget)} GiB`;
-  $('fPc').style.width = Math.min(100, (pc.host_gib || 0) / pcBudget * 100) + '%';
-
-  const hit = (st.token_hit_rate || 0) * 100;
-  $('mtHit').textContent = `${fmt(hit, 1)} %`;
-  $('fHit').style.width = Math.min(100, hit) + '%';
-
-  $('mtRam').textContent = `${fmt(host.mem_used_gib, 1)} / ${fmt(host.mem_total_gib, 1)} GiB`;
-  $('fRam').style.width = (host.mem_total_gib ? Math.min(100, host.mem_used_gib / host.mem_total_gib * 100) : 0) + '%';
-
-  $('sReq').textContent = fmt(st.requests || 0);
-  $('sPt').textContent = fmt(st.prompt_tokens || 0);
-  $('sCt').textContent = fmt(st.cached_tokens || 0);
-  $('sEv').textContent = fmt(sl.kv_evictions || 0);
-
-  // Charts
-  $('kvNow').textContent = `KV ${fmt(kvU, 1)} GiB · ${act} 活跃`;
-  legend($('lgKv'), kvSeries);
-  chKv.set(hist);
-  chPerf.set(S.perf === 'live' ? hist : chron);
-
-  // Table
-  $('cntReq').textContent = reqs.length;
-  if (!reqs.length) {
-    $('tbReq').innerHTML = `<tr><td colspan="9"><div class="empty"><b>暂无请求记录</b>点击右上角「测速」发送一条请求即可查看实时数据</div></td></tr>`;
-  } else {
-    const maxDec = Math.max(...reqs.map(r => r.decode_tps), 1);
-    $('tbReq').innerHTML = reqs.map(r => `<tr>
-      <td>${hms(r.ts)}</td>
-      <td>${fmt(r.prompt_tokens)}<span class="u">tok</span></td>
-      <td>${r.cached_tokens > 0 ? `<span class="badge ok">${fmt(r.cached_pct)}% · ${fmt(r.cached_tokens)}</span>` : '<span class="badge dim">未命中</span>'}</td>
-      <td>${fmt(r.prompt_ms)}<span class="u">ms</span></td>
-      <td>${r.prefill_tps > 0 ? fmt(r.prefill_tps) + '<span class="u">tok/s</span>' : '–'}</td>
-      <td>${fmt(r.gen_tokens)}<span class="u">tok</span></td>
-      <td><span class="bar-cell"><i style="--w:${(r.decode_tps / maxDec * 100).toFixed(1)}%"></i><b>${fmt(r.decode_tps, 1)}</b></span></td>
-      <td>${fmt(r.tok_per_round, 2)}<span class="u">/轮 · ${r.rounds}</span></td>
-      <td><span class="badge ${r.finish === 'stop' ? 'ok' : 'warn'}">${esc(r.finish)}</span></td>
-    </tr>`).join('');
-  }
-
-  // System Info
-  $('iHw').innerHTML = kvRows([
-    ['设备型号', `${hw.name || '–'} (${hw.device_type || '–'})`],
-    ['驱动版本', hw.driver_ver],
-    ['SoC 频率', hw.clock_mhz != null ? `${fmt(hw.clock_mhz)} / ${fmt(hw.clock_max_mhz)} MHz` : '–'],
-    ['HBM 显存', hw.mem_used_mib != null ? `${fmt(hw.mem_used_mib / 1024, 1)} / ${fmt(hw.mem_total_mib / 1024, 1)} GiB` : '–'],
-    ['温度 / 总功耗', `${hw.temp_c ?? '–'} °C · ${hw.power_w ?? '–'} / ${hw.power_max_w ?? '–'} W`],
-    ['供电明细', (hw.power_54v_w != null || hw.power_12v_w != null) ? `54V ${hw.power_54v_w ?? '–'}/${hw.power_54v_max_w ?? '–'} W + 12V ${hw.power_12v_w ?? '–'}/${hw.power_12v_max_w ?? '–'} W` : '–'],
-    ['PCIe 链路', hw.pcie_speed ? `${hw.pcie_speed} ×${hw.pcie_width}` : '–'],
-    ['硬重置计数', hw.hard_reset_cnt],
-  ]);
-  $('iEng').innerHTML = kvRows([
-    ['服务地址', E.url],
-    ['模型', E.model],
-    ['最大上下文', E.max_model_len ? fmt(E.max_model_len) + ' tokens' : '–'],
-    ['引擎版本', E.version],
-    ['执行后端', bn.direct_engine || '–'],
-    ['KV 预算', bn.kv_summary || '–'],
-    ['目标权重', bn.target_weights || '–'],
-    ['草稿 / 视觉', [bn.drafter_weights, bn.vision_weights].filter(Boolean).join(' · ') || '–'],
-  ]);
-  $('iSys').innerHTML = kvRows([
-    ['容器', ct.available ? `${ct.name} (${ct.id})` : '–'],
-    ['镜像', ct.image || '–'],
-    ['状态', ct.available ? `${ct.status} · ${ct.health}` : '–'],
-    ['运行 / 重启', ct.available ? `${uptime(ct.started_at)} · ${ct.restart_count} 次` : '–'],
-    ['宿主机 CPU', `${fmt(host.cpu_pct, 1)} % · load ${host.load1 ?? '–'}`],
-    ['宿主机内存', `${fmt(host.mem_used_gib, 1)} / ${fmt(host.mem_total_gib, 1)} GiB`],
-    ['/dev/shm', `${fmt(host.shm_used_gib, 1)} / ${fmt(host.shm_total_gib, 1)} GiB`],
-  ]);
-}
-
-async function fetchSnap() {
-  try {
-    const r = await fetch('/api/snapshot', { cache: 'no-store' });
-    if (r.ok) render(await r.json());
-  } catch (e) {
-    $('stDot').className = 'sdot err'; $('stText').textContent = '连接断开';
-  }
-}
-
-async function fetchLogs() {
-  try {
-    const r = await fetch('/api/logs?tail=300', { cache: 'no-store' });
-    if (!r.ok) return;
-    const { lines } = await r.json();
-    const q = $('lgFilter').value.trim().toLowerCase();
-    const rows = q ? lines.filter(l => (l.msg || '').toLowerCase().includes(q)) : lines;
-    const body = $('lgBody');
-    body.innerHTML = rows.length ? rows.map(l => {
-      const m = l.msg || '';
-      const cls = /fail|error|nan|exception|abort/i.test(m) ? 'err' : /\[g2e\] prompt /.test(m) ? 'req'
-        : /Direct MME|serving |warm-up|READY/i.test(m) ? 'ok' : /recipes \d+\/\d+/.test(m) ? 'dim' : '';
-      return `<div class="ln ${cls}"><span class="ts">${hms(l.ts)}</span><span class="msg">${esc(m)}</span></div>`;
-    }).join('') : '<div class="ln dim"><span class="msg">无匹配日志</span></div>';
-    if ($('lgAuto').checked) body.scrollTop = body.scrollHeight;
-  } catch (e) {}
-}
-
-async function runProbe() {
-  if (S.probing) return;
-  switchTab('probe');
-  S.probing = true;
-  const btns = [$('pbRun'), $('btnQuick')]; btns.forEach(b => b.disabled = true);
-  $('pbRun').textContent = '生成中…';
-  const out = $('pOut'), think = $('pThink'), box = $('pThinkBox');
-  out.textContent = ''; out.classList.add('typing'); think.textContent = ''; box.style.display = 'none';
-  ['pTtft', 'pTps', 'pTok', 'pTotal'].forEach(id => $(id).textContent = '–');
-  const t0 = performance.now(); let firstAt = null, n = 0;
-  const live = setInterval(() => {
-    $('pTotal').textContent = fmt(performance.now() - t0);
-    if (firstAt && n > 1) $('pTps').textContent = fmt(n / ((performance.now() - firstAt) / 1000), 1);
-  }, 80);
-  try {
-    const res = await fetch('/api/probe/stream', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: $('pbPrompt').value, max_tokens: +$('pbMax').value || 256, temperature: +$('pbTemp').value || 0 }),
-    });
-    if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
-    const reader = res.body.getReader(), dec = new TextDecoder();
-    let buf = '';
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let k;
-      while ((k = buf.indexOf('\n\n')) >= 0) {
-        const block = buf.slice(0, k); buf = buf.slice(k + 2);
-        const line = block.split('\n').find(l => l.startsWith('data:'));
-        if (!line) continue;
-        const ev = JSON.parse(line.slice(5));
-        if (ev.type === 'delta') {
-          if (!firstAt) { firstAt = performance.now(); $('pTtft').textContent = fmt(ev.t, 1); }
-          n++; $('pTok').textContent = n;
-          if (ev.r) { box.style.display = ''; think.textContent += ev.r; think.scrollTop = think.scrollHeight; $('pThinkLen').textContent = `${think.textContent.length} 字`; }
-          if (ev.c) { out.textContent += ev.c; out.scrollTop = out.scrollHeight; }
-        } else if (ev.type === 'done') {
-          $('pTtft').textContent = fmt(ev.ttft_ms, 1);
-          $('pTps').textContent = fmt(ev.decode_tps, 1);
-          $('pTok').textContent = fmt(ev.completion_tokens);
-          $('pTotal').textContent = fmt(ev.total_ms);
-          if (!out.textContent.trim()) out.innerHTML = `<span class="ph">（输出 token 已全部用于思考过程，可调大最大输出 Tokens）</span>`;
-        } else if (ev.type === 'error') {
-          throw new Error(ev.error);
-        }
-      }
-    }
-  } catch (e) {
-    out.innerHTML = `<span style="color:var(--red)">请求失败：${esc(e.message)}</span>`;
-  } finally {
-    clearInterval(live);
-    out.classList.remove('typing');
-    S.probing = false; btns.forEach(b => b.disabled = false);
-    $('pbRun').textContent = '发送流式测试';
-    setTimeout(fetchSnap, 500);
-  }
-}
-
-function switchTab(t) {
-  S.tab = t;
-  document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.t === t));
-  document.querySelectorAll('.pane').forEach(p => p.classList.toggle('on', p.id === 'p-' + t));
-  if (t === 'logs') fetchLogs();
-}
-function schedule() {
-  clearInterval(S.timer);
-  S.timer = setInterval(() => { if (S.paused) return; fetchSnap(); if (S.tab === 'logs') fetchLogs(); }, S.interval);
-}
-function applyTheme(t) {
-  document.documentElement.setAttribute('data-theme', t);
-  $('btnTheme').innerHTML = ico(t === 'dark' ? 'sun' : 'moon');
-  localStorage.setItem('g2e-apple-theme', t);
-  if (S.snap) render(S.snap);
-}
-
-document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => switchTab(b.dataset.t));
-document.querySelectorAll('#segInt button').forEach(b => b.onclick = () => {
-  document.querySelectorAll('#segInt button').forEach(x => x.classList.toggle('on', x === b));
-  S.interval = +b.dataset.v; schedule();
-});
-document.querySelectorAll('#segPerf button').forEach(b => b.onclick = () => setPerf(b.dataset.v));
-document.querySelectorAll('.preset').forEach(b => b.onclick = () => { $('pbPrompt').value = b.dataset.p; $('pbPrompt').focus(); });
-$('btnPause').onclick = () => { S.paused = !S.paused; $('btnPause').innerHTML = ico(S.paused ? 'play' : 'pause'); };
-$('btnTheme').onclick = () => applyTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
-$('btnQuick').onclick = runProbe;
-$('pbRun').onclick = runProbe;
-$('pbPrompt').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) runProbe(); });
-$('lgFilter').oninput = fetchLogs;
-let rz; window.addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(() => S.snap && render(S.snap), 120); });
-
-applyTheme(localStorage.getItem('g2e-apple-theme') || 'light');
-setPerf('live');
-fetchSnap();
-schedule();
-</script>
+<script src="/studio.js"></script>
 </body>
 </html>

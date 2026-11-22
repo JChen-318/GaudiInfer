@@ -143,6 +143,30 @@ UploadStats WeightPack::upload_subset(const Device& device, const Stream& stream
     return s;
 }
 
+UploadStats WeightPack::reload_subset_in_place(const Device& device, const Stream& stream,
+                                               const std::function<bool(const WeightEntry&)>& select) const {
+    if (!arena_) throw std::logic_error("g2w: reload_subset_in_place called before upload");
+    const auto t0 = std::chrono::steady_clock::now();
+    Fd f(path_);
+    const uint64_t chunk = 64ull << 20;
+    HostBuffer staging(device, chunk);
+    uint64_t copied = 0;
+    for (const auto& [name, e] : entries_) {
+        if (!select(e)) continue;
+        for (uint64_t done = 0; done < e.bytes; done += chunk) {
+            const uint64_t n = std::min(chunk, e.bytes - done);
+            f.read_exact(staging.data(), n, data_start_ + e.offset + done);
+            stream.upload(staging, 0, *arena_, e.offset + done, n);
+            stream.synchronize();
+        }
+        copied += e.bytes;
+    }
+    UploadStats s;
+    s.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    s.gib = double(copied) / double(1ull << 30);
+    return s;
+}
+
 std::vector<uint8_t> WeightPack::read(const std::string& name) const {
     const auto& e = at(name);
     std::vector<uint8_t> out(e.bytes);

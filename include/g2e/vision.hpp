@@ -26,8 +26,20 @@ struct VisionImage {
 // `rgb` is 8-bit interleaved RGB.
 VisionImage preprocess_image(const uint8_t* rgb, int width, int height, uint64_t min_pixels, uint64_t max_pixels,
                              uint32_t patch = 16, uint32_t merge = 2);
+// Patchify an ALREADY-resized RGB image (width, height multiples of patch*merge) without resizing again.
+VisionImage preprocess_image_exact(const uint8_t* rgb, int width, int height, uint32_t patch = 16, uint32_t merge = 2);
 // Decode a PNG/JPEG/... file in memory to 8-bit RGB (stb_image). Throws on failure.
 std::vector<uint8_t> decode_image(const uint8_t* data, size_t size, int& width, int& height);
+// Decode a PNG/JPEG/... file in memory to 8-bit RGBA (opaque A=255 if source has no alpha).
+std::vector<uint8_t> decode_image_rgba(const uint8_t* data, size_t size, int& width, int& height);
+// PIL-exact antialiased bicubic resize of 8-bit RGB [h, w, 3] -> [oh, ow, 3] or RGBA [h, w, 4] -> [oh, ow, 4].
+std::vector<uint8_t> resize_rgb_bicubic(const uint8_t* src, int w, int h, int ow, int oh);
+std::vector<uint8_t> resize_rgba_bicubic(const uint8_t* src, int w, int h, int ow, int oh);
+// Composite 8-bit RGBA over solid white (255, 255, 255) -> 8-bit RGB (matches PIL white.paste(img, mask=A)).
+std::vector<uint8_t> rgba_over_white_to_rgb(const uint8_t* rgba, int width, int height);
+// Encode 8-bit RGBA or RGB pixels to PNG bytes in memory (libpng16).
+std::vector<uint8_t> encode_png_rgba(const uint8_t* rgba, int width, int height);
+std::vector<uint8_t> encode_png_rgb(const uint8_t* rgb, int width, int height);
 
 class Vision {
 public:

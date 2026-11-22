@@ -28,6 +28,7 @@ struct Inputs {
 
 // processor order: merge blocks row-major, the patches of a block row-major -> (row, col) of patch p
 void patch_rc(uint32_t gh, uint32_t gw, uint32_t merge, uint32_t p, uint32_t& row, uint32_t& col) {
+    (void)gh;
     const uint32_t per_block = merge * merge, blocks_w = gw / merge;
     const uint32_t blk = p / per_block, in = p % per_block;
     row = (blk / blocks_w) * merge + in / merge;

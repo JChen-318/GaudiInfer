@@ -57,6 +57,22 @@ foreach(KERNEL
         gdn_spec_prep_batch_bf16_gaudi2
         gdn_spec_prep_bf16_gaudi2
         gdn_state_commit_f32_gaudi2
+        h3_adaln_rmsnorm_quant_bf16_gaudi2
+        h3_direct_attn_step_fp8_gaudi2
+        h3_fast_softmax_fp8_gaudi2
+        h3_gate_adaln_rmsnorm_quant_bf16_gaudi2
+        h3_gate_residual_bf16_gaudi2
+        h3_maxfree_exp_bf16_gaudi2
+        h3_qk_norm_rope_bf16_gaudi2
+        h3_qk_norm_rope_prep_bf16_gaudi2
+        h3_quant_v256_bf16_gaudi2
+        h3_row_quant_bf16_gaudi2
+        h3_silu_mul_quant_dual_bf16_gaudi2
+        h3_silu_mul_quant_dual_dq_bf16_gaudi2
+        h3_vvae_bias_silu_mul_quant_dq_bf16_gaudi2
+        h3_vvae_qk_norm_rope_bf16_gaudi2
+        h3_vvae_rmsnorm_quant_bf16_gaudi2
+        h3_vvae_scale_add_norm_quant_bf16_gaudi2
         masked_softmax_bf16_f8_gaudi2
         masked_softmax_bf16_gaudi2
         masked_softmax_f16_gaudi2
@@ -119,6 +135,28 @@ foreach(KERNEL
        KERNEL STREQUAL "add_rmsnorm_quant_bf16_gaudi2_dq")
         list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/add_rmsnorm_quant_bf16_gaudi2.c")
     endif()
+    if(KERNEL STREQUAL "h3_adaln_rmsnorm_quant_bf16_gaudi2" OR
+       KERNEL STREQUAL "h3_gate_adaln_rmsnorm_quant_bf16_gaudi2" OR
+       KERNEL STREQUAL "h3_qk_norm_rope_bf16_gaudi2" OR
+       KERNEL STREQUAL "h3_maxfree_exp_bf16_gaudi2" OR
+       KERNEL STREQUAL "h3_fast_softmax_fp8_gaudi2" OR
+       KERNEL STREQUAL "h3_direct_attn_step_fp8_gaudi2" OR
+       KERNEL STREQUAL "h3_vvae_qk_norm_rope_bf16_gaudi2" OR
+       KERNEL STREQUAL "h3_vvae_scale_add_norm_quant_bf16_gaudi2" OR
+       KERNEL STREQUAL "h3_vvae_rmsnorm_quant_bf16_gaudi2" OR
+       KERNEL STREQUAL "h3_row_quant_bf16_gaudi2")
+        list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/norm_math_gaudi2.h")
+    endif()
+    if(KERNEL STREQUAL "h3_vvae_rmsnorm_quant_bf16_gaudi2" OR
+       KERNEL STREQUAL "h3_row_quant_bf16_gaudi2")
+        list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/h3_vvae_scale_add_norm_quant_bf16_gaudi2.c")
+    endif()
+    if(KERNEL STREQUAL "h3_silu_mul_quant_dual_dq_bf16_gaudi2")
+        list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/h3_vvae_bias_silu_mul_quant_dq_bf16_gaudi2.c")
+    endif()
+    if(KERNEL STREQUAL "h3_gate_adaln_rmsnorm_quant_bf16_gaudi2")
+        list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/h3_adaln_rmsnorm_quant_bf16_gaudi2.c")
+    endif()
     add_custom_command(
         OUTPUT "${TPC_OBJECT}"
         COMMAND "${TPC_COMPILER}" -Wall -Werror -O2 -march=gaudi2 ${TPC_EXTRA_FLAGS} ${WY_EXTRA}
@@ -146,6 +184,7 @@ add_library(
     host/gated_norm_quant_bf16_gaudi2.cpp
     host/gdn_packed_decode_f32_gaudi2.cpp
     host/gdn_spec_prep_bf16_gaudi2.cpp
+    host/h3_adaln_bf16_gaudi2.cpp
     host/masked_softmax_bf16_gaudi2.cpp
     host/silu_and_mul_bf16_gaudi2.cpp
     host/silu_mul_quant_bf16_gaudi2.cpp

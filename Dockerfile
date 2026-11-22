@@ -33,7 +33,7 @@ ARG HABANA_VERSION
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        cmake ninja-build g++ binutils \
+        cmake ninja-build g++ binutils libpng-dev \
         habanalabs-tools=${HABANA_VERSION} \
     && rm -rf /var/lib/apt/lists/*
 
@@ -41,14 +41,14 @@ WORKDIR /src
 COPY . .
 
 RUN cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build --target g2e_server -j"$(nproc)" \
+    && cmake --build build --target g2e_server g2e_h3_server g2e_h3_cli g2e_qwen21_server g2e_h3_image_server -j"$(nproc)" \
     && mkdir -p /stage/opt/gaudiinfer/bin /stage/opt/gaudiinfer/lib /stage/opt/gaudiinfer/tools \
-    && cp build/g2e_server /stage/opt/gaudiinfer/bin/g2e_server \
+    && cp build/g2e_server build/g2e_h3_server build/g2e_h3_cli build/g2e_qwen21_server build/g2e_h3_image_server /stage/opt/gaudiinfer/bin/ \
     && cp build/tpc/flashinfer_gaudi/libflashinfer_gaudi_kernels.so /stage/opt/gaudiinfer/lib/ \
     && find build/tpc/flashinfer_gaudi -maxdepth 1 -name '*.o' ! -name '*_embedded.o' \
         -exec cp {} /stage/opt/gaudiinfer/lib/ \; \
     && cp tools/scal-g2e-direct.json /stage/opt/gaudiinfer/tools/ \
-    && cp -r tools/mme_descs_R128 tools/mme_descs_R16 /stage/opt/gaudiinfer/tools/ \
+    && cp -r tools/mme_descs_R128 tools/mme_descs_R16 tools/mme_descs_h3 /stage/opt/gaudiinfer/tools/ \
     && cp docker/entrypoint.sh /stage/opt/gaudiinfer/entrypoint.sh \
     && sed -i 's/\r$//' /stage/opt/gaudiinfer/entrypoint.sh \
     && chmod +x /stage/opt/gaudiinfer/entrypoint.sh
@@ -57,7 +57,7 @@ RUN cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 FROM base AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libcurl3t64-gnutls \
+        libcurl3t64-gnutls libpng16-16t64 ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data/recipes /data/habana_logs
 
@@ -67,6 +67,7 @@ ENV G2E_TPC_LIB=/opt/gaudiinfer/lib/libflashinfer_gaudi_kernels.so \
     G2E_TPC_OBJ_DIR=/opt/gaudiinfer/lib \
     G2E_MME_DESC_DIR=/opt/gaudiinfer/tools/mme_descs_R128 \
     G2E_MME_DESC_DIR_R16=/opt/gaudiinfer/tools/mme_descs_R16 \
+    G2E_H3_MME_DESC_DIR=/opt/gaudiinfer/tools/mme_descs_h3 \
     SCAL_CONFIG_FILE_PATH=/opt/gaudiinfer/tools/scal-g2e-direct.json \
     SCAL_CFG_FILE_PATH=/opt/gaudiinfer/tools/scal-g2e-direct.json \
     HABANA_SCAL_BIN_PATH=/opt/habanalabs/engines_fw \
