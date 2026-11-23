@@ -295,6 +295,7 @@ void Qwen35::prepare_aux() {
 uint64_t Qwen35::kv_row_bytes() const { return uint64_t(k_cache_.size()) * 2 * cfg_.kv_heads * cfg_.head_dim * kv_es(); }
 
 void Qwen35::save_kv(uint32_t r0, uint32_t n, const HostBuffer& dst, uint64_t off) const {
+    last_used_direct_b1_ = false;
     const uint64_t D = cfg_.head_dim, row = D * kv_es(), KV = cfg_.kv_heads;
     for (size_t s = 0; s < k_cache_.size(); ++s)
         for (int kv = 0; kv < 2; ++kv)
@@ -321,6 +322,7 @@ void Qwen35::load_kv(uint32_t r0, uint32_t n, const HostBuffer& src, uint64_t of
 uint64_t Qwen35::state_bytes() const { return uint64_t(num_gdn_) * (conv_bytes_ + ssm_bytes_); }
 
 void Qwen35::save_state(const HostBuffer& dst, uint64_t off) const {
+    last_used_direct_b1_ = false;
     for (uint32_t s = 0; s < num_gdn_; ++s) {
         stream_.download(conv_all_[conv_side_[s]], uint64_t(s) * conv_bytes_, dst, off, conv_bytes_);
         off += conv_bytes_;
@@ -344,6 +346,7 @@ void Qwen35::load_state(const HostBuffer& src, uint64_t off, uint32_t pos) {
 }
 
 void Qwen35::swap_seq(Seq& q) {
+    last_used_direct_b1_ = false;
     std::swap(k_cache_, q.k);
     std::swap(v_cache_, q.v);
     for (int i = 0; i < 2; ++i) {
@@ -3793,6 +3796,9 @@ Qwen35::BatchOut Qwen35::batch_verify(std::span<const uint32_t> slots, std::span
         }
         if (b8_ok) {
             mark(0);
+            // Ensure any prior async Synapse stream_ ops (e.g. PrefixCache load/save, prefill, Synapse accept_batch,
+            // or drafter append_context_batch) have completed in HBM before Direct SCAL reads/writes shared buffers.
+            stream_.synchronize();
             // Upload ALL dirty patched ECBs + ids_ control block in ONE batched PDMA sync (zero Synapse embed launch / sync)!
             direct_shared_->rt->flush_patches_and_upload(all_plans, ids_.address(),
                                                          staging_.as<uint8_t>() + kIdsStage,
@@ -4149,9 +4155,9 @@ void Qwen35::run_layers(std::span<const int32_t> tokens, bool spec, std::vector<
             }
         }
         if (b1_ok) {
-            // Ensure any prior async Synapse stream_ ops (e.g. PrefixCache::restore load_kv/load_state or
-            // Synapse accept/accept_batch) have landed in HBM before Direct SCAL reads KV/GDN state.
-            if (!last_used_direct_b1_) stream_.synchronize();
+            // Ensure any prior async Synapse stream_ ops (e.g. PrefixCache load/save, Synapse accept, or drafter
+            // append_context) have completed in HBM before Direct SCAL reads/writes KV, GDN, or feature buffers.
+            stream_.synchronize();
             direct_shared_->rt->flush_patches_and_upload(all_plans, ids_.address(),
                                                          staging_.as<uint8_t>() + kIdsStage, ids_up);
             const double patch_ms = std::chrono::duration<double, std::milli>(clk::now() - td0).count();

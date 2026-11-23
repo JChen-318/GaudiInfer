@@ -28,7 +28,7 @@ VisionImage preprocess_image(const uint8_t* rgb, int width, int height, uint64_t
                              uint32_t patch = 16, uint32_t merge = 2);
 // Patchify an ALREADY-resized RGB image (width, height multiples of patch*merge) without resizing again.
 VisionImage preprocess_image_exact(const uint8_t* rgb, int width, int height, uint32_t patch = 16, uint32_t merge = 2);
-// Decode a PNG/JPEG/... file in memory to 8-bit RGB (stb_image). Throws on failure.
+// Decode a PNG/JPEG/WebP/... file in memory to 8-bit RGB, compositing any alpha channel over solid white. Throws on failure.
 std::vector<uint8_t> decode_image(const uint8_t* data, size_t size, int& width, int& height);
 // Decode a PNG/JPEG/... file in memory to 8-bit RGBA (opaque A=255 if source has no alpha).
 std::vector<uint8_t> decode_image_rgba(const uint8_t* data, size_t size, int& width, int& height);

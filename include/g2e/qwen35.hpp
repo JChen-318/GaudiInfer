@@ -350,7 +350,7 @@ private:
     std::unique_ptr<DirectShared> direct_shared_;
     std::unique_ptr<DirectBatchState> direct_b8_;
     std::unique_ptr<DirectBatchState> direct_b1_;
-    bool last_used_direct_b1_ = false;
+    mutable bool last_used_direct_b1_ = false;
     bool ensure_direct_shared(uint32_t nl);
     bool ensure_direct_plan(std::unique_ptr<DirectBatchState>& dst, uint32_t B, std::array<uint32_t, 8> slot_caps);
     bool ensure_direct_b8(std::array<uint32_t, 8> slot_caps);

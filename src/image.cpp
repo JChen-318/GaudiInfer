@@ -181,13 +181,10 @@ std::vector<uint8_t> decode_webp(const uint8_t* data, size_t size, int& width, i
 }  // namespace
 
 std::vector<uint8_t> decode_image(const uint8_t* data, size_t size, int& width, int& height) {
-    if (is_webp(data, size)) return decode_webp(data, size, width, height, 3);
-    int channels = 0;
-    stbi_uc* px = stbi_load_from_memory(data, int(size), &width, &height, &channels, 3);
-    if (!px) throw std::invalid_argument(std::string("cannot decode the image: ") + stbi_failure_reason());
-    std::vector<uint8_t> rgb(px, px + size_t(width) * height * 3);
-    stbi_image_free(px);
-    return rgb;
+    // Decode as RGBA and composite over solid white so transparent PNG/WebP images (e.g. dark UI text or
+    // diagrams with alpha=0) do not turn black-on-black; opaque images (alpha=255) are bit-exact.
+    const auto rgba = decode_image_rgba(data, size, width, height);
+    return rgba_over_white_to_rgb(rgba.data(), width, height);
 }
 
 std::vector<uint8_t> decode_image_rgba(const uint8_t* data, size_t size, int& width, int& height) {

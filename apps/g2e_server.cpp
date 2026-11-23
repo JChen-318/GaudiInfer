@@ -578,6 +578,10 @@ struct Server {
                         auto parsed = ojson::parse(tc["function"]["arguments"].get<std::string>(), nullptr, false);
                         if (!parsed.is_discarded()) tc["function"]["arguments"] = parsed;
                     }
+            if ((!m.contains("reasoning_content") || m["reasoning_content"].is_null()) &&
+                m.contains("reasoning") && m["reasoning"].is_string()) {
+                m["reasoning_content"] = m["reasoning"];
+            }
             msgs.push_back(m);
         }
         ojson v;
@@ -863,7 +867,9 @@ int main(int argc, char** argv) {
                         msg["tool_calls"] = calls;
                         finish = "tool_calls";
                     }
-                    msg["reasoning"] = reasoning && !d.reasoning.empty() ? ojson(d.reasoning) : ojson(nullptr);
+                    const ojson rval = reasoning && !d.reasoning.empty() ? ojson(d.reasoning) : ojson(nullptr);
+                    msg["reasoning"] = rval;
+                    msg["reasoning_content"] = rval;
                     choice["message"] = msg;
                 } else {
                     choice["text"] = r.text;
@@ -906,7 +912,10 @@ int main(int argc, char** argv) {
                 int tool_index = 0;
                 auto delta_json = [&](const ParserDelta& d) {
                     ojson delta = ojson::object();
-                    if (!d.reasoning.empty()) delta["reasoning"] = d.reasoning;
+                    if (!d.reasoning.empty()) {
+                        delta["reasoning"] = d.reasoning;
+                        delta["reasoning_content"] = d.reasoning;
+                    }
                     if (!d.content.empty()) delta["content"] = d.content;
                     if (!d.tool_calls.empty()) {
                         ojson calls = ojson::array();
