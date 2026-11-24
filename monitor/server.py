@@ -605,25 +605,83 @@ class EngineManager:
         self.can_manage = BUILD_DIR.is_dir() and any((BUILD_DIR / s["binary"]).is_file() for s in ENGINE_SPECS.values())
         LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    def _kill_all_engines(self):
-        # 1. Stop our managed subprocess first
+    @staticmethod
+    def _is_pid_alive(pid: int) -> bool:
+        try:
+            stat_txt = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="ignore")
+            rp = stat_txt.rfind(")")
+            if rp != -1:
+                fields = stat_txt[rp + 2 :].split()
+                if fields and fields[0] == "Z":
+                    return False  # zombie already exited
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def _wait_device_ready(self, timeout: float = 45.0, seq=None) -> bool:
+        dev_path = "/dev/accel/accel0"
+        if not os.path.exists(dev_path):
+            return True
+        status_path = "/sys/class/accel/accel0/device/status"
+        deadline = time.time() + timeout
+        waited = False
+        while time.time() < deadline:
+            if seq is not None:
+                with self.lock:
+                    if self._switch_seq != seq:
+                        return False
+            st = read_sysfs(status_path)
+            if not st or st.lower() == "operational":
+                try:
+                    fd = os.open(dev_path, os.O_RDWR)
+                    os.close(fd)
+                    if waited:
+                        time.sleep(0.5)  # brief settle after kernel teardown finishes
+                    return True
+                except OSError:
+                    pass
+            if not waited:
+                waited = True
+                if seq is not None:
+                    with self.lock:
+                        if self._switch_seq == seq:
+                            self.status_msg = "正在等待 Gaudi2 设备完全释放…"
+            time.sleep(0.5)
+        return False
+
+    def _kill_all_engines(self, seq=None):
+        # 1. Stop our managed subprocess first and ALWAYS reap it (even after SIGKILL)
         with self.lock:
             p = self.proc
             self.proc = None
             self.proc_engine = None
-        if p is not None and p.poll() is None:
-            try:
-                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-            except Exception:
+        if p is not None:
+            if p.poll() is None:
                 try:
-                    p.terminate()
+                    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
                 except Exception:
-                    pass
-            try:
-                p.wait(timeout=12)
-            except Exception:
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
                 try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                    p.wait(timeout=12)
+                except Exception:
+                    try:
+                        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                    except Exception:
+                        try:
+                            p.kill()
+                        except Exception:
+                            pass
+                    try:
+                        p.wait(timeout=15)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    p.wait(timeout=1)
                 except Exception:
                     pass
 
@@ -646,7 +704,7 @@ class EngineManager:
                     out = subprocess.check_output(["pgrep", "-f", f"/{b}(\\s|$)"], text=True, stderr=subprocess.DEVNULL)
                     for ln in out.splitlines():
                         pid = int(ln.strip())
-                        if pid != os.getpid():
+                        if pid != os.getpid() and self._is_pid_alive(pid):
                             pids.append(pid)
                 except Exception:
                     pass
@@ -657,18 +715,14 @@ class EngineManager:
                     os.kill(pid, sig)
                 except Exception:
                     pass
-            deadline = time.time() + (10.0 if sig == signal.SIGTERM else 3.0)
+            deadline = time.time() + (10.0 if sig == signal.SIGTERM else 5.0)
             while time.time() < deadline:
-                alive = []
-                for pid in set(pids):
-                    try:
-                        os.kill(pid, 0)
-                        alive.append(pid)
-                    except OSError:
-                        pass
-                if not alive:
+                if not any(self._is_pid_alive(pid) for pid in set(pids)):
                     break
                 time.sleep(0.3)
+
+        # 4. Wait until habanalabs finishes releasing / resetting /dev/accel/accel0
+        self._wait_device_ready(timeout=45.0, seq=seq)
 
     def stop_async(self):
         if not self.can_manage:
@@ -683,7 +737,7 @@ class EngineManager:
 
         def _worker():
             try:
-                self._kill_all_engines()
+                self._kill_all_engines(seq=seq)
                 with self.lock:
                     if self._switch_seq == seq:
                         self.state = "idle"
@@ -720,7 +774,7 @@ class EngineManager:
 
         def _worker():
             try:
-                self._kill_all_engines()
+                self._kill_all_engines(seq=seq)
                 with self.lock:
                     if self._switch_seq != seq:
                         return
@@ -728,65 +782,95 @@ class EngineManager:
 
                 cmd, env = build_engine_command(engine_id)
                 log_path = LOG_DIR / f"g2e_{engine_id}.log"
-                lf = open(log_path, "wb")
-                lf.write(f"[studio] launching {spec['name']}: {' '.join(cmd)}\n".encode("utf-8"))
-                lf.flush()
-                proc = subprocess.Popen(
-                    cmd,
-                    cwd=str(REPO_DIR),
-                    env=env,
-                    stdout=lf,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-                with self.lock:
-                    if self._switch_seq != seq:
-                        try:
-                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                        except Exception:
-                            pass
-                        lf.close()
-                        return
-                    self.proc = proc
-                    self.proc_engine = engine_id
-                    self.proc_log_path = log_path
-
-                # Wait up to 600s for /health == 200 (covers cold 624-recipe cache warmup on 27B)
                 health_url = f"http://127.0.0.1:{spec['port']}/health"
-                deadline = time.time() + 600.0
-                while time.time() < deadline:
+                max_attempts = 3
+
+                for attempt in range(max_attempts):
                     with self.lock:
                         if self._switch_seq != seq:
                             return
-                    if proc.poll() is not None:
-                        tail = ""
-                        try:
-                            tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
-                            tail = "\n".join(tail)
-                        except Exception:
-                            pass
-                        with self.lock:
-                            if self._switch_seq == seq:
-                                self.state = "error"
-                                self.error = f"进程异常退出 (rc={proc.returncode}): {tail}"
-                                self.status_msg = f"{spec['name']} 启动失败 (rc={proc.returncode})"
-                        return
+                    lf = open(log_path, "wb")
                     try:
-                        if http_status(health_url, timeout=1.5) == 200:
+                        lf.write(f"[studio] launching {spec['name']}: {' '.join(cmd)}\n".encode("utf-8"))
+                        lf.flush()
+                        proc = subprocess.Popen(
+                            cmd,
+                            cwd=str(REPO_DIR),
+                            env=env,
+                            stdout=lf,
+                            stderr=subprocess.STDOUT,
+                            start_new_session=True,
+                        )
+                    finally:
+                        lf.close()
+
+                    with self.lock:
+                        if self._switch_seq != seq:
+                            try:
+                                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                            except Exception:
+                                pass
+                            return
+                        self.proc = proc
+                        self.proc_engine = engine_id
+                        self.proc_log_path = log_path
+
+                    # Wait up to 600s for /health == 200 (covers cold 624-recipe cache warmup on 27B)
+                    launch_ts = time.time()
+                    deadline = launch_ts + 600.0
+                    retry_acquire = False
+                    while time.time() < deadline:
+                        with self.lock:
+                            if self._switch_seq != seq:
+                                return
+                        if proc.poll() is not None:
+                            tail = ""
+                            try:
+                                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
+                                tail = "\n".join(lines)
+                            except Exception:
+                                pass
+                            is_dev_busy = (
+                                "Synapse status 8" in tail
+                                or "Device not found" in tail
+                                or "synDeviceAcquire" in tail
+                            )
+                            if is_dev_busy and (time.time() - launch_ts) < 20.0 and attempt + 1 < max_attempts:
+                                with self.lock:
+                                    if self._switch_seq == seq:
+                                        self.status_msg = (
+                                            f"Gaudi2 设备仍在复位，等待后重试启动 {spec['name']} ({attempt + 2}/{max_attempts})…"
+                                        )
+                                self._wait_device_ready(timeout=30.0, seq=seq)
+                                time.sleep(2.0)
+                                retry_acquire = True
+                                break
                             with self.lock:
                                 if self._switch_seq == seq:
-                                    self.state = "running"
-                                    self.status_msg = f"{spec['name']} 已就绪（:{spec['port']}）"
+                                    self.state = "error"
+                                    self.error = f"进程异常退出 (rc={proc.returncode}): {tail}"
+                                    self.status_msg = f"{spec['name']} 启动失败 (rc={proc.returncode})"
                             return
-                    except Exception:
-                        pass
-                    time.sleep(1.0)
+                        try:
+                            if http_status(health_url, timeout=1.5) == 200:
+                                with self.lock:
+                                    if self._switch_seq == seq:
+                                        self.state = "running"
+                                        self.status_msg = f"{spec['name']} 已就绪（:{spec['port']}）"
+                                return
+                        except Exception:
+                            pass
+                        time.sleep(1.0)
 
-                with self.lock:
-                    if self._switch_seq == seq:
-                        self.state = "error"
-                        self.error = "等待 /health 超时 (360s)"
-                        self.status_msg = f"{spec['name']} 启动超时"
+                    if retry_acquire:
+                        continue
+
+                    with self.lock:
+                        if self._switch_seq == seq:
+                            self.state = "error"
+                            self.error = "等待 /health 超时 (600s)"
+                            self.status_msg = f"{spec['name']} 启动超时"
+                    return
             except Exception as e:
                 with self.lock:
                     if self._switch_seq == seq:
