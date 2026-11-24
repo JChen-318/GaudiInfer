@@ -82,12 +82,122 @@ foreach(KERNEL
         silu_and_mul_bf16_gaudi2
         silu_mul_quant_bf16_gaudi2
         silu_mul_quant_dq_bf16_gaudi2
-        spec_conv_bf16_gaudi2)
+        spec_conv_bf16_gaudi2
+        ink_conv_bf16_gaudi2
+        ink_conv_dyn_bf16_gaudi2
+        ink_qprep_bf16_gaudi2
+        ink_qprep_tau_bf16_gaudi2
+        ink_kv_commit_bf16_gaudi2
+        ink_mix_gaudi2
+        ink_mix_f32p_gaudi2
+        ink_route_gaudi2
+        ink_mg_gaudi2
+        ink_mg_out_gaudi2
+        ink_mg_out_lut_gaudi2
+        ink_attn_sm16_gaudi2
+        ink_attn_sm16f_gaudi2
+        ink_dattn_gaudi2
+        ink_dgate_gaudi2
+        ink_dpost_gaudi2
+        ink_dpost_v_gaudi2
+        ink_dpost_vf_gaudi2
+        ink_dattn_v_gaudi2
+        ink_dattn_vf_gaudi2
+        ink_dgate_v_gaudi2
+        ink_dgate_vf_gaudi2
+        ink_dpost_full_gaudi2
+        ink_dattn_far_gaudi2
+        ink_dgate_far_gaudi2
+        ink_dgram_gaudi2
+        ink_dnorm_gaudi2
+        ink_dnorm_f32p_gaudi2
+        ink_dgram_msg_gaudi2
+        ink_dnorm_msg_gaudi2
+        ink_dnorm_msg_f32p_gaudi2
+        ink_dmid_gaudi2
+        ink_rollback_gaudi2
+        ink_dmgy_gaudi2
+        ink_dmgn_gaudi2
+        ink_prprep_gaudi2
+        ink_prprep_tau_gaudi2
+        ink_pgate_gaudi2
+        ink_pgate_far_gaudi2
+        ink_conv_hm_bf16_gaudi2
+        ink_conv_dyn_hm_bf16_gaudi2
+        ink_conv_resa_bf16_gaudi2
+        ink_conv_resm_bf16_gaudi2
+        ink_pcopy_gaudi2
+        ink_attn_sm16b_gaudi2
+        ink_attn_sm16fb_gaudi2
+        ink_rplan_hist_gaudi2
+        ink_pnorm_gaudi2
+        ink_mg_out_pade_gaudi2
+        ink_conv_hm2_bf16_gaudi2
+        ink_conv_dyn_hm2_bf16_gaudi2
+        ink_sgather_bf16_gaudi2
+        ink_act_bf16_gaudi2
+        ink_rplan_dyn_tab_bf16_gaudi2
+        ink_rplan_dyn_slots_bf16_gaudi2
+        ink_attn_sm16w_gaudi2
+        ink_moe_combine_bf16_gaudi2
+        ink_droute1_gaudi2
+        ink_dtail_rw_gaudi2
+        ink_dmg_fgy_gaudi2
+        ink_zero_gaudi2
+        ink_attn_sm16_near_gaudi2
+        ink_attn_far_step_gaudi2
+        ink_pfar_head_io_gaudi2
+        ink_dembed_gaudi2
+        ink_dsoftcap_argmax_gaudi2
+        ink_dattn_near_max_gaudi2
+        ink_dfar_sm_gaudi2
+        ink_dfar_acc_gaudi2
+        ink_dgate_f32_gaudi2
+        ink_dpost_b_gaudi2
+        ink_dpost_b_full_gaudi2
+        ink_kv_commit_d1_gaudi2
+        ink_dattn_b_gaudi2
+        ink_dattn_b_near_max_gaudi2
+        ink_dgate_b_gaudi2
+        ink_dgate_b_full_gaudi2
+        ink_dmid_b_gaudi2
+        ink_dtail_rw_b_gaudi2
+        ink_dsoftcap_argmax_b_gaudi2
+        ink_vmoe_plan_gaudi2
+        ink_vmoe_up_nvf4_gaudi2
+        ink_vmoe_up_mxf8_gaudi2
+        ink_vmoe_dn_nvf4_gaudi2
+        ink_vmoe_dn_mxf8_gaudi2
+        ink_dtail_rw_dgram_gaudi2
+        ink_dtail_rw_dgram_msg_gaudi2
+        ink_dmoe_up9_nvf4_gaudi2
+        ink_dmoe_up9_mxf8_gaudi2
+        ink_dmoe_dn9_nvf4_gaudi2
+        ink_dmoe_dn9_mxf8_gaudi2
+        ink_dfar_pv_gaudi2
+        ink_dfar_acc3_gaudi2
+        ink_dgate_far3_gaudi2
+        ink_droute1_b_gaudi2
+        ink_kv_commit_b4_gaudi2
+        ink_nvf4_deq_bf16_gaudi2
+        ink_mxfp8_deq_bf16_gaudi2)
     set(TPC_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${KERNEL}.c")
     set(TPC_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.o")
     set(TPC_EMBEDDED_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}_embedded.o")
     set(TPC_EXTRA_DEPENDENCIES)
     set(TPC_EXTRA_FLAGS)
+    if(KERNEL STREQUAL "ink_mg_out_lut_gaudi2" OR KERNEL STREQUAL "ink_mg_out_gaudi2" OR KERNEL STREQUAL "ink_mg_out_pade_gaudi2")
+        list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_mg_gaudi2.c")
+    endif()
+    if(KERNEL MATCHES "^ink_attn_sm16")
+        list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_attn_row16_gaudi2.h"
+             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_attn_roww_gaudi2.h"
+             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_attn_sm16_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_attn_sm16f_gaudi2.c")
+    endif()
+    if(KERNEL STREQUAL "ink_mix_gaudi2" OR KERNEL STREQUAL "ink_mix_f32p_gaudi2")
+        list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_mix_row_gaudi2.h"
+             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_mix_gaudi2.c")
+    endif()
     if(KERNEL MATCHES "^add_rmsnorm_quant_bf16_gaudi2")
         list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/norm_math_gaudi2.h")
     endif()
@@ -157,6 +267,26 @@ foreach(KERNEL
     if(KERNEL STREQUAL "h3_gate_adaln_rmsnorm_quant_bf16_gaudi2")
         list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/h3_adaln_rmsnorm_quant_bf16_gaudi2.c")
     endif()
+    if(KERNEL STREQUAL "ink_dmoe_up9_nvf4_gaudi2" OR KERNEL STREQUAL "ink_dmoe_up9_mxf8_gaudi2")
+        list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_dmoe_up9_gaudi2.c")
+    endif()
+    if(KERNEL STREQUAL "ink_dmoe_dn9_nvf4_gaudi2" OR KERNEL STREQUAL "ink_dmoe_dn9_mxf8_gaudi2")
+        list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_dmoe_dn9_gaudi2.c")
+    endif()
+    if(KERNEL STREQUAL "ink_vmoe_up_nvf4_gaudi2" OR KERNEL STREQUAL "ink_vmoe_up_mxf8_gaudi2")
+        list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_vmoe_up_gaudi2.c")
+    endif()
+    if(KERNEL STREQUAL "ink_vmoe_dn_nvf4_gaudi2" OR KERNEL STREQUAL "ink_vmoe_dn_mxf8_gaudi2")
+        list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_vmoe_dn_gaudi2.c")
+    endif()
+    if(KERNEL STREQUAL "ink_mxfp8_deq_bf16_gaudi2")
+        list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_nvf4_deq_bf16_gaudi2.c")
+    endif()
+    if(KERNEL MATCHES "^ink_")
+        list(APPEND TPC_EXTRA_DEPENDENCIES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/norm_math_gaudi2.h"
+             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_conv_bf16_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_qprep_bf16_gaudi2.c"
+             "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_mix_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_mg_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_math_gaudi2.h" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_dmix_gaudi2.h" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_dgram_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_dnorm_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_dpost_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_dattn_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_dgate_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_dpost_v_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_dattn_v_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_dgate_v_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_dpost_b_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_dattn_b_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_dgate_b_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_droute1_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_lin_gaudi2.h" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_prprep_gaudi2.c" "${CMAKE_CURRENT_SOURCE_DIR}/kernels/ink_pgate_gaudi2.c")
+    endif()
     add_custom_command(
         OUTPUT "${TPC_OBJECT}"
         COMMAND "${TPC_COMPILER}" -Wall -Werror -O2 -march=gaudi2 ${TPC_EXTRA_FLAGS} ${WY_EXTRA}
@@ -189,6 +319,7 @@ add_library(
     host/silu_and_mul_bf16_gaudi2.cpp
     host/silu_mul_quant_bf16_gaudi2.cpp
     host/spec_conv_bf16_gaudi2.cpp
+    host/inkling_gaudi2.cpp
     ${TPC_EMBEDDED_OBJECTS}
 )
 target_include_directories(

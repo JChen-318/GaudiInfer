@@ -275,6 +275,11 @@ python3 tools/convert_vision.py  /models/qwen3.8-27b-fp8  packs/vision.g2w
 
 把权重包放在内存盘上（比如 `/dev/shm`），服务器启动可以缩短到约 30 秒。
 
+### Inkling-2-Mini
+
+`g2e_server` 也可以部署 [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)（循环式 MoE 模型：24 个存储层，每个 token 做 48 次层计算；0–19 层为原生 NVFP4 专家权重，20–23 层为原生 MXFP8 专家权重，无舍入地保存在 17.65 GiB 的权重包中），支持最多 8 个槽位、批量解码、DSpark 投机解码、图片输入、可配置的设备端 BF16 权重缓存（`G2E_INK_BF16_CACHE`）以及最长 1M token 的上下文。它有独立的转换脚本、权重包校验脚本、SCAL 配置（`tools/scal-g2e-ink.json`）和引擎开关，详见 [docs/inkling2.md](docs/inkling2.md)。
+
+
 ## 运行
 
 ```bash

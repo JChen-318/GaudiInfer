@@ -20,7 +20,7 @@
 
     <div class="nav-tabs" id="navTabs">
       <button data-v="monitor" class="on"><span data-i18n="nav_monitor">硬件监控</span></button>
-      <button data-v="llm"><i class="dot-mini"></i><span data-i18n="nav_llm">27B 对话</span></button>
+      <button data-v="llm"><i class="dot-mini"></i><span data-i18n="nav_llm">LLM 对话</span></button>
       <button data-v="qwen21"><i class="dot-mini"></i><span data-i18n="nav_qwen21">Qwen 2.1 生图</span></button>
       <button data-v="h3_image"><i class="dot-mini"></i><span data-i18n="nav_h3i">H3 图像</span></button>
       <button data-v="h3"><i class="dot-mini"></i><span data-i18n="nav_h3">H3 视频</span></button>
@@ -60,13 +60,14 @@
   <!-- ==================== VIEW 1: 27B CHAT + VLM ==================== -->
   <section class="view" id="v-llm">
     <div class="need-engine" id="need-llm">
-      <div><b data-i18n="need_llm_t">Qwen3.8-27B 当前未加载</b><div class="card-sub" data-i18n="need_llm_s">单卡 Gaudi2 每次常驻一个模型，点击右侧按钮一键切换（/dev/shm 加载极速就绪）</div></div>
+      <div><b data-i18n="need_llm_t">对话模型当前未加载</b><div class="card-sub" data-i18n="need_llm_s">单卡 Gaudi2 每次常驻一个模型，点击右侧按钮一键切换（/dev/shm 加载极速就绪）</div></div>
       <button class="btn primary" onclick="switchEngine('llm')" data-i18n="launch_llm">一键启动 Qwen3.8-27B</button>
+      <button class="btn" onclick="switchEngine('inkling')" data-i18n="launch_ink">一键启动 Inkling-2-Mini</button>
     </div>
     <div class="chat-wrap">
       <div class="card">
         <div class="card-head" style="margin-bottom:12px">
-          <div><div class="card-title" data-i18n="chat_cfg_t">Qwen3.8-27B 设置</div><div class="card-sub" data-i18n="chat_cfg_s">FP8 + DSpine-b16 · 视觉多模态</div></div>
+          <div><div class="card-title" data-i18n="chat_cfg_t">对话设置</div><div class="card-sub" data-i18n="chat_cfg_s">Qwen3.8-27B / Inkling-2-Mini · 视觉多模态</div></div>
           <button class="btn sm" id="chatClear" data-i18n="chat_new">新对话</button>
         </div>
         <div class="fld">
@@ -442,7 +443,7 @@
           <div class="track"><div class="fill" id="fHbm" style="background:var(--purple)"></div></div>
         </div>
         <div class="meter">
-          <div class="meter-head"><span>KV Cache (27B)</span><span id="mtKv">–</span></div>
+          <div class="meter-head"><span>KV Cache</span><span id="mtKv">–</span></div>
           <div class="track"><div class="fill" id="fKv" style="background:var(--blue)"></div></div>
         </div>
         <div class="meter">

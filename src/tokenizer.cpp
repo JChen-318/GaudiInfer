@@ -24,7 +24,11 @@ std::string llama_regex(const std::string& pattern) {
         "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
     const std::string ci = "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])";
     if (pattern == qwen2 || pattern == qwen35) return ci + pattern.substr(pattern.find(')') + 1);
-    return pattern;
+    // other patterns (o200k / GPT-4o: Inkling): spell every case-insensitive contraction group out
+    std::string out = pattern;
+    const std::string group = "(?i:'s|'t|'re|'ve|'m|'ll|'d)";
+    for (size_t at = out.find(group); at != std::string::npos; at = out.find(group, at + ci.size())) out.replace(at, group.size(), ci);
+    return out;
 }
 // UTF-8 length of the sequence starting with byte c (1 for continuation/invalid bytes)
 size_t utf8_len(unsigned char c) {
@@ -59,6 +63,7 @@ Tokenizer::Tokenizer(const std::string& path) {
         }
         bytes_[size_t(id)] = raw;
     }
+    ignore_merges_ = model.value("ignore_merges", false);
     int32_t rank = 0;
     for (const auto& m : model.at("merges")) {
         std::string key = m.is_array() ? m[0].get<std::string>() + " " + m[1].get<std::string>() : m.get<std::string>();
@@ -103,6 +108,12 @@ void Tokenizer::bpe(const std::string& word, std::vector<int32_t>& out) const {
         std::lock_guard lock(cache_mutex_);
         if (auto it = cache_.find(word); it != cache_.end()) {
             out.insert(out.end(), it->second.begin(), it->second.end());
+            return;
+        }
+    }
+    if (ignore_merges_) {  // a word that is itself a vocabulary entry is one token (tokenizers' ignore_merges)
+        if (const auto it = vocab_.find(word); it != vocab_.end()) {
+            out.push_back(it->second);
             return;
         }
     }

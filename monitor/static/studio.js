@@ -11,15 +11,15 @@ document.querySelectorAll('[data-ic]').forEach(el => { el.outerHTML = ico(el.dat
 /* ==================== i18n Dictionary (ZH / EN) ==================== */
 const I18N = {
   zh: {
-    nav_llm: '27B 对话', nav_qwen21: 'Qwen 2.1 生图', nav_h3i: 'H3 图像', nav_h3: 'H3 视频',
+    nav_llm: 'LLM 对话', nav_qwen21: 'Qwen 2.1 生图', nav_h3i: 'H3 图像', nav_h3: 'H3 视频',
     nav_gallery: '作品画廊', nav_monitor: '硬件监控',
     hw_mini_tip: '点击查看完整硬件监控', theme_tip: '切换深浅色主题', pause_tip: '暂停 / 继续',
     connecting: '连接中…', disconnected: '连接断开', switching: '切换中…', running: '运行中', card_idle: '卡空闲',
     elapsed: '耗时', view_logs: '查看日志', start: '启动', stop: '停止', loading: '加载中…',
     clear: '清空', refresh: '刷新', send: '发送', close_esc: '关闭 (Esc)', download: '下载', del: '删',
-    need_llm_t: 'Qwen3.8-27B 当前未加载',
+    need_llm_t: '对话模型当前未加载',
     need_llm_s: '单卡 Gaudi2 每次常驻一个模型，点击右侧按钮一键切换（/dev/shm 加载极速就绪）',
-    launch_llm: '一键启动 Qwen3.8-27B',
+    launch_llm: '一键启动 Qwen3.8-27B', launch_ink: '一键启动 Inkling-2-Mini',
     need_q21_t: 'Qwen-Image-2.1-Turbo 当前未加载',
     need_q21_s: '1024² 文生图 2.3s、1–4 图编辑 4.2s（占用 22.6 GiB HBM）',
     launch_q21: '一键启动 Qwen 2.1 生图',
@@ -30,7 +30,7 @@ const I18N = {
     need_h3_s: '支持文生音视频（T2VA）、首帧生视频（I2VA）与首尾帧过渡（FL2VA），同步生成双声道音频',
     launch_h3: '一键启动 H3 视频',
 
-    chat_cfg_t: 'Qwen3.8-27B 设置', chat_cfg_s: 'FP8 + DSpine-b16 · 视觉多模态', chat_new: '新对话',
+    chat_cfg_t: '对话设置', chat_cfg_s: 'Qwen3.8-27B / Inkling-2-Mini · 视觉多模态', chat_new: '新对话',
     chat_think: '开启深度思考 (Thinking)', chat_temp: '温度 Temp', chat_max: '最大输出',
     chat_sys: '系统提示词 (可选)', chat_sys_ph: '例如：你是一个专业视觉与代码助手，回答简洁直接。',
     quick_presets: '快捷提示', chat_add_img: '📎 图片', chat_add_img_tip: '上传图片给 27B 分析',
@@ -105,6 +105,7 @@ const I18N = {
     waiting_data: '等待采样数据…', total_t: '总耗时', encode_t: '编码', frames_u: '帧',
     eng_hints: {
       llm: ['~33 GiB + 动态 KV', '~180–210 tok/s · 看图 + 思考'],
+      inkling: ['~28 GiB + 动态 KV', '~130–200 tok/s · 看图 + 思考 · 1M'],
       qwen21: ['22.6 GiB', '1024² 约 2.3s · 编辑约 4.2s'],
       h3_image: ['56.9 GiB', '2K 约 4.6s · 4K 16MP 约 22s'],
       h3: ['~62 GiB', '480p/768p 5–15s 同步双声道'],
@@ -155,15 +156,15 @@ const I18N = {
     ],
   },
   en: {
-    nav_llm: '27B Chat', nav_qwen21: 'Qwen 2.1', nav_h3i: 'H3 Image', nav_h3: 'H3 Video',
+    nav_llm: 'LLM Chat', nav_qwen21: 'Qwen 2.1', nav_h3i: 'H3 Image', nav_h3: 'H3 Video',
     nav_gallery: 'Gallery', nav_monitor: 'Monitor',
     hw_mini_tip: 'Open full hardware monitor', theme_tip: 'Toggle Light / Dark theme', pause_tip: 'Pause / Resume',
     connecting: 'Connecting…', disconnected: 'Disconnected', switching: 'Switching…', running: 'Running', card_idle: 'Idle',
     elapsed: 'Elapsed', view_logs: 'Logs', start: 'Start', stop: 'Stop', loading: 'Loading…',
     clear: 'Clear', refresh: 'Refresh', send: 'Send', close_esc: 'Close (Esc)', download: 'Download', del: 'Del',
-    need_llm_t: 'Qwen3.8-27B is not loaded',
+    need_llm_t: 'No chat model is loaded',
     need_llm_s: 'Single Gaudi2 hosts one engine at a time. Click right to switch (fast load from /dev/shm).',
-    launch_llm: 'Launch Qwen3.8-27B',
+    launch_llm: 'Launch Qwen3.8-27B', launch_ink: 'Launch Inkling-2-Mini',
     need_q21_t: 'Qwen-Image-2.1-Turbo is not loaded',
     need_q21_s: '1024² T2I in ~2.3s, 1–4 ref editing in ~4.2s (22.6 GiB HBM).',
     launch_q21: 'Launch Qwen 2.1 Image',
@@ -174,7 +175,7 @@ const I18N = {
     need_h3_s: 'Text-to-Video+Audio (T2VA), First-Frame (I2VA) & First/Last-Frame (FL2VA) with stereo audio.',
     launch_h3: 'Launch H3 Video',
 
-    chat_cfg_t: 'Qwen3.8-27B Settings', chat_cfg_s: 'FP8 + DSpine-b16 · Multimodal Vision', chat_new: 'New Chat',
+    chat_cfg_t: 'Chat Settings', chat_cfg_s: 'Qwen3.8-27B / Inkling-2-Mini · Multimodal Vision', chat_new: 'New Chat',
     chat_think: 'Enable Thinking', chat_temp: 'Temperature', chat_max: 'Max Tokens',
     chat_sys: 'System Prompt (Optional)', chat_sys_ph: 'e.g., You are a concise vision & coding assistant.',
     quick_presets: 'Quick Presets', chat_add_img: '📎 Image', chat_add_img_tip: 'Attach image(s) for 27B Vision',
@@ -248,6 +249,7 @@ const I18N = {
     waiting_data: 'Waiting for samples…', total_t: 'Total', encode_t: 'Encode', frames_u: 'f',
     eng_hints: {
       llm: ['~33 GiB + Dynamic KV', '~180–210 tok/s · Vision + Thinking'],
+      inkling: ['~28 GiB + Dynamic KV', '~130–200 tok/s · Vision + Thinking · 1M'],
       qwen21: ['22.6 GiB', '1024² ~2.3s · Edit ~4.2s'],
       h3_image: ['56.9 GiB', '2K ~4.6s · 4K 16MP ~22s'],
       h3: ['~62 GiB', '480p/768p 5–15s Stereo Audio'],
@@ -671,7 +673,7 @@ function renderEngineStrip(snap) {
       btnHtml = `<button class="btn sm primary" ${st === 'loading' || st === 'stopping' ? 'disabled' : ''} onclick="switchEngine('${it.id}')">${esc(t('start'))}</button>`;
     }
     return `<div class="eng-card ${cls}">
-      <div class="eng-info" style="cursor:pointer" onclick="switchView('${it.id}')">
+      <div class="eng-info" style="cursor:pointer" onclick="switchView('${it.kind === 'chat' ? 'llm' : it.id}')">
         <div class="eng-name"><i class="sdot ${dot}"></i>${esc(it.name)}</div>
         <div class="eng-meta">${esc(hbmStr)} · ${esc(spdStr)}</div>
       </div>
@@ -680,10 +682,12 @@ function renderEngineStrip(snap) {
   }).join('');
 
   ['llm', 'qwen21', 'h3_image', 'h3'].forEach(eid => {
-    const it = items.find(x => x.id === eid);
+    const its = items.filter(x => x.id === eid || (eid === 'llm' && x.kind === 'chat'));
     const el = $('need-' + eid);
-    if (el) el.classList.toggle('on', !(it && it.healthy) && !(it && it.loading));
+    if (el) el.classList.toggle('on', !its.some(it => it.healthy || it.loading));
   });
+  const chatOn = items.find(x => x.kind === 'chat' && x.healthy);
+  if (chatOn) S.chatModel = chatOn.name;
 
   if (E.h3_loras && !$('h3Lora').dataset.loaded) {
     $('h3Lora').dataset.loaded = '1';
@@ -799,7 +803,7 @@ async function sendChat() {
 
   const aEl = document.createElement('div');
   aEl.className = 'msg assistant';
-  aEl.innerHTML = `<div class="msg-role">Qwen3.8-27B</div>
+  aEl.innerHTML = `<div class="msg-role">${esc(S.chatModel || 'Assistant')}</div>
     <details class="think" style="display:none"><summary><span>${esc(t('think_title'))}</span><span class="tlen"></span></summary><pre></pre></details>
     <div class="msg-bub typing"></div>
     <div class="msg-meta">${esc(t('wait_resp'))}</div>`;
@@ -1232,7 +1236,8 @@ function renderMonitor(snap) {
   $('chModel').textContent = E.model || t('not_loaded');
   $('chEngine').textContent = mode === 'idle' ? `Gaudi2 ${t('idle')}` : `${E.url?.replace(/^https?:\/\//, '')} · Direct MME + SRAM`;
   $('hwSub').textContent = `Intel Gaudi2 ${hw.name || 'HL-225'}`;
-  $('chCtx').textContent = mode === 'llm' ? (E.max_model_len ? Math.round(E.max_model_len / 1024) + 'K' : '256K')
+  const chatMode = mode === 'llm' || mode === 'inkling';
+  $('chCtx').textContent = chatMode ? (E.max_model_len ? Math.round(E.max_model_len / 1024) + 'K' : '256K')
     : (st.completed != null ? (en ? `${st.completed} done` : `已完成 ${st.completed}`) : t('idle'));
   $('lastUpd').textContent = hms(snap.timestamp || Date.now() / 1000);
 
@@ -1380,7 +1385,7 @@ function renderMonitor(snap) {
     slotKey = key;
     $('slots').innerHTML = Array.from({ length: tot }, (_, i) => `<div class="slot ${i < act ? 'on' : ''}"><span>Slot ${i}</span><i class="sd"></i></div>`).join('');
   }
-  $('capSub').textContent = mode === 'llm' ? (en ? `${act} / ${tot} active slots` : `${act} / ${tot} 活跃槽位`)
+  $('capSub').textContent = chatMode ? (en ? `${act} / ${tot} active slots` : `${act} / ${tot} 活跃槽位`)
     : (E.healthy ? (en ? `${E.model} resident on card` : `${E.model} 单卡独占常驻`) : `Gaudi2 ${t('idle')}`);
   $('capQueue').textContent = q > 0 ? (en ? `Queued ${q}` : `排队 ${q}`) : (E.healthy ? t('online') : t('idle'));
   $('capQueue').className = 'badge ' + (q > 0 ? 'warn' : (E.healthy ? 'ok' : 'dim'));

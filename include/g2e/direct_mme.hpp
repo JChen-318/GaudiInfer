@@ -41,6 +41,42 @@ struct DirectTpcTensor {
 
 class DirectPlan;
 
+// One MME tile job for a dynamic grouped-GEMM stage (DirectDynMmeSet).
+struct DirectMmeJob {
+    const MmeTemplate* tmpl = nullptr;
+    uint64_t a = 0;
+    uint64_t b = 0;
+    uint64_t c0 = 0;
+    uint64_t c1 = 0;
+};
+
+// Reusable per-slot dynamic MME ECB buffer set (shared across all layers of one chunk slot in hbm_shared + host_shared).
+// Builds diff-encoded QMAN chunks on CPU for up to `num_stages` dynamic stages and uploads ALL code in ONE SCAL PDMA.
+class DirectDynMmeSet {
+public:
+    DirectDynMmeSet(class DirectRuntime& rt, uint32_t num_stages, uint32_t max_ecbs = 48,
+                    size_t max_code_bytes = 384u << 10);
+    ~DirectDynMmeSet();
+    DirectDynMmeSet(const DirectDynMmeSet&) = delete;
+    DirectDynMmeSet& operator=(const DirectDynMmeSet&) = delete;
+
+    void reset();
+    uint32_t set_stage(uint32_t stage_idx, std::span<const DirectMmeJob> jobs,
+                       bool has_wait, uint32_t wait_target, uint32_t fence_id, uint32_t sig_sob_abs);
+    void upload();
+
+    uint32_t stage_credits(uint32_t stage_idx) const;
+    size_t last_code_bytes() const;
+    uint32_t last_ecb_count() const;
+
+    struct Impl;
+    Impl& impl() { return *impl_; }
+    const Impl& impl() const { return *impl_; }
+
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
 // Process-wide SCAL direct-dispatch context borrowing the existing Synapse device.
 class DirectRuntime {
 public:
@@ -48,13 +84,31 @@ public:
     // Returns true if a valid SCAL direct config is now active in the process environment.
     static bool ensure_scal_config();
 
+    // Opt-in behaviours, all off by default: the plans, waits and uploads of the models that do not ask for them stay
+    // as they are. A model's Direct engine sets them once, before it builds its first plan. The environment overrides
+    // each one (0 / 1): G2E_DIRECT_SPIN, G2E_DIRECT_MME_DIFF, G2E_DIRECT_PDMA_PATCH.
+    struct Options {
+        // wait_fence polls the host fence counter in user space (up to 50 ms) before it blocks in SCAL: no wake-up
+        // latency after a short plan, at the price of one busy host core while a plan runs.
+        bool spin_wait = false;
+        // After the first MME descriptor of an ECB chunk only the words that changed are written (smaller plans).
+        bool mme_diff = false;
+        // flush_patches / flush_patches_and_upload send the dirty ECBs as PDMA commands of the compute scheduler on
+        // the runtime's own stream instead of a Synapse stream copy + synchronisation.
+        bool pdma_patches = false;
+    };
+
     explicit DirectRuntime(const Device& dev);
     ~DirectRuntime();
+    void set_options(const Options& o);
+    const Options& options() const;
     DirectRuntime(const DirectRuntime&) = delete;
     DirectRuntime& operator=(const DirectRuntime&) = delete;
 
     uint64_t sram_base() const;
     uint64_t sram_size() const;
+    // sram_size() less what SCAL keeps for itself at the end (the TPC barrier kernel, when the config puts it in SRAM)
+    uint64_t sram_usable() const;
     uint32_t sob_base() const;
     uint32_t sob_count() const;
     uint32_t monitor_base() const;
@@ -66,6 +120,15 @@ public:
 
     // Synchronous HBM <-> SRAM copy on a temporary Synapse stream (for setup / verification).
     void copy_sync(uint64_t src, uint64_t dst, uint64_t bytes) const;
+    // Fast synchronous DRAM -> host download on the runtime's persistent DMA-only patch stream.
+    void download_sync(uint64_t src_dev_addr, void* dst_host, size_t bytes);
+    // Direct SCAL PDMA (compute_media_scheduler PDMA_BATCH_TRANSFER -> host_shared, zero Synapse stream/ISR).
+    struct PdmaH2D { const void* src; uint64_t dst; uint32_t bytes; };
+    struct PdmaD2H { uint64_t src; void* dst; uint32_t bytes; };
+    void pdma_d2h_sync(uint64_t src_dev_addr, void* dst_host, size_t bytes);
+    void pdma_h2d_sync(const void* src_host, uint64_t dst_dev_addr, size_t bytes);
+    void pdma_h2d_scatter_sync(std::span<const PdmaH2D> xfers);
+    void pdma_d2h_scatter_sync(std::span<const PdmaD2H> xfers);
 
     // Upload all dirty patched ECBs across multiple DirectPlans in ONE batched PDMA sync.
     void flush_patches(std::span<DirectPlan* const> plans);
@@ -81,6 +144,10 @@ public:
     // Non-blocking submit + wait for double-buffered chain pipelining (requires plans fit in <= 1 chunk when pipelining).
     uint32_t submit_chain(std::span<DirectPlan* const> plans);
     void wait_chain(uint32_t in_flight);
+
+    // Steps of one or two plans (DirectWave) back-to-back; the two plans of a step (lanes 1 and 2, DirectPlan::set_lane)
+    // run concurrently with their stages dispatched in the step's interleaving order. Returns total elapsed us.
+    double run_waves(std::span<const struct DirectWave> steps);
 
     bool chain_enabled() const;
 
@@ -111,7 +178,7 @@ public:
     // so patch_addr(tag, new_addr) can retarget HBM pointers in-place after prepare() with zero rebuild.
     void add_mme(const MmeTemplate& tmpl, uint64_t a, uint64_t b, uint64_t c0, uint64_t c1 = 0,
                  int wait_sob = -1, uint32_t wait_target = 0, int sig_sob = -1,
-                 std::array<int, 4> patch_tags = {-1, -1, -1, -1});
+                 std::array<int, 4> patch_tags = {-1, -1, -1, -1}, int override_fence = -1);
 
     // Run two independent single-engine GEMMs in parallel (engine 0 uses (a0,b0,c0), engine 1 uses (a1,b1,c1)),
     // replicating tmpl's engine-0 descriptor(s) onto both MME engines. Signals sig_sob twice per engine-0 signal.
@@ -137,6 +204,31 @@ public:
                  int sig_sob = -1, uint32_t tpc_cmd = 0xf, std::span<const int> tensor_patch_tags = {},
                  std::span<const int> srf_patch_tags = {});
 
+    // Before the first stage: lane 1 or 2 gives the plan one half of the private SOBs / monitors (at most 64 SOBs,
+    // 24 waiting MME stages, 27 waiting TPC stages), so a lane-1 and a lane-2 plan can run at the same time.
+    void set_lane(uint32_t lane);
+    // Stages so far (consecutive MME stages without a wait form one stage).
+    size_t stage_count() const;
+    // MME descriptors per engine in one ECB chunk (default 9, the most that fit)
+    void set_mme_chunk_limit(uint32_t n);
+    // Start a new MME stage on the next add_mme (even when wait_sob < 0), so wave interleaving can schedule
+    // the other plan's MME stages between large MME blocks with zero extra waits/SOBs.
+    void end_mme_stage();
+
+    // Tag subsequent MME/TPC stages with an optional bit index [0..63] (-1: always active). Forces a stage break
+    // whenever the tag changes. At runtime, stages whose bit is 0 in opt_mask are skipped and dependent SOB wait
+    // targets are reduced by their skipped signal counts automatically.
+    void set_opt_id(int id);
+    void set_opt_mask(uint64_t mask);
+
+    // Append a dynamic MME stage backed by `dyn_set`'s `dyn_stage_idx` (0 bytes in plan_code/plan_meta; reserves 2 MME
+    // monitors if wait_sob >= 0). At run time, skips if inactive, arms with dyn stage's wait_target, and queues its ECBs.
+    void add_dyn_mme(const DirectDynMmeSet* dyn_set, uint32_t dyn_stage_idx, int wait_sob = -1, int sig_sob = -1);
+
+    // Dynamic wait-target slots [0..15] for TPC stages waiting on dynamic MME SOBs.
+    void set_next_dyn_wait(int slot);
+    void set_dyn_wait(int slot, uint32_t target);
+
     // Validate every QMAN packet, upload ECBs to hbm_shared with readback verification, and pre-configure monitors.
     void prepare();
 
@@ -155,6 +247,15 @@ public:
 
 private:
     std::unique_ptr<Impl> impl_;
+};
+
+// One step of DirectRuntime::run_waves: plan a, optionally plan b running concurrently. order: the dispatch sequence
+// of their stages (bit 15: plan b; low 15 bits: the stage index in its plan); stages it leaves out follow in plan
+// order. Stages of one plan on one engine type must keep their plan order.
+struct DirectWave {
+    DirectPlan* a = nullptr;
+    DirectPlan* b = nullptr;
+    std::vector<uint16_t> order;
 };
 
 }  // namespace g2e

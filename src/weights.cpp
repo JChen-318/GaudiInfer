@@ -22,6 +22,7 @@ DType parse_dtype(const std::string& s) {
     if (s == "f32") return DType::F32;
     if (s == "f16") return DType::F16;
     if (s == "i32") return DType::I32;
+    if (s == "u8") return DType::U8;
     throw std::runtime_error("g2w: unknown dtype " + s);
 }
 struct Fd {
