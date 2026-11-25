@@ -37,6 +37,7 @@ private:
     std::vector<bool> special_;                       // id -> special added token
     std::vector<std::pair<std::string, int32_t>> added_;  // added tokens, longest first
     std::string regex_;
+    bool ignore_merges_ = false;
     mutable std::mutex cache_mutex_;
     mutable std::unordered_map<std::string, std::vector<int32_t>> cache_;
 };

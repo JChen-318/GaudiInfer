@@ -263,4 +263,45 @@ VisionImage preprocess_image(const uint8_t* rgb, int width, int height, uint64_t
     return preprocess_image_exact(img.data(), rw, rh, patch, merge);
 }
 
+VisionImage preprocess_inkling_image(const uint8_t* rgb, int width, int height, uint32_t max_tokens, uint32_t patch,
+                                     uint32_t merge) {
+    const int cell = int(patch * merge);
+    auto cells = [&](int w, int h) { return uint64_t((h + cell - 1) / cell) * uint64_t((w + cell - 1) / cell); };
+    std::vector<uint8_t> img(rgb, rgb + size_t(width) * height * 3);
+    int w = width, h = height;
+    if (max_tokens && cells(w, h) > max_tokens) {  // shrink (keeping the aspect ratio) until the cells fit
+        double f = std::sqrt(double(max_tokens) * cell * cell / (double(w) * h));
+        int nw = 0, nh = 0;
+        for (;; f *= 0.98) {
+            nw = std::max(1, int(std::floor(w * f)));
+            nh = std::max(1, int(std::floor(h * f)));
+            if (cells(nw, nh) <= max_tokens) break;
+        }
+        img = resize_channels(img.data(), w, h, nw, nh, 3);
+        w = nw;
+        h = nh;
+    }
+    const uint32_t rows = uint32_t((h + cell - 1) / cell), cols = uint32_t((w + cell - 1) / cell);
+    VisionImage out;
+    out.grid_h = rows * merge;
+    out.grid_w = cols * merge;
+    const uint64_t P = patch, K = P * P * 3, N = uint64_t(out.grid_h) * out.grid_w;
+    out.patches.resize(N * K);
+    const float pad = (-1.0f * float(1.0 / 255.0) - 0.5f) / 0.5f;  // the reference pads with -1 on the 0-255 scale
+    for (uint64_t p = 0; p < N; ++p) {
+        // cells row-major, the cell's patches row-major; each patch [row, col, channel]
+        const uint64_t blk = p / (merge * merge), in = p % (merge * merge);
+        const uint64_t prow = (blk / cols) * merge + in / merge, pcol = (blk % cols) * merge + in % merge;
+        float* dst = &out.patches[p * K];
+        for (uint64_t y = 0; y < P; ++y)
+            for (uint64_t x = 0; x < P; ++x) {
+                const uint64_t iy = prow * P + y, ix = pcol * P + x;
+                for (uint64_t c = 0; c < 3; ++c)
+                    dst[(y * P + x) * 3 + c] = (iy < uint64_t(h) && ix < uint64_t(w))
+                        ? (float(img[(iy * uint64_t(w) + ix) * 3 + c]) * float(1.0 / 255.0) - 0.5f) / 0.5f : pad;
+            }
+    }
+    return out;
+}
+
 }  // namespace g2e

@@ -47,8 +47,8 @@ RUN cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
     && cp build/tpc/flashinfer_gaudi/libflashinfer_gaudi_kernels.so /stage/opt/gaudiinfer/lib/ \
     && find build/tpc/flashinfer_gaudi -maxdepth 1 -name '*.o' ! -name '*_embedded.o' \
         -exec cp {} /stage/opt/gaudiinfer/lib/ \; \
-    && cp tools/scal-g2e-direct.json /stage/opt/gaudiinfer/tools/ \
-    && cp -r tools/mme_descs_R128 tools/mme_descs_R16 tools/mme_descs_h3 /stage/opt/gaudiinfer/tools/ \
+    && cp tools/scal-g2e-direct.json tools/scal-g2e-ink.json /stage/opt/gaudiinfer/tools/ \
+    && cp -r tools/mme_descs_R128 tools/mme_descs_R16 tools/mme_descs_h3 tools/mme_descs_ink /stage/opt/gaudiinfer/tools/ \
     && cp docker/entrypoint.sh /stage/opt/gaudiinfer/entrypoint.sh \
     && sed -i 's/\r$//' /stage/opt/gaudiinfer/entrypoint.sh \
     && chmod +x /stage/opt/gaudiinfer/entrypoint.sh
@@ -68,6 +68,7 @@ ENV G2E_TPC_LIB=/opt/gaudiinfer/lib/libflashinfer_gaudi_kernels.so \
     G2E_MME_DESC_DIR=/opt/gaudiinfer/tools/mme_descs_R128 \
     G2E_MME_DESC_DIR_R16=/opt/gaudiinfer/tools/mme_descs_R16 \
     G2E_H3_MME_DESC_DIR=/opt/gaudiinfer/tools/mme_descs_h3 \
+    G2E_INK_MME_DIR=/opt/gaudiinfer/tools/mme_descs_ink \
     SCAL_CONFIG_FILE_PATH=/opt/gaudiinfer/tools/scal-g2e-direct.json \
     SCAL_CFG_FILE_PATH=/opt/gaudiinfer/tools/scal-g2e-direct.json \
     HABANA_SCAL_BIN_PATH=/opt/habanalabs/engines_fw \

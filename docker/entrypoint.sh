@@ -64,6 +64,40 @@ if [ "${G2E_MODE:-llm}" = "h3_image" ]; then
         --tokenizer "${G2E_H3I_TOKENIZER:-/models/minimax-h3/FL2VA/tokenizer/tokenizer.json}"
 fi
 
+if [ "${G2E_MODE:-llm}" = "inkling" ]; then
+    # Inkling-2 (docs/inkling2.md): its own SCAL config (two plan lanes, the whole SRAM) and the Direct engine switches.
+    mkdir -p "${G2E_RECIPE_CACHE:-/data/recipes}" "${HABANA_LOGS:-/data/habana_logs}"
+    export SCAL_CONFIG_FILE_PATH=/opt/gaudiinfer/tools/scal-g2e-ink.json
+    export SCAL_CFG_FILE_PATH=/opt/gaudiinfer/tools/scal-g2e-ink.json
+    export G2E_INK_DIRECT="${G2E_INK_DIRECT:-15}" G2E_INK_DIRECT_SRAM="${G2E_INK_DIRECT_SRAM:-1}" \
+           G2E_INK_DPREFILL="${G2E_INK_DPREFILL:-15}" G2E_INK_BF16_CACHE="${G2E_INK_BF16_CACHE:-auto}"
+    if [ "$#" -gt 0 ]; then
+        exec "$BIN" "$@"
+    fi
+    PDIR="${G2E_PACKS_DIR:-/packs}"
+    INK_ARGS=(
+        --model-dir "${G2E_MODEL_DIR:-/models/Inkling-2-Mini}"
+        --target-pack "${G2E_TARGET_PACK:-${PDIR}/inkling2-mini.g2w}"
+        --served-model-name "${G2E_SERVED_MODEL_NAME:-inkling-2-mini}"
+        --host "${G2E_HOST:-0.0.0.0}"
+        --port "${G2E_PORT:-8001}"
+        --max-model-len "${G2E_MAX_MODEL_LEN:-131072}"
+        --slots "${G2E_SLOTS:-8}"
+        --kv-cache-gib "${G2E_KV_CACHE_GIB:-0}"
+    )
+    INK_DRAFT="${G2E_DRAFT_PACK:-${PDIR}/inkling2-mini-dspark.g2w}"
+    INK_VISION="${G2E_VISION_PACK:-${PDIR}/inkling2-mini-vision.g2w}"
+    if [ -f "${INK_DRAFT}" ]; then INK_ARGS+=(--draft-pack "${INK_DRAFT}"); fi
+    if [ -f "${INK_VISION}" ]; then INK_ARGS+=(--vision-pack "${INK_VISION}"); fi
+    if [ -n "${G2E_EXTRA_ARGS:-}" ]; then
+        # shellcheck disable=SC2206
+        EXTRA=(${G2E_EXTRA_ARGS})
+        INK_ARGS+=("${EXTRA[@]}")
+    fi
+    echo "[gaudiinfer] starting g2e_server for Inkling-2 (packs=${PDIR}, port=${G2E_PORT:-8001}, max_model_len=${G2E_MAX_MODEL_LEN:-131072}, slots=${G2E_SLOTS:-8}, bf16_cache=${G2E_INK_BF16_CACHE})"
+    exec "$BIN" "${INK_ARGS[@]}"
+fi
+
 # Allow passing raw g2e_server CLI flags directly.
 if [ "$#" -gt 0 ]; then
     exec "$BIN" "$@"

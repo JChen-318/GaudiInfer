@@ -275,6 +275,10 @@ python3 tools/convert_vision.py  /models/qwen3.8-27b-fp8  packs/vision.g2w
 
 Keeping the packs on a RAM disk (for example `/dev/shm`) brings server start-up down to about 30 seconds.
 
+### Inkling-2-Mini
+
+`g2e_server` also serves [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (a looped MoE model: 24 stored layers, 48 layer applications per token, with native NVFP4 experts in layers 0-19 and MXFP8 experts in layers 20-23 stored without rounding in a 17.65 GiB pack) with up to 8 slots, batched decode, DSpark speculative decoding, image input, configurable on-device BF16 weight caching (`G2E_INK_BF16_CACHE`), and contexts up to 1M tokens. It has its own converters, pack verifier, SCAL config (`tools/scal-g2e-ink.json`), and engine switches: see [docs/inkling2.md](docs/inkling2.md).
+
 ## Run
 
 ```bash

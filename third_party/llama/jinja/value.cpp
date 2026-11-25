@@ -1,3 +1,5 @@
+#include <nlohmann/json.hpp>
+#include <functional>
 #include "runtime.h"
 #include "common_unicode.h"
 #include "value.h"
@@ -247,14 +249,50 @@ static value tojson(const func_args & args) {
     if (is_val<value_int>(val_indent)) {
         indent = static_cast<int>(val_indent->as_int());
     }
-    if (val_sort->as_bool()) { // undefined == false
-        throw not_implemented_exception("tojson sort_keys=true not implemented");
-    }
     const bool ensure_ascii = val_ascii->as_bool(); // undefined == false
     auto separators = (is_val<value_array>(val_separators) ? val_separators : mk_val<value_array>())->as_array();
     std::string item_sep = separators.size() > 0 ? separators[0]->as_string().str() : (indent < 0 ? ", " : ",");
     std::string key_sep = separators.size() > 1 ? separators[1]->as_string().str() : ": ";
     std::string json_str = value_to_json(args.get_pos(0), indent, item_sep, key_sep);
+    if (val_sort->as_bool()) { // undefined == false
+        // g2e: sort_keys=true (Inkling-2 chat template): re-serialize with every object's keys in code point order
+        // (nlohmann::json objects are std::map: UTF-8 byte order == code point order)
+        const auto j = nlohmann::json::parse(value_to_json(args.get_pos(0), -1, ",", ":"));
+        std::function<void(const nlohmann::json&, int, std::string&)> dump = [&](const nlohmann::json& x, int level, std::string& out) {
+            auto nl = [&](int lv) {
+                if (indent >= 0) { out += "\n"; out.append(size_t(indent) * size_t(lv), ' '); }
+            };
+            if (x.is_object()) {
+                if (x.empty()) { out += "{}"; return; }
+                out += "{";
+                bool first = true;
+                for (auto it = x.begin(); it != x.end(); ++it) {
+                    if (!first) out += item_sep;
+                    first = false;
+                    nl(level + 1);
+                    out += nlohmann::json(it.key()).dump();
+                    out += key_sep;
+                    dump(it.value(), level + 1, out);
+                }
+                nl(level);
+                out += "}";
+            } else if (x.is_array()) {
+                if (x.empty()) { out += "[]"; return; }
+                out += "[";
+                for (size_t i = 0; i < x.size(); ++i) {
+                    if (i) out += item_sep;
+                    nl(level + 1);
+                    dump(x[i], level + 1, out);
+                }
+                nl(level);
+                out += "]";
+            } else {
+                out += x.dump();
+            }
+        };
+        json_str.clear();
+        dump(j, 0, json_str);
+    }
     if (ensure_ascii) {
         json_str = json_ensure_ascii_preserving_format(json_str);
     }

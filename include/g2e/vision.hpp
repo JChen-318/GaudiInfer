@@ -28,6 +28,12 @@ VisionImage preprocess_image(const uint8_t* rgb, int width, int height, uint64_t
                              uint32_t patch = 16, uint32_t merge = 2);
 // Patchify an ALREADY-resized RGB image (width, height multiples of patch*merge) without resizing again.
 VisionImage preprocess_image_exact(const uint8_t* rgb, int width, int height, uint32_t patch = 16, uint32_t merge = 2);
+// Inkling2ImageProcessor: no resize; pad (bottom / right) to the patch*merge grid with -1 on the 0-255 scale, rescale
+// 1/255, normalise (mean 0.5, std 0.5); one image token per cell. Patches: cells row-major, the cell's patches
+// row-major, each [row, column, channel]. Images over max_tokens cells (0: no limit) are first shrunk (keeping the
+// aspect ratio; the reference processor has no limit).
+VisionImage preprocess_inkling_image(const uint8_t* rgb, int width, int height, uint32_t max_tokens, uint32_t patch = 20,
+                                     uint32_t merge = 2);
 // Decode a PNG/JPEG/WebP/... file in memory to 8-bit RGB, compositing any alpha channel over solid white. Throws on failure.
 std::vector<uint8_t> decode_image(const uint8_t* data, size_t size, int& width, int& height);
 // Decode a PNG/JPEG/... file in memory to 8-bit RGBA (opaque A=255 if source has no alpha).

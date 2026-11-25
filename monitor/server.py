@@ -3,6 +3,7 @@
 
 Unified workbench + real-time hardware telemetry + one-click engine switcher for:
   - llm       : Qwen3.8-27B FP8 + DSpine-b16 + Vision (:8001)
+  - inkling   : Inkling-2-Mini looped MoE + DSpark + Vision (:8003, docs/inkling2.md)
   - qwen21    : Qwen-Image-2.1-Turbo T2I & 1-4 Ref Edit (:8098)
   - h3_image  : MiniMax-H3-Image 2K/4K 16MP T2I & 1-16 Ref Edit (:8099)
   - h3        : MiniMax-H3 Video + Stereo Audio T2VA / FL2VA (:8097)
@@ -55,6 +56,17 @@ ENGINE_SPECS = {
         "hbm_est": "~33 GiB + 动态 KV",
         "speed_hint": "~180–210 tok/s · 看图 + 思考",
     },
+    "inkling": {
+        "id": "inkling",
+        "name": "Inkling-2-Mini",
+        "short": "Inkling 对话",
+        "subtitle": "Looped MoE + DSpark + Vision · 1M 上下文",
+        "kind": "chat",
+        "port": int(os.environ.get("G2E_INK_PORT", "8003")),
+        "binary": "g2e_server",
+        "hbm_est": "~50 GiB（含 BF16 权重缓存）+ 动态 KV",
+        "speed_hint": "~90–170 tok/s · 8 槽位批量解码",
+    },
     "qwen21": {
         "id": "qwen21",
         "name": "Qwen-Image-2.1-Turbo",
@@ -90,7 +102,8 @@ ENGINE_SPECS = {
     },
 }
 
-ENGINE_ORDER = ["llm", "qwen21", "h3_image", "h3"]
+ENGINE_ORDER = ["llm", "inkling", "qwen21", "h3_image", "h3"]
+CHAT_ENGINES = [e for e in ENGINE_ORDER if ENGINE_SPECS[e]["kind"] == "chat"]
 
 REQ_RE = re.compile(
     r"\[g2e\]\s+prompt\s+(\d+)\s+\(cached\s+(\d+),\s+([\d.]+)%;\s+all requests\s+([\d.]+)%\)\s+"
@@ -149,7 +162,7 @@ def build_engine_command(engine_id: str):
         pdir = shm if all((shm / f).is_file() for f in ("qwen3.8-27b.g2w", "dspine-b16.g2w", "vision.g2w")) else PACKS_DIR
         cmd = [
             bin_path,
-            "--model-dir", str(MODELS_DIR / "qwen3.8-27b-fp8-mtp"),
+            "--model-dir", os.environ.get("G2E_LLM_MODEL_DIR", str(MODELS_DIR / "qwen3.8-27b-fp8-mtp")),
             "--target-pack", str(pdir / "qwen3.8-27b.g2w"),
             "--draft-pack", str(pdir / "dspine-b16.g2w"),
             "--vision-pack", str(pdir / "vision.g2w"),
@@ -161,6 +174,37 @@ def build_engine_command(engine_id: str):
             "--kv-cache-gib", "0",
             "--reasoning-parser", "qwen3",
         ]
+    elif engine_id == "inkling":
+        # Inkling's Direct engine: its own SCAL config (two plan lanes, the whole SRAM) and the engine switches
+        ink_scal = str(REPO_DIR / "tools/scal-g2e-ink.json")
+        env["SCAL_CONFIG_FILE_PATH"] = ink_scal
+        env["SCAL_CFG_FILE_PATH"] = ink_scal
+        for k, v in (("G2E_INK_DIRECT", "15"), ("G2E_INK_DIRECT_SRAM", "1"), ("G2E_INK_DPREFILL", "15"),
+                     ("G2E_INK_BF16_CACHE", "auto")):
+            env.setdefault(k, v)
+        ink_recipes = DATA_DIR / "recipes-inkling"
+        if "G2E_INK_RECIPE_CACHE" in os.environ:
+            env["G2E_RECIPE_CACHE"] = os.environ["G2E_INK_RECIPE_CACHE"]
+        elif ink_recipes.is_dir() and os.access(ink_recipes, os.W_OK):
+            env["G2E_RECIPE_CACHE"] = str(ink_recipes)
+        shm = pathlib.Path("/dev/shm/g2e")
+        pack = lambda env_name, *names: os.environ.get(env_name) or pick_existing(
+            *[d / n for n in names for d in (shm, PACKS_DIR)])
+        cmd = [
+            bin_path,
+            "--model-dir", os.environ.get("G2E_INK_MODEL_DIR", str(MODELS_DIR / "Inkling-2-Mini")),
+            "--target-pack", pack("G2E_INK_TARGET_PACK", "inkling2-mini.g2w"),
+            "--served-model-name", "inkling-2-mini",
+            "--host", "0.0.0.0",
+            "--port", port,
+            "--max-model-len", os.environ.get("G2E_INK_MAX_MODEL_LEN", "1048576"),
+            "--slots", os.environ.get("G2E_SLOTS", "8"),
+        ]
+        for flag, env_name, name in (("--draft-pack", "G2E_INK_DRAFT_PACK", "inkling2-mini-dspark.g2w"),
+                                     ("--vision-pack", "G2E_INK_VISION_PACK", "inkling2-mini-vision.g2w")):
+            path = pack(env_name, name)
+            if os.path.exists(path):
+                cmd.extend([flag, path])
     elif engine_id == "qwen21":
         cmd = [
             bin_path,
@@ -1094,7 +1138,7 @@ class TelemetryStore:
             eng["max_model_len"] = m0.get("max_model_len")
             eng["started_at"] = m0.get("created")
 
-        if active_id == "llm" and self._version_cache is None:
+        if active_id in CHAT_ENGINES and self._version_cache is None:
             try:
                 _, ver = http_json(f"{active_url}/version", timeout=1.5)
                 self._version_cache = ver.get("version")
@@ -1285,17 +1329,34 @@ def poller_loop():
 
 # ------------------------------------------------------------------------------------------------ Chat Streaming
 
+def active_chat_engine() -> str:
+    """The chat engine that answers /health (Qwen3.8 or Inkling-2), else the default LLM."""
+    for eid in CHAT_ENGINES:
+        try:
+            if http_status(f"http://127.0.0.1:{ENGINE_SPECS[eid]['port']}/health", timeout=0.8) == 200:
+                return eid
+        except Exception:
+            pass
+    return "llm"
+
+
 def stream_chat_events(messages: list, max_tokens: int, temperature: float, enable_thinking: bool = True):
-    llm_url = f"http://127.0.0.1:{ENGINE_SPECS['llm']['port']}"
+    eid = active_chat_engine()
+    llm_url = f"http://127.0.0.1:{ENGINE_SPECS[eid]['port']}"
     payload = {
-        "model": "qwen3.8-27b",
+        "model": "inkling-2-mini" if eid == "inkling" else "qwen3.8-27b",
         "messages": messages,
         "max_tokens": max(1, min(int(max_tokens), 8192)),
         "temperature": max(0.0, min(float(temperature), 2.0)),
         "stream": True,
         "stream_options": {"include_usage": True},
-        "chat_template_kwargs": {"enable_thinking": bool(enable_thinking)},
     }
+    if eid == "inkling":
+        # the Inkling template's switch is reasoning_effort (none, low, ..., max); its default thinks
+        if not enable_thinking:
+            payload["reasoning_effort"] = "none"
+    else:
+        payload["chat_template_kwargs"] = {"enable_thinking": bool(enable_thinking)}
     req = urllib.request.Request(
         f"{llm_url}/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),

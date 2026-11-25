@@ -35,8 +35,11 @@ constexpr uint32_t kOwnBudget = kOwnRing - 512u;
 constexpr uint64_t kMme0FenceAddr = 0x1000007ffc0ca2dcull;
 constexpr uint64_t kMme2FenceAddr = 0x1000007ffc4ca2dcull;
 
-uint64_t tpc_fence_addr(uint32_t index) {
-    return 0x1000007ffc00a2dcull + uint64_t(index / 6) * 0x200000ull + uint64_t(index % 6) * 0x10000ull;
+// CP_FENCE<id>_RDATA of the lower CP (index 4) of an engine's QMAN: fence 3 at 0x2dc, 0x14 per fence id below it
+uint64_t fence_reg(uint64_t fence3_addr, uint32_t fence_id) { return fence3_addr - uint64_t(3 - fence_id) * 0x14ull; }
+
+uint64_t tpc_fence_addr(uint32_t index, uint32_t fence_id = 3) {
+    return fence_reg(0x1000007ffc00a2dcull + uint64_t(index / 6) * 0x200000ull + uint64_t(index % 6) * 0x10000ull, fence_id);
 }
 
 uint32_t tpc_hw_dtype(DType dt) {
@@ -150,7 +153,7 @@ bool validate_static_program(const std::vector<char>& raw, uint32_t group) {
             if (!allowed || !p->msg_barrier || p->swtc) return false;
         } else if (p->opcode == PACKET_FENCE) {
             const auto* f = reinterpret_cast<const packet_fence*>(p);
-            if ((f->id != 3 && !(f->id == 2 && group == SCAL_MME_COMPUTE_GROUP)) || f->target_val != 1 || f->dec_val != 1)
+            if ((f->id != 3 && f->id != 2) || f->target_val != 1 || f->dec_val != 1)
                 return false;
         } else if (p->opcode == PACKET_NOP) {
             const auto* n = reinterpret_cast<const packet_nop*>(p);
@@ -337,21 +340,33 @@ struct PreparedEcb {
     bool dirty = false;
 };
 
+// 0 / 1 from the environment, -1 when the variable is unset
+static int env_switch(const char* name) {
+    const char* e = std::getenv(name);
+    return (e && *e) ? int(*e != '0') : -1;
+}
+
 struct DirectRuntime::Impl {
+    DirectRuntime::Options opt;
     synDeviceId dev_id = 0;
     int fd = -1;
     uint64_t sram_base = 0;
     uint64_t sram_size = 0;
+    uint64_t sram_usable = 0;
 
     scal_handle_t scal = nullptr;
     scal_stream_handle_t stream = nullptr;
     scal_host_fence_counter_handle_t fence = nullptr;
     scal_pool_handle_t host_pool = nullptr;
     scal_pool_handle_t hbm_pool = nullptr;
+    // the prepared plans' share of the pools (256 MiB / 128 MiB); shared with the plans, which may outlive the runtime
+    struct PoolUse { uint64_t code = 0, meta = 0; uint32_t plans = 0; };
+    std::shared_ptr<PoolUse> pool_use = std::make_shared<PoolUse>();
     scal_pool_handle_t bin_pool = nullptr;
     scal_buffer_handle_t cmd_buf = nullptr;
     void* commands = nullptr;
     volatile const uint64_t* host_counter = nullptr;
+    const uint64_t* host_req_counter = nullptr;
 
     uint32_t pi = 0;
     uint32_t run_start = 0;
@@ -377,10 +392,54 @@ struct DirectRuntime::Impl {
     synStreamHandle patch_stream = nullptr;
     void* patch_stage = nullptr;
     size_t patch_stage_cap = 0;
+    scal_buffer_handle_t pdma_buf = nullptr;
+    void* pdma_host = nullptr;
+    uint64_t pdma_dev = 0;
+    size_t pdma_cap = 0;
 
     ~Impl() {
         if (patch_stream) synStreamDestroy(patch_stream);
         if (patch_stage) synHostFree(dev_id, patch_stage, 0);
+        if (pdma_buf) scal_free_buffer(pdma_buf);
+    }
+
+    void ensure_pdma_buf(size_t bytes) {
+        if (pdma_buf && bytes <= pdma_cap) return;
+        if (pdma_buf) { scal_free_buffer(pdma_buf); pdma_buf = nullptr; }
+        pdma_cap = std::max<size_t>((bytes + 4095) & ~size_t(4095), 256u << 10);
+        if (scal_allocate_buffer(host_pool, pdma_cap, &pdma_buf))
+            throw std::runtime_error("direct_mme: cannot allocate host_shared pdma buffer");
+        scal_buffer_info_t bi{};
+        if (scal_buffer_get_info(pdma_buf, &bi) || !bi.host_address || !bi.device_address)
+            throw std::runtime_error("direct_mme: host_shared pdma buffer info missing host/device addr");
+        pdma_host = bi.host_address;
+        pdma_dev = bi.device_address;
+    }
+
+    void emit_pdma_batch(uint32_t group, uint32_t dir, const sched_arc_pdma_commands_params_t* ps, uint32_t count, uint32_t sig_sob_abs) {
+        // count must be 1 or 2 so command size (16 + 20*count <= 56) fits inside cmd_align (64).
+        struct __attribute__((aligned(4), packed)) Cmd2 {
+            sched_arc_cmd_pdma_batch_transfer_t hdr;
+            sched_arc_pdma_commands_params_t p[2];
+        } cmd{};
+        cmd.hdr.opcode = SCHED_COMPUTE_ARC_CMD_PDMA_BATCH_TRANSFER;
+        cmd.hdr.engine_group_type = group;
+        cmd.hdr.watch_dog_sig_value = 0;
+        cmd.hdr.signal_to_cg = 0;
+        cmd.hdr.workload_type = ENG_PDMA_ARC_CMD_BATCH_NO_FRAGMENTATION;
+        cmd.hdr.stream_ctxt_id = dir;
+        cmd.hdr.api_id = 0;
+        cmd.hdr.has_payload = 1;
+        cmd.hdr.batch_count = count;
+        cmd.hdr.pay_data = 0x80000001u;
+        cmd.hdr.pay_addr = uint32_t(mmDCORE2_SYNC_MNGR_OBJS_BASE + sig_sob_abs * 4);
+        for (uint32_t i = 0; i < count; ++i) cmd.p[i] = ps[i];
+        append(&cmd, 16u + 20u * count);
+    }
+
+    void emit_pdma_1(uint32_t group, uint32_t dir, uint64_t src, uint64_t dst, uint32_t bytes, uint32_t sig_sob_abs) {
+        sched_arc_pdma_commands_params_t p{bytes, src, dst};
+        emit_pdma_batch(group, dir, &p, 1, sig_sob_abs);
     }
 
     void ensure_patch_buf(size_t bytes) {
@@ -474,6 +533,18 @@ struct DirectRuntime::Impl {
     }
 
     void wait_fence(uint64_t credits, uint64_t timeout_us = 2000000) {
+        if (opt.spin_wait && host_counter && host_req_counter) {
+            const uint64_t target = *host_req_counter + credits;
+            if (*host_counter < target) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+                for (uint32_t it = 0; *host_counter < target; ++it) {
+                    if ((it & 255u) == 255u && std::chrono::steady_clock::now() >= deadline) break;
+#if defined(__x86_64__) || defined(_M_X64)
+                    __builtin_ia32_pause();
+#endif
+                }
+            }
+        }
         const int rc = scal_host_fence_counter_wait(fence, credits, timeout_us);
         if (rc) {
             const uint64_t cur = host_counter ? *host_counter : 0;
@@ -640,6 +711,7 @@ bool DirectRuntime::ensure_scal_config() {
 
 DirectRuntime::DirectRuntime(const Device& dev) : impl_(std::make_unique<Impl>()) {
     auto& s = *impl_;
+    set_options(Options{});  // the defaults, unless the environment asks otherwise
     s.dev_id = dev.id();
     synDeviceInfoV2 info{};
     check(synDeviceGetInfoV2(s.dev_id, &info), "direct_mme synDeviceGetInfoV2");
@@ -649,6 +721,11 @@ DirectRuntime::DirectRuntime(const Device& dev) : impl_(std::make_unique<Impl>()
 
     if (scal_get_handle_from_fd(s.fd, &s.scal) || !s.scal)
         throw std::runtime_error("direct_mme: scal_get_handle_from_fd failed");
+    // SCAL's usable SRAM size: with tpc_barrier_in_sram=true SCAL keeps its 2 KiB TPC barrier kernel at
+    // sram_end - 2 KiB and scal_get_sram_size() reports 48 MiB - 2 KiB; with false all 48.00 MiB is free.
+    s.sram_usable = s.sram_size;
+    if (const uint32_t scal_sram = scal_get_sram_size(s.scal); scal_sram > 0 && uint64_t(scal_sram) < s.sram_size)
+        s.sram_usable = scal_sram;
     if (scal_get_stream_handle_by_name(s.scal, "mme_attention0", &s.stream))
         throw std::runtime_error("direct_mme: stream 'mme_attention0' not found (set SCAL_CFG_FILE_PATH=tools/scal-g2e-direct.json)");
     if (scal_get_pool_handle_by_name(s.scal, "host_shared", &s.host_pool) ||
@@ -678,6 +755,7 @@ DirectRuntime::DirectRuntime(const Device& dev) : impl_(std::make_unique<Impl>()
         throw std::runtime_error("direct_mme: bad host fence info");
     s.host_sob = fi.info.so_index;
     s.host_counter = fi.info.ctr;
+    s.host_req_counter = fi.info.request_counter;
 
     scal_so_pool_handle_t sos = nullptr;
     scal_monitor_pool_handle_t mons = nullptr;
@@ -758,8 +836,19 @@ DirectRuntime::DirectRuntime(const Device& dev) : impl_(std::make_unique<Impl>()
 
 DirectRuntime::~DirectRuntime() = default;
 
+void DirectRuntime::set_options(const Options& o) {
+    auto& s = *impl_;
+    s.opt = o;
+    if (const int v = env_switch("G2E_DIRECT_SPIN"); v >= 0) s.opt.spin_wait = v;
+    if (const int v = env_switch("G2E_DIRECT_MME_DIFF"); v >= 0) s.opt.mme_diff = v;
+    if (const int v = env_switch("G2E_DIRECT_PDMA_PATCH"); v >= 0) s.opt.pdma_patches = v;
+}
+
+const DirectRuntime::Options& DirectRuntime::options() const { return impl_->opt; }
+
 uint64_t DirectRuntime::sram_base() const { return impl_->sram_base; }
 uint64_t DirectRuntime::sram_size() const { return impl_->sram_size; }
+uint64_t DirectRuntime::sram_usable() const { return impl_->sram_usable; }
 uint32_t DirectRuntime::sob_base() const { return impl_->sob_base; }
 uint32_t DirectRuntime::sob_count() const { return impl_->sob_count; }
 uint32_t DirectRuntime::monitor_base() const { return impl_->mon_base; }
@@ -771,21 +860,22 @@ uint64_t DirectRuntime::load_tpc_elf(const std::string& obj_path) {
     auto& s = *impl_;
     if (auto it = s.isa_cache.find(obj_path); it != s.isa_cache.end()) return it->second;
     const auto isa = extract_elf_text(obj_path);
-    if (isa.empty() || isa.size() > 65536)
+    const uint64_t cap = (uint64_t(isa.size()) + 65535) / 65536 * 65536;  // 64 KB granules
+    if (isa.empty() || isa.size() > 4 * 65536)
         throw std::runtime_error("direct_mme: TPC ISA size out of range: " + std::to_string(isa.size()));
     scal_buffer_handle_t buf = nullptr;
-    if (scal_allocate_aligned_buffer(s.bin_pool, 65536, 256, &buf))
+    if (scal_allocate_aligned_buffer(s.bin_pool, cap, 256, &buf))
         throw std::runtime_error("direct_mme: hbm_binary alloc failed");
     scal_buffer_info_t bi{};
     if (scal_buffer_get_info(buf, &bi) || !bi.device_address)
         throw std::runtime_error("direct_mme: hbm_binary info failed");
     void* host = nullptr;
     synStreamHandle upload = nullptr;
-    check(synHostMalloc(s.dev_id, 65536, 0, &host), "direct_mme isa synHostMalloc");
+    check(synHostMalloc(s.dev_id, cap, 0, &host), "direct_mme isa synHostMalloc");
     check(synStreamCreateGeneric(&upload, s.dev_id, 0), "direct_mme isa synStreamCreateGeneric");
-    std::memset(host, 0, 65536);
+    std::memset(host, 0, cap);
     std::memcpy(host, isa.data(), isa.size());
-    check(synMemCopyAsync(upload, reinterpret_cast<uintptr_t>(host), 65536, bi.device_address, HOST_TO_DRAM),
+    check(synMemCopyAsync(upload, reinterpret_cast<uintptr_t>(host), cap, bi.device_address, HOST_TO_DRAM),
           "direct_mme upload TPC ISA");
     check(synStreamSynchronize(upload), "direct_mme sync TPC ISA");
     synStreamDestroy(upload);
@@ -802,6 +892,87 @@ void DirectRuntime::copy_sync(uint64_t src, uint64_t dst, uint64_t bytes) const 
     synStreamDestroy(st);
 }
 
+void DirectRuntime::download_sync(uint64_t src_dev_addr, void* dst_host, size_t bytes) {
+    pdma_d2h_sync(src_dev_addr, dst_host, bytes);
+}
+
+void DirectRuntime::pdma_d2h_sync(uint64_t src_dev_addr, void* dst_host, size_t bytes) {
+    auto& s = *impl_;
+    s.ensure_pdma_buf(bytes);
+    s.begin();
+    s.emit_pdma_1(SCAL_PDMA_RX_GROUP, PDMA_DIR_DEV2HOST, src_dev_addr, s.pdma_dev, uint32_t(bytes), s.host_sob);
+    s.submit();
+    s.wait_fence(1, 500000);
+    std::memcpy(dst_host, s.pdma_host, bytes);
+}
+
+void DirectRuntime::pdma_h2d_sync(const void* src_host, uint64_t dst_dev_addr, size_t bytes) {
+    auto& s = *impl_;
+    s.ensure_pdma_buf(bytes);
+    std::memcpy(s.pdma_host, src_host, bytes);
+    s.begin();
+    s.emit_pdma_1(SCAL_PDMA_TX_DATA_GROUP, PDMA_DIR_HOST2DEV, s.pdma_dev, dst_dev_addr, uint32_t(bytes), s.host_sob);
+    s.submit();
+    s.wait_fence(1, 500000);
+}
+
+void DirectRuntime::pdma_h2d_scatter_sync(std::span<const PdmaH2D> xfers) {
+    if (xfers.empty()) return;
+    auto& s = *impl_;
+    size_t total = 0;
+    for (const auto& x : xfers) total += (size_t(x.bytes) + 7) & ~size_t(7);
+    s.ensure_pdma_buf(total);
+    std::vector<sched_arc_pdma_commands_params_t> ps;
+    ps.reserve(xfers.size());
+    size_t off = 0;
+    for (const auto& x : xfers) {
+        if (!x.bytes) continue;
+        std::memcpy(static_cast<char*>(s.pdma_host) + off, x.src, x.bytes);
+        ps.push_back({x.bytes, s.pdma_dev + off, x.dst});
+        off += (size_t(x.bytes) + 7) & ~size_t(7);
+    }
+    if (ps.empty()) return;
+    s.begin();
+    uint32_t sigs = 0;
+    for (size_t i = 0; i < ps.size(); i += 2) {
+        const uint32_t cnt = uint32_t(std::min<size_t>(2, ps.size() - i));
+        s.emit_pdma_batch(SCAL_PDMA_TX_DATA_GROUP, PDMA_DIR_HOST2DEV, &ps[i], cnt, s.host_sob);
+        ++sigs;
+    }
+    s.submit();
+    s.wait_fence(sigs, 500000);
+}
+
+void DirectRuntime::pdma_d2h_scatter_sync(std::span<const PdmaD2H> xfers) {
+    if (xfers.empty()) return;
+    auto& s = *impl_;
+    size_t total = 0;
+    for (const auto& x : xfers) total += (size_t(x.bytes) + 7) & ~size_t(7);
+    s.ensure_pdma_buf(total);
+    std::vector<sched_arc_pdma_commands_params_t> ps;
+    std::vector<std::tuple<size_t, void*, uint32_t>> cp;
+    ps.reserve(xfers.size());
+    cp.reserve(xfers.size());
+    size_t off = 0;
+    for (const auto& x : xfers) {
+        if (!x.bytes) continue;
+        ps.push_back({x.bytes, x.src, s.pdma_dev + off});
+        cp.push_back({off, x.dst, x.bytes});
+        off += (size_t(x.bytes) + 7) & ~size_t(7);
+    }
+    if (ps.empty()) return;
+    s.begin();
+    uint32_t sigs = 0;
+    for (size_t i = 0; i < ps.size(); i += 2) {
+        const uint32_t cnt = uint32_t(std::min<size_t>(2, ps.size() - i));
+        s.emit_pdma_batch(SCAL_PDMA_RX_GROUP, PDMA_DIR_DEV2HOST, &ps[i], cnt, s.host_sob);
+        ++sigs;
+    }
+    s.submit();
+    s.wait_fence(sigs, 500000);
+    for (const auto& [o, dst, nb] : cp) std::memcpy(dst, static_cast<const char*>(s.pdma_host) + o, nb);
+}
+
 std::vector<float> DirectRuntime::interleave_f32_scales(std::span<const float> src) {
     if ((src.size() % 128) != 0) throw std::invalid_argument("interleave_f32_scales: size must be multiple of 128");
     std::vector<float> out(src.size());
@@ -813,6 +984,313 @@ std::vector<float> DirectRuntime::interleave_f32_scales(std::span<const float> s
     }
     return out;
 }
+
+struct DirectDynMmeSet::Impl {
+    DirectRuntime& rt;
+    struct DynStage {
+        bool active = false;
+        bool has_wait = false;
+        uint32_t wait_target = 0;
+        uint32_t sig_credits = 0;
+        std::vector<PreparedEcb> ecbs;
+    };
+    struct DiffKey {
+        const MmeTemplate* prev_t;
+        const MmeTemplate* cur_t;
+        uint8_t prev_act;
+        uint8_t cur_act;
+        uint8_t eng;
+        bool operator<(const DiffKey& o) const {
+            return std::tie(prev_t, cur_t, prev_act, cur_act, eng) <
+                   std::tie(o.prev_t, o.cur_t, o.prev_act, o.cur_act, o.eng);
+        }
+    };
+    struct DiffBlob {
+        std::vector<char> raw;
+        int32_t sob_byte_off = -1;  // byte offset inside `raw` of kSobWord (0x14c) if present
+    };
+    std::vector<DynStage> stages;
+    uint32_t max_ecbs = 0;
+    size_t max_code_bytes = 0;
+    scal_buffer_handle_t meta_buf = nullptr;
+    scal_buffer_handle_t code_buf = nullptr;
+    void* meta_host = nullptr;
+    uint64_t meta_core = 0;
+    uint64_t code_dev = 0;
+    uint32_t ecb_used = 0;
+    size_t code_used = 0;
+    std::shared_ptr<DirectRuntime::Impl::PoolUse> pool_use;
+    alignas(64) char prog_buf[2][8192];
+    std::map<DiffKey, DiffBlob> diff_cache;
+
+    Impl(DirectRuntime& r, uint32_t num_stages, uint32_t max_e, size_t max_c)
+        : rt(r), stages(num_stages), max_ecbs(max_e), max_code_bytes((max_c + 255) & ~size_t(255)) {
+        auto& s = rt.impl();
+        const int rc_h = scal_allocate_aligned_buffer(s.host_pool, size_t(max_ecbs) * 512, 256, &meta_buf);
+        const int rc_d = rc_h ? 0 : scal_allocate_aligned_buffer(s.hbm_pool, max_code_bytes, 256, &code_buf);
+        if (rc_h || rc_d)
+            throw std::runtime_error("direct_mme: DirectDynMmeSet alloc failed");
+        scal_buffer_info_t mi{}, ci{};
+        if (scal_buffer_get_info(meta_buf, &mi) || scal_buffer_get_info(code_buf, &ci) ||
+            !mi.host_address || !mi.core_address || (mi.core_address % 256) != 0)
+            throw std::runtime_error("direct_mme: DirectDynMmeSet buffer info failed");
+        meta_host = mi.host_address;
+        meta_core = mi.core_address;
+        code_dev = ci.device_address;
+        pool_use = s.pool_use;
+        pool_use->code += max_code_bytes;
+        pool_use->meta += size_t(max_ecbs) * 512;
+        // Pre-populate invariant 512B ECB headers for all slots once (flush_chunk only patches 2 sizes + 1 offset!).
+        std::memset(meta_host, 0, size_t(max_ecbs) * 512);
+        for (uint32_t slot = 0; slot < max_ecbs; ++slot) {
+            char* md = static_cast<char*>(meta_host) + size_t(slot) * 512;
+            for (uint32_t part = 0; part < 2; ++part) {
+                auto* sz = reinterpret_cast<eng_arc_cmd_list_size_t*>(md + 256 * part);
+                sz->cmd_type = ECB_CMD_LIST_SIZE;
+                sz->topology_start = 1;
+                sz->list_size = 256;
+            }
+            auto* dyn = reinterpret_cast<eng_arc_cmd_nop_t*>(md + 4);
+            dyn->cmd_type = ECB_CMD_NOP;
+            dyn->switch_cq = 1;
+            dyn->yield = 1;
+            dyn->padding = 62;
+            auto* entries = reinterpret_cast<eng_arc_cmd_static_desc_v2_t*>(md + 260);
+            for (uint32_t i = 0; i < 2; ++i) {
+                entries[i].cmd_type = ECB_CMD_STATIC_DESC_V2;
+                entries[i].cpu_index = i;
+                entries[i].addr_index = 6;
+                entries[i].yield = (i == 1) ? 1 : 0;
+            }
+            const uint32_t used = 4 + 2 * uint32_t(sizeof(*entries));
+            auto* pad = reinterpret_cast<eng_arc_cmd_nop_t*>(md + 256 + used);
+            pad->cmd_type = ECB_CMD_NOP;
+            pad->padding = (256 - used) / 4 - 1;
+        }
+    }
+
+    ~Impl() {
+        if (pool_use) {
+            pool_use->code -= max_code_bytes;
+            pool_use->meta -= size_t(max_ecbs) * 512;
+        }
+        if (code_buf) scal_free_buffer(code_buf);
+        if (meta_buf) scal_free_buffer(meta_buf);
+    }
+
+    static const MmeDesc& find_desc(const MmeTemplate& tmpl, uint32_t act, uint32_t eng) {
+        for (const auto& ds : tmpl.descs)
+            if (ds.act == act && ds.engine == eng) return ds;
+        throw std::runtime_error("direct_mme: dyn MME missing (act, eng)");
+    }
+
+    // Pre-encoded QMAN register-write blob for words [8..181] transitioning (prev_t, prev_act) -> (cur_t, cur_act).
+    // When prev_t == nullptr, emits full words [8..181] (including kSobWord); otherwise emits only differing spans.
+    const DiffBlob& get_diff(const MmeTemplate* prev_t, uint8_t prev_act,
+                             const MmeTemplate* cur_t, uint8_t cur_act, uint8_t eng, bool diff_on) {
+        const DiffKey key{diff_on ? prev_t : nullptr, cur_t, diff_on ? prev_act : uint8_t(0), cur_act, eng};
+        if (auto it = diff_cache.find(key); it != diff_cache.end()) return it->second;
+        constexpr uint32_t kAddrWords = 8, kSobWord = (0x14c - 8) / 4;
+        const auto& cur_w = find_desc(*cur_t, cur_act, eng).words;
+        DiffBlob blob;
+        if (!key.prev_t) {
+            push_regs_bulk(blob.raw, uint16_t(0xb008 + 4 * kAddrWords), cur_w.data() + kAddrWords, 182 - kAddrWords, false);
+        } else {
+            const auto& prev_w = find_desc(*key.prev_t, key.prev_act, eng).words;
+            auto need = [&](uint32_t i) { return i != kSobWord && cur_w[i] != prev_w[i]; };
+            for (uint32_t i = kAddrWords; i < 182;) {
+                if (!need(i)) { ++i; continue; }
+                uint32_t j = i + 1;
+                for (uint32_t k = j; k < 182 && k < j + 2; ++k)
+                    if (need(k)) { j = k + 1; k = j - 1; }
+                push_regs_bulk(blob.raw, uint16_t(0xb008 + 4 * i), cur_w.data() + i, j - i, false);
+                i = j;
+            }
+        }
+        const int64_t so = find_reg_payload(blob.raw, 0, uint32_t(0xb008 + 4 * kSobWord));
+        blob.sob_byte_off = so >= 0 ? int32_t(so) : -1;
+        return diff_cache.emplace(key, std::move(blob)).first->second;
+    }
+};
+
+DirectDynMmeSet::DirectDynMmeSet(DirectRuntime& rt, uint32_t num_stages, uint32_t max_ecbs, size_t max_code_bytes)
+    : impl_(std::make_unique<Impl>(rt, num_stages, max_ecbs, max_code_bytes)) {}
+DirectDynMmeSet::~DirectDynMmeSet() = default;
+
+void DirectDynMmeSet::reset() {
+    auto& d = *impl_;
+    d.rt.impl().ensure_pdma_buf(d.max_code_bytes);
+    d.ecb_used = 0;
+    d.code_used = 0;
+    for (auto& st : d.stages) {
+        st.active = false;
+        st.has_wait = false;
+        st.wait_target = 0;
+        st.sig_credits = 0;
+        st.ecbs.clear();
+    }
+}
+
+uint32_t DirectDynMmeSet::set_stage(uint32_t stage_idx, std::span<const DirectMmeJob> jobs,
+                                    bool has_wait, uint32_t wait_target, uint32_t fence_id, uint32_t sig_sob_abs) {
+    auto& d = *impl_;
+    if (stage_idx >= d.stages.size()) throw std::out_of_range("direct_mme: dyn stage index out of range");
+    auto& st = d.stages[stage_idx];
+    st.ecbs.clear();
+    st.sig_credits = 0;
+    if (jobs.empty()) {
+        st.active = false;
+        st.has_wait = false;
+        st.wait_target = 0;
+        return 0;
+    }
+    st.active = true;
+    st.has_wait = has_wait;
+    st.wait_target = wait_target;
+
+    const bool diff_on = d.rt.impl().opt.mme_diff;
+    static const bool do_val = std::getenv("G2E_DIRECT_DYN_VALIDATE") != nullptr;
+    auto& s = d.rt.impl();
+    char* const pdma_base = static_cast<char*>(s.pdma_host);
+    const uint32_t sob_addr = uint32_t(mmDCORE2_SYNC_MNGR_OBJS_BASE + sig_sob_abs * 4);
+
+    // Pre-built constant QMAN packet headers (zero per-job struct zeroing or vector resizing).
+    packet_wreg_bulk addr_hdr{};
+    addr_hdr.size64 = 4;  // 8 uint32 address words (0xb008..0xb024)
+    addr_hdr.opcode = PACKET_WREG_BULK;
+    addr_hdr.msg_barrier = 1;
+    addr_hdr.reg_offset = 0xb008;
+    packet_wreg32 exec_pkt{};
+    exec_pkt.opcode = PACKET_WREG_32;
+    exec_pkt.msg_barrier = 1;
+    exec_pkt.reg_offset = 0xb004;
+    exec_pkt.value = 0x3ff;
+    packet_fence fence_pkt{};
+    fence_pkt.opcode = PACKET_FENCE;
+    fence_pkt.msg_barrier = 1;
+    fence_pkt.id = fence_id;
+    fence_pkt.target_val = 1;
+    fence_pkt.dec_val = 1;
+    packet_nop fin_pkt{};
+    fin_pkt.opcode = PACKET_NOP;
+    fin_pkt.msg_barrier = 1;
+    fin_pkt.swtc = 1;
+
+    size_t sz[2] = {0, 0};
+    bool fence_added[2] = {false, false};
+    const MmeTemplate* last_tmpl[2] = {nullptr, nullptr};
+    uint8_t last_act[2] = {0, 0};
+    // Small 1-entry hot cache for consecutive alternating (prev -> cur) blob lookups (e.g. gt512 act0 <-> act1).
+    const MmeTemplate* cache_pt[2] = {nullptr, nullptr};
+    const MmeTemplate* cache_ct[2] = {nullptr, nullptr};
+    uint8_t cache_pa[2] = {0, 0}, cache_ca[2] = {0, 0};
+    const Impl::DiffBlob* cache_b[2] = {nullptr, nullptr};
+
+    auto flush_chunk = [&] {
+        if (!sz[0] && !sz[1]) return;
+        std::memcpy(d.prog_buf[0] + sz[0], &fin_pkt, 8); sz[0] += 8;
+        std::memcpy(d.prog_buf[1] + sz[1], &fin_pkt, 8); sz[1] += 8;
+        if (do_val) {
+            std::vector<char> v0(d.prog_buf[0], d.prog_buf[0] + sz[0]);
+            std::vector<char> v1(d.prog_buf[1], d.prog_buf[1] + sz[1]);
+            if (!validate_static_program(v0, SCAL_MME_COMPUTE_GROUP) ||
+                !validate_static_program(v1, SCAL_MME_COMPUTE_GROUP))
+                throw std::runtime_error("direct_mme: dyn MME static QMAN program validation failed");
+        }
+        const uint32_t off0 = 0;
+        const uint32_t off1 = uint32_t((sz[0] + 63) & ~size_t(63));
+        const size_t chunk_bytes = (size_t(off1) + sz[1] + 255) & ~size_t(255);
+        if (d.ecb_used >= d.max_ecbs || d.code_used + chunk_bytes > d.max_code_bytes)
+            throw std::runtime_error("direct_mme: DirectDynMmeSet capacity exceeded (ecbs=" +
+                                     std::to_string(d.ecb_used) + ", bytes=" + std::to_string(d.code_used + chunk_bytes) + ")");
+        char* dst = pdma_base + d.code_used;
+        std::memcpy(dst + off0, d.prog_buf[0], sz[0]);
+        if (off1 > sz[0]) std::memset(dst + sz[0], 0, off1 - sz[0]);
+        std::memcpy(dst + off1, d.prog_buf[1], sz[1]);
+        if (chunk_bytes > off1 + sz[1]) std::memset(dst + off1 + sz[1], 0, chunk_bytes - (off1 + sz[1]));
+
+        // Patch only variable size/offset fields in pre-initialized 512B ECB meta (zero memset!).
+        char* md = static_cast<char*>(d.meta_host) + size_t(d.ecb_used) * 512;
+        auto* entries = reinterpret_cast<eng_arc_cmd_static_desc_v2_t*>(md + 260);
+        entries[0].size = uint32_t(sz[0]);
+        entries[0].addr_offset = off0;
+        entries[1].size = uint32_t(sz[1]);
+        entries[1].addr_offset = off1;
+
+        PreparedEcb ecb{};
+        ecb.meta_core_addr = d.meta_core + uint64_t(d.ecb_used) * 512ull;
+        ecb.code_dev_addr = d.code_dev + d.code_used;
+        ecb.group = SCAL_MME_COMPUTE_GROUP;
+        st.ecbs.push_back(std::move(ecb));
+
+        ++d.ecb_used;
+        d.code_used += chunk_bytes;
+        sz[0] = sz[1] = 0;
+        last_tmpl[0] = last_tmpl[1] = nullptr;
+    };
+
+    for (const auto& job : jobs) {
+        const auto& tmpl = *job.tmpl;
+        st.sig_credits += tmpl.signal_count;
+        const uint64_t addr4[4] = {job.c1, job.c0, job.a, job.b};
+        for (const auto& desc : tmpl.descs) {
+            const uint32_t e = desc.engine;
+            if (e == 0 && (sz[0] > 7300 || sz[1] > 7300)) flush_chunk();
+            char* dst = d.prog_buf[e] + sz[e];
+            if (has_wait && !fence_added[e]) {
+                std::memcpy(dst, &fence_pkt, 8);
+                dst += 8;
+                fence_added[e] = true;
+            }
+            // Write 8 address words (40 bytes: 8B header + 32B payload)
+            std::memcpy(dst, &addr_hdr, 8);
+            std::memcpy(dst + 8, addr4, 32);
+            dst += 40;
+            const uint8_t da = uint8_t(desc.act);
+            if (!(diff_on && last_tmpl[e] == job.tmpl && last_act[e] == da)) {
+                const Impl::DiffBlob* blob;
+                if (cache_pt[e] == last_tmpl[e] && cache_pa[e] == last_act[e] &&
+                    cache_ct[e] == job.tmpl && cache_ca[e] == da && cache_b[e]) {
+                    blob = cache_b[e];
+                } else {
+                    blob = &d.get_diff(last_tmpl[e], last_act[e], job.tmpl, da, uint8_t(e), diff_on);
+                    cache_pt[e] = last_tmpl[e]; cache_pa[e] = last_act[e];
+                    cache_ct[e] = job.tmpl;     cache_ca[e] = da;
+                    cache_b[e] = blob;
+                }
+                const size_t bn = blob->raw.size();
+                if (bn) {
+                    std::memcpy(dst, blob->raw.data(), bn);
+                    if (blob->sob_byte_off >= 0) std::memcpy(dst + blob->sob_byte_off, &sob_addr, 4);
+                    dst += bn;
+                }
+                last_tmpl[e] = job.tmpl;
+                last_act[e] = da;
+            }
+            std::memcpy(dst, &exec_pkt, 8);
+            dst += 8;
+            sz[e] = size_t(dst - d.prog_buf[e]);
+        }
+    }
+    flush_chunk();
+    return st.sig_credits;
+}
+
+void DirectDynMmeSet::upload() {
+    auto& d = *impl_;
+    if (!d.code_used) return;
+    auto& s = d.rt.impl();
+    s.begin();
+    s.emit_pdma_1(SCAL_PDMA_TX_DATA_GROUP, PDMA_DIR_HOST2DEV, s.pdma_dev, d.code_dev, uint32_t(d.code_used), s.host_sob);
+    s.submit();
+    s.wait_fence(1, 500000);
+}
+
+uint32_t DirectDynMmeSet::stage_credits(uint32_t stage_idx) const {
+    return impl_->stages.at(stage_idx).sig_credits;
+}
+size_t DirectDynMmeSet::last_code_bytes() const { return impl_->code_used; }
+uint32_t DirectDynMmeSet::last_ecb_count() const { return impl_->ecb_used; }
 
 struct DirectPlan::Impl {
     DirectRuntime& rt;
@@ -837,9 +1315,19 @@ struct DirectPlan::Impl {
         bool fence_added[2] = {false, false};
         int wait_sob = -1;
         uint32_t wait_target = 0;
+        uint32_t fence_id = 3;
+        int dyn_wait_slot = -1;
+        const DirectDynMmeSet* dyn_set = nullptr;
+        uint32_t dyn_stage_idx = 0;
+        int opt_id = -1;
+        int sig_sob_rel = -1;
+        uint32_t sig_credits = 0;
         uint32_t engine_mask = 0;  // for MME: bit 0/1; for TPC: number of active TPCs
         uint32_t mon_first = 0;
         std::vector<PreparedEcb> ecbs;
+
+        // the descriptor words last written by this chunk's program, per engine (diff encoding, see add_mme)
+        std::vector<uint32_t> last[2];
 
         void flush_mme_chunk() {
             if (!cnt[0] && !cnt[1]) return;
@@ -847,6 +1335,8 @@ struct DirectPlan::Impl {
             chunks.push_back(std::move(cur));
             cur.assign(2, {});
             cnt[0] = cnt[1] = 0;
+            last[0].clear();
+            last[1].clear();
         }
     };
     std::vector<Stage> stages;
@@ -860,6 +1350,20 @@ struct DirectPlan::Impl {
     static constexpr uint32_t kMmeMonLimit = 96;
     uint32_t next_mme_mon = 0;
     uint32_t next_tpc_mon = kMmeMonLimit;
+    // Lanes (set_lane): two plans that run concurrently (run_waves) use disjoint SOBs and monitors.
+    //   lane 1: SOBs [0, 64),   MME monitors [0, 48),  TPC monitors [96, 744)
+    //   lane 2: SOBs [64, 128), MME monitors [48, 96), TPC monitors [744, 1392)
+    uint32_t mme_chunk_limit = 9;  // MME descriptors per engine in one ECB chunk
+    bool mme_stage_break = false;
+    int next_opt_id = -1;
+    int next_dyn_wait = -1;
+    uint64_t opt_mask = ~uint64_t(0);
+    std::array<uint32_t, 16> dyn_wait_targets{};
+    uint32_t lane = 0;
+    uint32_t fence_id = 3;  // the engines' QMAN fence of this plan's waits (lane 2: fence 2, see set_lane)
+    uint32_t sob_off = 0;
+    uint32_t mme_mon_end = kMmeMonLimit;
+    uint32_t tpc_mon_end = 0;  // 0: the pool's end
     scal_buffer_handle_t plan_meta = nullptr;
     scal_buffer_handle_t plan_code = nullptr;
     bool prepared = false;
@@ -867,7 +1371,14 @@ struct DirectPlan::Impl {
     std::vector<PreparedEcb*> dirty_ecbs;
 
     explicit Impl(DirectRuntime& r, uint32_t /*init_mon*/) : rt(r) {}
+    uint64_t code_bytes = 0, meta_bytes = 0;
+    std::shared_ptr<DirectRuntime::Impl::PoolUse> pool_use;
     ~Impl() {
+        if (pool_use) {
+            pool_use->code -= code_bytes;
+            pool_use->meta -= meta_bytes;
+            --pool_use->plans;
+        }
         if (plan_code) scal_free_buffer(plan_code);
         if (plan_meta) scal_free_buffer(plan_meta);
     }
@@ -876,25 +1387,101 @@ struct DirectPlan::Impl {
 DirectPlan::DirectPlan(DirectRuntime& rt, uint32_t init_mon) : impl_(std::make_unique<Impl>(rt, init_mon)) {}
 DirectPlan::~DirectPlan() = default;
 
-void DirectPlan::add_mme(const MmeTemplate& tmpl, uint64_t a, uint64_t b, uint64_t c0, uint64_t c1,
-                         int wait_sob, uint32_t wait_target, int sig_sob, std::array<int, 4> patch_tags) {
+void DirectPlan::set_lane(uint32_t lane) {
+    auto& p = *impl_;
+    if (!p.stages.empty() || lane > 2) throw std::logic_error("direct_mme: set_lane before the first stage (0..2)");
+    p.lane = lane;
+    if (lane == 1) {
+        p.sob_off = 0; p.next_mme_mon = 0; p.mme_mon_end = 48; p.next_tpc_mon = Impl::kMmeMonLimit; p.tpc_mon_end = 744;
+    } else if (lane == 2) {
+        p.sob_off = 64; p.next_mme_mon = 48; p.mme_mon_end = 96; p.next_tpc_mon = 744; p.tpc_mon_end = 1392;
+        // A fence of its own: the waiting stages of an engine take from one counter per fence id, so with a shared
+        // fence a signal of one lane's plan could release a stage of the other's.
+        p.fence_id = 2;
+    }
+}
+
+size_t DirectPlan::stage_count() const { return impl_->stages.size(); }
+
+void DirectPlan::set_mme_chunk_limit(uint32_t n) {
+    if (n < 1 || n > 9) throw std::invalid_argument("direct_mme: MME chunk limit 1..9");
+    impl_->mme_chunk_limit = n;
+}
+
+void DirectPlan::end_mme_stage() { impl_->mme_stage_break = true; }
+
+void DirectPlan::set_opt_id(int id) {
+    if (id < -1 || id >= 64) throw std::invalid_argument("direct_mme: opt_id must be -1 or 0..63");
+    if (impl_->next_opt_id != id) impl_->mme_stage_break = true;
+    impl_->next_opt_id = id;
+}
+
+void DirectPlan::set_opt_mask(uint64_t mask) { impl_->opt_mask = mask; }
+
+void DirectPlan::set_next_dyn_wait(int slot) {
+    if (slot < -1 || slot >= 16) throw std::invalid_argument("direct_mme: dyn_wait slot must be -1 or 0..15");
+    impl_->next_dyn_wait = slot;
+}
+
+void DirectPlan::set_dyn_wait(int slot, uint32_t target) {
+    if (slot < 0 || slot >= 16) throw std::invalid_argument("direct_mme: dyn_wait slot out of range");
+    impl_->dyn_wait_targets[size_t(slot)] = target;
+}
+
+void DirectPlan::add_dyn_mme(const DirectDynMmeSet* dyn_set, uint32_t dyn_stage_idx, int wait_sob, int sig_sob) {
     auto& p = *impl_;
     if (p.prepared) throw std::logic_error("direct_mme: plan already prepared");
+    if (!dyn_set || dyn_stage_idx >= dyn_set->impl().stages.size())
+        throw std::invalid_argument("direct_mme: bad dyn_set/stage_idx");
+    if (sig_sob < 0) throw std::logic_error("direct_mme: dynamic MME stage must signal a private SOB (not host)");
+    p.max_sob_used = std::max(p.max_sob_used, uint32_t(sig_sob) + 1);
+    if (wait_sob >= 0) p.max_sob_used = std::max(p.max_sob_used, uint32_t(wait_sob) + 1);
+    Impl::Stage st;
+    st.group = SCAL_MME_COMPUTE_GROUP;
+    st.wait_sob = wait_sob;
+    st.wait_target = 0;
+    st.dyn_set = dyn_set;
+    st.dyn_stage_idx = dyn_stage_idx;
+    st.sig_sob_rel = sig_sob;
+    st.engine_mask = 3u;
+    if (wait_sob >= 0) {
+        st.mon_first = p.next_mme_mon;
+        p.next_mme_mon += 2;
+    }
+    p.stages.push_back(std::move(st));
+    p.mme_stage_break = true;
+}
+
+void DirectPlan::add_mme(const MmeTemplate& tmpl, uint64_t a, uint64_t b, uint64_t c0, uint64_t c1,
+                         int wait_sob, uint32_t wait_target, int sig_sob, std::array<int, 4> patch_tags,
+                         int override_fence) {
+    auto& p = *impl_;
+    if (p.prepared) throw std::logic_error("direct_mme: plan already prepared");
+    if (p.next_opt_id >= 0 && wait_sob >= 0)
+        throw std::logic_error("direct_mme: optional MME stage cannot carry wait_sob");
+    const uint32_t st_fence = override_fence >= 0 ? uint32_t(override_fence) : p.fence_id;
     const uint32_t done_sob = p.rt.impl().chain_enabled ? p.rt.impl().chain_sob : p.rt.host_sob();
-    const uint32_t sob_idx = sig_sob < 0 ? done_sob : (p.rt.sob_base() + uint32_t(sig_sob));
+    const uint32_t sob_idx = sig_sob < 0 ? done_sob : (p.rt.sob_base() + p.sob_off + uint32_t(sig_sob));
     if (sig_sob < 0) p.host_credits += tmpl.signal_count;
     else p.max_sob_used = std::max(p.max_sob_used, uint32_t(sig_sob) + 1);
     if (wait_sob >= 0) p.max_sob_used = std::max(p.max_sob_used, uint32_t(wait_sob) + 1);
 
-    const bool append_prev = (wait_sob < 0 && !p.stages.empty() &&
+    const bool append_prev = (!p.mme_stage_break && wait_sob < 0 && !p.stages.empty() &&
                               p.stages.back().group == SCAL_MME_COMPUTE_GROUP &&
-                              p.stages.back().engine_mask == tmpl.engine_mask);
+                              p.stages.back().dyn_set == nullptr &&
+                              p.stages.back().engine_mask == tmpl.engine_mask &&
+                              p.stages.back().opt_id == p.next_opt_id &&
+                              (p.next_opt_id < 0 || p.stages.back().sig_sob_rel == sig_sob));
+    p.mme_stage_break = false;
     if (!append_prev) {
         Impl::Stage st;
         st.group = SCAL_MME_COMPUTE_GROUP;
         st.cur.assign(2, {});
+        st.opt_id = p.next_opt_id;
+        st.sig_sob_rel = sig_sob;
         st.wait_sob = wait_sob;
         st.wait_target = wait_target;
+        st.fence_id = st_fence;
         st.engine_mask = tmpl.engine_mask;
         if (wait_sob >= 0) {
             st.mon_first = p.next_mme_mon;
@@ -904,12 +1491,13 @@ void DirectPlan::add_mme(const MmeTemplate& tmpl, uint64_t a, uint64_t b, uint64
     }
     const uint32_t stage_idx = uint32_t(p.stages.size() - 1);
     auto& st = p.stages.back();
+    st.sig_credits += tmpl.signal_count;
 
     for (const auto& d : tmpl.descs) {
         if (d.engine > 1) throw std::runtime_error("direct_mme: invalid MME engine index");
-        if (st.cnt[d.engine] >= 9) st.flush_mme_chunk();
+        if (st.cnt[d.engine] >= p.mme_chunk_limit) st.flush_mme_chunk();
         if (st.wait_sob >= 0 && !st.fence_added[d.engine]) {
-            push_fence(st.cur[d.engine], 3);
+            push_fence(st.cur[d.engine], st.fence_id);
             st.fence_added[d.engine] = true;
         }
         const uint32_t chunk_idx = uint32_t(st.chunks.size());
@@ -921,7 +1509,29 @@ void DirectPlan::add_mme(const MmeTemplate& tmpl, uint64_t a, uint64_t b, uint64
         set(0x18, uint32_t(a));  set(0x1c, uint32_t(a >> 32));
         set(0x20, uint32_t(b));  set(0x24, uint32_t(b >> 32));
         set(0x14c, uint32_t(mmDCORE2_SYNC_MNGR_OBJS_BASE + sob_idx * 4));
-        push_regs_bulk(st.cur[d.engine], 0xb008, w.data(), 182, false);
+        // The descriptor registers keep their values between executions: after the first descriptor of a chunk's
+        // program only the words that changed are written (Options::mme_diff), plus always the operand addresses
+        // (the runtime patches them per descriptor) and the signal's SOB. A descriptor of the same template as the
+        // one before then takes about 12 words instead of 182: the plans' code pool (about 116 MiB usable) holds the
+        // prefill plans of both chunk slots and the decode plans. The execution time is the same.
+        const bool diff_on = p.rt.impl().opt.mme_diff;
+        auto& lastw = st.last[d.engine];
+        if (!diff_on || lastw.size() != w.size()) {
+            push_regs_bulk(st.cur[d.engine], 0xb008, w.data(), 182, false);
+        } else {
+            constexpr uint32_t kAddrWords = 8, kSobWord = (0x14c - 8) / 4;
+            push_regs_bulk(st.cur[d.engine], 0xb008, w.data(), kAddrWords, false);
+            auto need = [&](uint32_t i) { return w[i] != lastw[i] || i == kSobWord; };
+            for (uint32_t i = kAddrWords; i < 182;) {
+                if (!need(i)) { ++i; continue; }
+                uint32_t j = i + 1;  // the run [i, j): up to the last changed word before two unchanged ones
+                for (uint32_t k = j; k < 182 && k < j + 2; ++k)
+                    if (need(k)) { j = k + 1; k = j - 1; }
+                push_regs_bulk(st.cur[d.engine], uint16_t(0xb008 + 4 * i), w.data() + i, j - i, false);
+                i = j;
+            }
+        }
+        lastw.assign(w.begin(), w.end());
         auto rec_mme = [&](int tag, uint32_t reg_lo) {
             if (tag < 0) return;
             const int64_t lo = find_reg_payload(st.cur[d.engine], scan_from, reg_lo);
@@ -950,7 +1560,7 @@ void DirectPlan::add_mme_pair(const MmeTemplate& tmpl,
         if (d.engine == 0 && d.signals()) ++e0_signals;
     const uint32_t pair_signals = e0_signals * 2u;
     const uint32_t done_sob = p.rt.impl().chain_enabled ? p.rt.impl().chain_sob : p.rt.host_sob();
-    const uint32_t sob_idx = sig_sob < 0 ? done_sob : (p.rt.sob_base() + uint32_t(sig_sob));
+    const uint32_t sob_idx = sig_sob < 0 ? done_sob : (p.rt.sob_base() + p.sob_off + uint32_t(sig_sob));
     if (sig_sob < 0) p.host_credits += pair_signals;
     else p.max_sob_used = std::max(p.max_sob_used, uint32_t(sig_sob) + 1);
     if (wait_sob >= 0) p.max_sob_used = std::max(p.max_sob_used, uint32_t(wait_sob) + 1);
@@ -965,6 +1575,7 @@ void DirectPlan::add_mme_pair(const MmeTemplate& tmpl,
         st.cur.assign(2, {});
         st.wait_sob = wait_sob;
         st.wait_target = wait_target;
+        st.fence_id = p.fence_id;
         st.engine_mask = kBothMask;
         if (wait_sob >= 0) {
             st.mon_first = p.next_mme_mon;
@@ -974,13 +1585,14 @@ void DirectPlan::add_mme_pair(const MmeTemplate& tmpl,
     }
     const uint32_t stage_idx = uint32_t(p.stages.size() - 1);
     auto& st = p.stages.back();
+    st.sig_credits += tmpl.signal_count;
 
     for (const auto& d : tmpl.descs) {
         if (d.engine != 0) continue;
         if (st.cnt[0] >= 9 || st.cnt[1] >= 9) st.flush_mme_chunk();
         auto emit_one = [&](uint32_t eng, uint64_t a, uint64_t b, uint64_t c, const std::array<int, 4>& pt) {
             if (st.wait_sob >= 0 && !st.fence_added[eng]) {
-                push_fence(st.cur[eng], 3);
+                push_fence(st.cur[eng], p.fence_id);
                 st.fence_added[eng] = true;
             }
             const uint32_t chunk_idx = uint32_t(st.chunks.size());
@@ -993,6 +1605,7 @@ void DirectPlan::add_mme_pair(const MmeTemplate& tmpl,
             set(0x20, uint32_t(b)); set(0x24, uint32_t(b >> 32));
             set(0x14c, uint32_t(mmDCORE2_SYNC_MNGR_OBJS_BASE + sob_idx * 4));
             push_regs_bulk(st.cur[eng], 0xb008, w.data(), 182, false);
+            st.last[eng].clear();  // not tracked here: the next add_mme of this chunk writes its descriptor whole
             auto rec_mme = [&](int tag, uint32_t reg_lo) {
                 if (tag < 0) return;
                 const int64_t lo = find_reg_payload(st.cur[eng], scan_from, reg_lo);
@@ -1026,7 +1639,7 @@ void DirectPlan::add_tpc_grid(uint64_t isa, std::span<const DirectTpcTensor> ten
     const uint32_t total_work = grid_sizes[split_dim];
     const uint32_t active_tpcs = std::min(tpcs, total_work);
     const uint32_t done_sob = p.rt.impl().chain_enabled ? p.rt.impl().chain_sob : p.rt.host_sob();
-    const uint32_t sob_idx = sig_sob < 0 ? done_sob : (p.rt.sob_base() + uint32_t(sig_sob));
+    const uint32_t sob_idx = sig_sob < 0 ? done_sob : (p.rt.sob_base() + p.sob_off + uint32_t(sig_sob));
     if (sig_sob < 0) p.host_credits += active_tpcs;
     else p.max_sob_used = std::max(p.max_sob_used, uint32_t(sig_sob) + 1);
     if (wait_sob >= 0) p.max_sob_used = std::max(p.max_sob_used, uint32_t(wait_sob) + 1);
@@ -1036,6 +1649,11 @@ void DirectPlan::add_tpc_grid(uint64_t isa, std::span<const DirectTpcTensor> ten
     st.group = SCAL_TPC_COMPUTE_GROUP;
     st.wait_sob = wait_sob;
     st.wait_target = wait_target;
+    st.dyn_wait_slot = p.next_dyn_wait;
+    p.next_dyn_wait = -1;
+    st.opt_id = p.next_opt_id;
+    st.sig_sob_rel = sig_sob;
+    st.sig_credits = active_tpcs;
     st.engine_mask = active_tpcs;
     if (wait_sob >= 0) {
         st.mon_first = p.next_tpc_mon;
@@ -1048,7 +1666,7 @@ void DirectPlan::add_tpc_grid(uint64_t isa, std::span<const DirectTpcTensor> ten
         if (i < active_tpcs) {
             const uint32_t first = total_work * i / active_tpcs;
             const uint32_t work = total_work * (i + 1) / active_tpcs - first;
-            if (wait_sob >= 0) push_fence(progs[i], 3);
+            if (wait_sob >= 0) push_fence(progs[i], p.fence_id);
             gaudi2::Gaudi2TpcDesc desc{};
             for (size_t ti = 0; ti < tensors.size(); ++ti) {
                 const auto& in = tensors[ti];
@@ -1114,7 +1732,7 @@ void DirectPlan::add_tpc_grid(uint64_t isa, std::span<const DirectTpcTensor> ten
             push_reg(progs[i], uint16_t(0xb000 + offsetof(gaudi2::block_tpc, tpc_cmd)), tpc_cmd, true);
             push_reg(progs[i], uint16_t(0xb000 + offsetof(gaudi2::block_tpc, tpc_execute)), 1, false);
         } else {
-            if (wait_sob >= 0) push_fence(progs[i], 3);
+            if (wait_sob >= 0) push_fence(progs[i], p.fence_id);
             push_reg(progs[i], uint16_t(0xb000 + offsetof(gaudi2::block_tpc, tpc_cmd)), tpc_cmd, true);
         }
         push_finish(progs[i], true);
@@ -1186,9 +1804,12 @@ void DirectPlan::prepare() {
     auto& s = p.rt.impl();
     const uint32_t max_sobs = s.chain_enabled ? (s.sob_count - 1u) : s.sob_count;
     const uint32_t max_mons = s.chain_enabled ? (s.mon_count - 4u) : s.mon_count;
-    if (p.max_sob_used > max_sobs)
-        throw std::runtime_error("direct_mme: plan exceeds private SOB pool (" + std::to_string(p.max_sob_used) + ")");
-    if (p.next_mme_mon > DirectPlan::Impl::kMmeMonLimit || p.next_tpc_mon > max_mons)
+    if (p.sob_off + p.max_sob_used > max_sobs)
+        throw std::runtime_error("direct_mme: plan exceeds private SOB pool (" + std::to_string(p.sob_off + p.max_sob_used) +
+                                 " of " + std::to_string(max_sobs) + ")");
+    if (p.lane && p.max_sob_used > 64)
+        throw std::runtime_error("direct_mme: plan exceeds its lane's SOBs (" + std::to_string(p.max_sob_used) + ")");
+    if (p.next_mme_mon > p.mme_mon_end || p.next_tpc_mon > (p.tpc_mon_end ? std::min(p.tpc_mon_end, max_mons) : max_mons))
         throw std::runtime_error("direct_mme: plan exceeds private monitor pool (mme=" +
                                  std::to_string(p.next_mme_mon) + ", tpc=" + std::to_string(p.next_tpc_mon) + ")");
     if (p.host_credits == 0)
@@ -1213,8 +1834,18 @@ void DirectPlan::prepare() {
     if (rc_h || rc_d) {
         throw std::runtime_error("direct_mme: plan alloc failed (rc_host=" + std::to_string(rc_h) +
                                  ", rc_hbm=" + std::to_string(rc_d) + ", ecbs=" + std::to_string(num_ecbs) +
-                                 ", bytes=" + std::to_string(total_code) + ")");
+                                 ", bytes=" + std::to_string(total_code) + "; " + std::to_string(s.pool_use->plans) + " plans hold " +
+                                 std::to_string(s.pool_use->code >> 20) + " MiB of code)");
     }
+    p.code_bytes = total_code;
+    p.meta_bytes = num_ecbs * 512ull;
+    p.pool_use = s.pool_use;
+    s.pool_use->code += total_code;
+    s.pool_use->meta += p.meta_bytes;
+    ++s.pool_use->plans;
+    if (static const bool dbg = std::getenv("G2E_DIRECT_POOL") != nullptr; dbg)
+        std::fprintf(stderr, "[direct] plan %u: %zu ECBs, %zu KiB code; pools: %llu MiB code, %llu MiB meta\n", s.pool_use->plans, num_ecbs,
+                     total_code >> 10, (unsigned long long)(s.pool_use->code >> 20), (unsigned long long)(s.pool_use->meta >> 20));
     scal_buffer_info_t mi{}, ci{};
     if (scal_buffer_get_info(p.plan_meta, &mi) || scal_buffer_get_info(p.plan_code, &ci) ||
         !mi.host_address || !mi.core_address || (mi.core_address % 256) != 0)
@@ -1261,7 +1892,7 @@ void DirectPlan::prepare() {
     };
     for (const auto& st : p.stages) {
         if (st.wait_sob < 0) continue;
-        const uint32_t sob = s.sob_base + uint32_t(st.wait_sob);
+        const uint32_t sob = s.sob_base + p.sob_off + uint32_t(st.wait_sob);
         if (st.group == SCAL_MME_COMPUTE_GROUP) {
             uint32_t m = s.mon_base + st.mon_first;
             auto cfg_one = [&](uint64_t dst) {
@@ -1281,15 +1912,15 @@ void DirectPlan::prepare() {
                 }
                 ++m;
             };
-            if (st.engine_mask & 1u) cfg_one(kMme0FenceAddr);
-            if (st.engine_mask & 2u) cfg_one(kMme2FenceAddr);
+            if (st.engine_mask & 1u) cfg_one(fence_reg(kMme0FenceAddr, st.fence_id));
+            if (st.engine_mask & 2u) cfg_one(fence_reg(kMme2FenceAddr, st.fence_id));
         } else {
             for (uint32_t i = 0; i < 24; i += 4) {
                 if (batch_lbws > 2500) flush_cfg();
                 const uint32_t cnt = 4u;
                 for (uint32_t j = 0; j < cnt; ++j) {
                     const uint32_t m = s.mon_base + st.mon_first + i + j, sl = m % 2048;
-                    const uint64_t dst = tpc_fence_addr(i + j);
+                    const uint64_t dst = tpc_fence_addr(i + j, p.fence_id);
                     const uint8_t wr = j ? 0 : uint8_t(cnt - 1);
                     const uint64_t key = dst ^ (uint64_t((sob / 8) >> 8) << 1) ^ 1ull;
                     if (s.mon_cfg[sl] == key && s.mon_wr[sl] == wr) continue;
@@ -1310,31 +1941,74 @@ void DirectPlan::prepare() {
     flush_cfg();
 }
 
-static void emit_plan_stages(DirectRuntime::Impl& s, const DirectPlan::Impl& p) {
+static void emit_sob_resets(DirectRuntime::Impl& s, const DirectPlan::Impl& p) {
     const uint64_t base = mmDCORE2_SYNC_MNGR_OBJS_BASE;
-    for (uint32_t i = 0; i < p.max_sob_used; ++i) s.lbw(base + (s.sob_base + i) * 4, 0);
+    for (uint32_t i = 0; i < p.max_sob_used; ++i) s.lbw(base + (s.sob_base + p.sob_off + i) * 4, 0);
+}
+
+static uint32_t compute_skip_sig(const DirectPlan::Impl& p, std::array<uint32_t, 64>& skip_sig) {
+    skip_sig.fill(0);
+    uint32_t skip_host = 0;
+    if (p.opt_mask == ~uint64_t(0)) return 0;
     for (const auto& st : p.stages) {
-        if (st.wait_sob >= 0) {
-            const uint32_t sob = s.sob_base + uint32_t(st.wait_sob);
-            if (st.group == SCAL_MME_COMPUTE_GROUP) {
-                uint32_t m = s.mon_base + st.mon_first;
-                if (st.engine_mask & 1u) s.arm_monitor(m++, sob, st.wait_target, kMme0FenceAddr);
-                if (st.engine_mask & 2u) s.arm_monitor(m++, sob, st.wait_target, kMme2FenceAddr);
-            } else {
-                for (uint32_t i = 0; i < 24; i += 4) {
-                    uint64_t dsts[4];
-                    for (uint32_t j = 0; j < 4; ++j) dsts[j] = tpc_fence_addr(i + j);
-                    s.arm_monitor_multi(s.mon_base + st.mon_first + i, 4, sob, st.wait_target, dsts);
-                }
+        if (st.opt_id < 0 || ((p.opt_mask >> st.opt_id) & 1ull)) continue;
+        if (st.sig_sob_rel < 0) skip_host += st.sig_credits;
+        else if (st.sig_sob_rel < 64) skip_sig[size_t(st.sig_sob_rel)] += st.sig_credits;
+    }
+    return skip_host;
+}
+
+static void emit_stage(DirectRuntime::Impl& s, const DirectPlan::Impl& p, const DirectPlan::Impl::Stage& st,
+                       const std::array<uint32_t, 64>& skip_sig) {
+    if (st.dyn_set != nullptr) {
+        const auto& ds = st.dyn_set->impl().stages[st.dyn_stage_idx];
+        if (!ds.active) return;
+        if (ds.has_wait && st.wait_sob >= 0) {
+            const uint32_t sob = s.sob_base + p.sob_off + uint32_t(st.wait_sob);
+            uint32_t m = s.mon_base + st.mon_first;
+            s.arm_monitor(m++, sob, ds.wait_target, fence_reg(kMme0FenceAddr, p.fence_id));
+            s.arm_monitor(m++, sob, ds.wait_target, fence_reg(kMme2FenceAddr, p.fence_id));
+        }
+        for (const auto& ecb : ds.ecbs) s.queue_ecb(ecb);
+        return;
+    }
+    if (st.opt_id >= 0 && !((p.opt_mask >> st.opt_id) & 1ull)) return;
+    if (st.wait_sob >= 0) {
+        const uint32_t sob = s.sob_base + p.sob_off + uint32_t(st.wait_sob);
+        const uint32_t target = (st.dyn_wait_slot >= 0)
+                                    ? p.dyn_wait_targets[size_t(st.dyn_wait_slot)]
+                                    : (st.wait_target - (st.wait_sob < 64 ? skip_sig[size_t(st.wait_sob)] : 0u));
+        if (st.group == SCAL_MME_COMPUTE_GROUP) {
+            uint32_t m = s.mon_base + st.mon_first;
+            if (st.engine_mask & 1u) s.arm_monitor(m++, sob, target, fence_reg(kMme0FenceAddr, st.fence_id));
+            if (st.engine_mask & 2u) s.arm_monitor(m++, sob, target, fence_reg(kMme2FenceAddr, st.fence_id));
+        } else {
+            for (uint32_t i = 0; i < 24; i += 4) {
+                uint64_t dsts[4];
+                for (uint32_t j = 0; j < 4; ++j) dsts[j] = tpc_fence_addr(i + j, p.fence_id);
+                s.arm_monitor_multi(s.mon_base + st.mon_first + i, 4, sob, target, dsts);
             }
         }
-        for (const auto& ecb : st.ecbs) s.queue_ecb(ecb);
     }
+    for (const auto& ecb : st.ecbs) s.queue_ecb(ecb);
+}
+
+static void emit_plan_stages(DirectRuntime::Impl& s, const DirectPlan::Impl& p, const std::array<uint32_t, 64>& skip_sig) {
+    emit_sob_resets(s, p);
+    for (const auto& st : p.stages) emit_stage(s, p, st, skip_sig);
 }
 
 static uint32_t est_plan_cmd_bytes(const DirectPlan::Impl& p) {
     uint32_t bytes = (p.max_sob_used + 2u) * 16u + 128u;
     for (const auto& st : p.stages) {
+        if (st.dyn_set != nullptr) {
+            const auto& ds = st.dyn_set->impl().stages[st.dyn_stage_idx];
+            if (!ds.active) continue;
+            if (ds.has_wait && st.wait_sob >= 0) bytes += 48u;
+            bytes += uint32_t(ds.ecbs.size()) * 64u;
+            continue;
+        }
+        if (st.opt_id >= 0 && !((p.opt_mask >> st.opt_id) & 1ull)) continue;
         if (st.wait_sob >= 0) bytes += (st.group == SCAL_MME_COMPUTE_GROUP ? 48u : 128u);
         bytes += uint32_t(st.ecbs.size()) * 64u;
     }
@@ -1349,16 +2023,18 @@ double DirectPlan::run() {
         DirectPlan* self = this;
         p.rt.flush_patches(std::span<DirectPlan* const>(&self, 1));
     }
+    std::array<uint32_t, 64> skip_sig;
+    const uint32_t eff_host = p.host_credits - compute_skip_sig(p, skip_sig);
     const uint64_t base = mmDCORE2_SYNC_MNGR_OBJS_BASE;
     s.begin();
     if (s.chain_enabled) {
         s.lbw(base + s.chain_sob * 4, 0);
-        s.arm_only(s.chain_mon_host, s.chain_sob, p.host_credits);
+        s.arm_only(s.chain_mon_host, s.chain_sob, eff_host);
     }
-    emit_plan_stages(s, p);
+    emit_plan_stages(s, p, skip_sig);
     const double t0 = now_us();
     s.submit();
-    s.wait_fence(s.chain_enabled ? 1u : p.host_credits);
+    s.wait_fence(s.chain_enabled ? 1u : eff_host);
     return now_us() - t0;
 }
 
@@ -1402,10 +2078,12 @@ double DirectRuntime::run_chain(std::span<DirectPlan* const> plans) {
         const uint32_t need_next = is_final ? 0u : est_plan_cmd_bytes(active[i + 1]->impl());
         const bool is_chunk_end = !is_final && (cur_chunk + need_this + need_next > kChunkBudget);
 
+        std::array<uint32_t, 64> skip_sig;
+        const uint32_t eff_host = p.host_credits - compute_skip_sig(p, skip_sig);
         s.lbw(base + s.chain_sob * 4, 0);
         const uint32_t cmon = is_final ? s.chain_mon_host : (is_chunk_end ? s.chain_mon_both : s.chain_mon_fence);
-        s.arm_only(cmon, s.chain_sob, p.host_credits);
-        emit_plan_stages(s, p);
+        s.arm_only(cmon, s.chain_sob, eff_host);
+        emit_plan_stages(s, p, skip_sig);
         if (!is_final) s.fence_wait(Impl::kChainFenceId, 1);
 
         if (is_final || is_chunk_end) {
@@ -1452,10 +2130,12 @@ uint32_t DirectRuntime::submit_chain(std::span<DirectPlan* const> plans) {
         const uint32_t need_next = is_final ? 0u : est_plan_cmd_bytes(active[i + 1]->impl());
         const bool is_chunk_end = !is_final && (cur_chunk + need_this + need_next > kChunkBudget);
 
+        std::array<uint32_t, 64> skip_sig;
+        const uint32_t eff_host = p.host_credits - compute_skip_sig(p, skip_sig);
         s.lbw(base + s.chain_sob * 4, 0);
         const uint32_t cmon = is_final ? s.chain_mon_host : (is_chunk_end ? s.chain_mon_both : s.chain_mon_fence);
-        s.arm_only(cmon, s.chain_sob, p.host_credits);
-        emit_plan_stages(s, p);
+        s.arm_only(cmon, s.chain_sob, eff_host);
+        emit_plan_stages(s, p, skip_sig);
         if (!is_final) s.fence_wait(Impl::kChainFenceId, 1);
 
         if (is_final || is_chunk_end) {
@@ -1476,6 +2156,93 @@ uint32_t DirectRuntime::submit_chain(std::span<DirectPlan* const> plans) {
 
 void DirectRuntime::wait_chain(uint32_t in_flight) {
     if (in_flight > 0) impl_->wait_fence(in_flight);
+}
+
+// Steps of one or two plans back-to-back on the device. A step's two plans (lanes 1 and 2) run concurrently: their
+// stages are dispatched interleaved in the given order (each engine executes its stages in dispatch order, so the
+// order decides which plan an engine serves first), and the next step starts when both have finished.
+double DirectRuntime::run_waves(std::span<const DirectWave> steps) {
+    auto& s = *impl_;
+    if (steps.empty()) return 0.0;
+    if (!s.chain_enabled) throw std::runtime_error("direct_mme: run_waves needs the on-device chaining");
+    std::vector<DirectPlan*> all;
+    for (const auto& w : steps)
+        for (DirectPlan* pl : {w.a, w.b})
+            if (pl) {
+                if (!pl->impl().prepared) pl->prepare();
+                all.push_back(pl);
+            }
+    for (const auto& w : steps) {
+        if (!w.a) throw std::invalid_argument("direct_mme: a wave step needs its first plan");
+        if (w.b && (w.a->impl().lane == 0 || w.b->impl().lane == 0 || w.a->impl().lane == w.b->impl().lane))
+            throw std::invalid_argument("direct_mme: the two plans of a wave step need different lanes");
+    }
+    bool any_dirty = false;
+    for (DirectPlan* pl : all) any_dirty |= pl->impl().any_dirty;
+    if (any_dirty) flush_patches(all);
+
+    auto need = [&](const DirectWave& w) { return est_plan_cmd_bytes(w.a->impl()) + (w.b ? est_plan_cmd_bytes(w.b->impl()) : 0u) + 128u; };
+    constexpr uint32_t kChunkBudget = 20480u;
+    const uint64_t base = mmDCORE2_SYNC_MNGR_OBJS_BASE;
+    const double t0 = now_us();
+    std::vector<uint32_t> flight;  // bytes of the submitted chunks not yet known to be complete (oldest first)
+    uint32_t flight_bytes = 0;
+    s.begin();
+    uint32_t chunk_start_pi = s.pi;
+    for (size_t i = 0; i < steps.size(); ++i) {
+        const auto& w = steps[i];
+        const bool is_final = i + 1 == steps.size();
+        const uint32_t cur_chunk = s.pi - chunk_start_pi;
+        const uint32_t need_this = need(w), need_next = is_final ? 0u : need(steps[i + 1]);
+        // the ring keeps the commands of the chunks still in flight: wait for the oldest when this step may not fit
+        while (!flight.empty() && flight_bytes + cur_chunk + need_this + need_this / 4 + 2048 > kOwnRing - 2048) {
+            s.wait_fence(1);
+            flight_bytes -= flight.front();
+            flight.erase(flight.begin());
+        }
+        const bool is_chunk_end = !is_final && (cur_chunk + need_this + need_next > kChunkBudget);
+        const auto& pa = w.a->impl();
+        std::array<uint32_t, 64> skip_a, skip_b;
+        const uint32_t cred_a = pa.host_credits - compute_skip_sig(pa, skip_a);
+        const uint32_t cred_b = w.b ? (w.b->impl().host_credits - compute_skip_sig(w.b->impl(), skip_b)) : 0u;
+        const uint32_t credits = cred_a + cred_b;
+        s.lbw(base + s.chain_sob * 4, 0);
+        const uint32_t cmon = is_final ? s.chain_mon_host : (is_chunk_end ? s.chain_mon_both : s.chain_mon_fence);
+        s.arm_only(cmon, s.chain_sob, credits);
+        if (!w.b) {
+            emit_plan_stages(s, pa, skip_a);
+        } else {
+            const auto& pb = w.b->impl();
+            emit_sob_resets(s, pa);
+            emit_sob_resets(s, pb);
+            // the given order (bit 15: plan b; low bits: stage index), then whatever it left out, in plan order
+            std::vector<uint8_t> seen_a(pa.stages.size(), 0), seen_b(pb.stages.size(), 0);
+            for (uint16_t o : w.order) {
+                const size_t k = o & 0x7fffu;
+                if (!(o & 0x8000u) && k < pa.stages.size() && !seen_a[k]) { emit_stage(s, pa, pa.stages[k], skip_a); seen_a[k] = 1; }
+                else if ((o & 0x8000u) && k < pb.stages.size() && !seen_b[k]) { emit_stage(s, pb, pb.stages[k], skip_b); seen_b[k] = 1; }
+            }
+            for (size_t k = 0; k < pa.stages.size(); ++k)
+                if (!seen_a[k]) emit_stage(s, pa, pa.stages[k], skip_a);
+            for (size_t k = 0; k < pb.stages.size(); ++k)
+                if (!seen_b[k]) emit_stage(s, pb, pb.stages[k], skip_b);
+        }
+        if (!is_final) s.fence_wait(Impl::kChainFenceId, 1);
+        if (is_final || is_chunk_end) {
+            s.submit();
+            flight.push_back(s.pi - chunk_start_pi);
+            flight_bytes += flight.back();
+            s.begin();
+            chunk_start_pi = s.pi;
+            if (!is_final && flight.size() >= 2) {
+                s.wait_fence(1);
+                flight_bytes -= flight.front();
+                flight.erase(flight.begin());
+            }
+        }
+    }
+    if (!flight.empty()) s.wait_fence(flight.size());
+    return now_us() - t0;
 }
 
 void DirectRuntime::flush_patches(std::span<DirectPlan* const> plans) {
@@ -1539,9 +2306,72 @@ void DirectRuntime::wait_patches() {
     check(synStreamSynchronize(impl_->patch_stream), "direct_mme batch patch sync");
 }
 
+// Synchronous flush: over the patch stream (Synapse), or with Options::pdma_patches as PDMA commands of the
+// compute scheduler on the runtime's own stream (no Synapse stream synchronisation in the caller's hot path).
 void DirectRuntime::flush_patches_and_upload(std::span<DirectPlan* const> plans, uint64_t dst_addr, const void* src, size_t bytes) {
-    flush_patches_and_upload_async(plans, dst_addr, src, bytes);
-    wait_patches();
+    auto& s = *impl_;
+    if (!s.opt.pdma_patches) {
+        flush_patches_and_upload_async(plans, dst_addr, src, bytes);
+        wait_patches();
+        return;
+    }
+    size_t total = bytes;
+    for (DirectPlan* pl : plans) {
+        if (!pl) continue;
+        auto& p = pl->impl();
+        if (!p.any_dirty) continue;
+        for (PreparedEcb* ecb : p.dirty_ecbs) total += ecb->shadow.size();
+    }
+    if (!total) {
+        for (DirectPlan* pl : plans) {
+            if (!pl) continue;
+            pl->impl().dirty_ecbs.clear();
+            pl->impl().any_dirty = false;
+        }
+        return;
+    }
+    s.ensure_pdma_buf(total);
+    std::vector<sched_arc_pdma_commands_params_t> xfers;
+    xfers.reserve(64);
+    size_t off = 0;
+    if (bytes && src) {
+        std::memcpy(static_cast<char*>(s.pdma_host), src, bytes);
+        xfers.push_back({uint32_t(bytes), s.pdma_dev, dst_addr});
+        off += bytes;
+    }
+    for (DirectPlan* pl : plans) {
+        if (!pl) continue;
+        auto& p = pl->impl();
+        if (!p.any_dirty) continue;
+        std::sort(p.dirty_ecbs.begin(), p.dirty_ecbs.end(),
+                  [](const PreparedEcb* a, const PreparedEcb* b) { return a->code_dev_addr < b->code_dev_addr; });
+        size_t i = 0;
+        while (i < p.dirty_ecbs.size()) {
+            const uint64_t dst0 = p.dirty_ecbs[i]->code_dev_addr;
+            const size_t src_off0 = off;
+            uint64_t run_bytes = 0;
+            while (i < p.dirty_ecbs.size() && p.dirty_ecbs[i]->code_dev_addr == dst0 + run_bytes) {
+                PreparedEcb* ecb = p.dirty_ecbs[i++];
+                std::memcpy(static_cast<char*>(s.pdma_host) + off, ecb->shadow.data(), ecb->shadow.size());
+                off += ecb->shadow.size();
+                run_bytes += ecb->shadow.size();
+                ecb->dirty = false;
+            }
+            xfers.push_back({uint32_t(run_bytes), s.pdma_dev + src_off0, dst0});
+        }
+        p.dirty_ecbs.clear();
+        p.any_dirty = false;
+    }
+    if (xfers.empty()) return;
+    s.begin();
+    uint32_t ncmds = 0;
+    for (size_t i = 0; i < xfers.size(); i += 2) {
+        const uint32_t cnt = (i + 2 <= xfers.size()) ? 2u : 1u;
+        s.emit_pdma_batch(SCAL_PDMA_TX_DATA_GROUP, PDMA_DIR_HOST2DEV, &xfers[i], cnt, s.host_sob);
+        ++ncmds;
+    }
+    s.submit();
+    s.wait_fence(ncmds, 500000);
 }
 
 }  // namespace g2e

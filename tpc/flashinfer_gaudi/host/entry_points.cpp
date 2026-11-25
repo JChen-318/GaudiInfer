@@ -11,6 +11,7 @@
 #include "silu_and_mul_bf16_gaudi2.hpp"
 #include "silu_mul_quant_bf16_gaudi2.hpp"
 #include "spec_conv_bf16_gaudi2.hpp"
+#include "inkling_gaudi2.hpp"
 
 namespace {
 template <class K>
@@ -72,6 +73,21 @@ constexpr Entry kKernels[] = {
     {&static_name<SiluMulQuantBf16Gaudi2>, &glue<SiluMulQuantBf16Gaudi2>},
     {&static_name<SiluMulQuantDqBf16Gaudi2>, &glue<SiluMulQuantDqBf16Gaudi2>},
     {&static_name<SpecConvBf16Gaudi2>, &glue<SpecConvBf16Gaudi2>},
+    {&static_name<InkConvBf16Gaudi2>, &glue<InkConvBf16Gaudi2>},
+    {&static_name<InkConvDynBf16Gaudi2>, &glue<InkConvDynBf16Gaudi2>},
+    {&static_name<InkQprepBf16Gaudi2>, &glue<InkQprepBf16Gaudi2>},
+    {&static_name<InkQprepTauBf16Gaudi2>, &glue<InkQprepTauBf16Gaudi2>},
+    {&static_name<InkKvCommitBf16Gaudi2>, &glue<InkKvCommitBf16Gaudi2>},
+    {&static_name<InkMixGaudi2>, &glue<InkMixGaudi2>},
+    {&static_name<InkMixF32pGaudi2>, &glue<InkMixF32pGaudi2>},
+    {&static_name<InkRouteGaudi2>, &glue<InkRouteGaudi2>},
+    {&static_name<InkMgGaudi2>, &glue<InkMgGaudi2>},
+    {&static_name<InkMgOutGaudi2>, &glue<InkMgOutGaudi2>},
+    {&static_name<InkMgOutLutGaudi2>, &glue<InkMgOutLutGaudi2>},
+    {&static_name<InkAttnSm16Gaudi2>, &glue<InkAttnSm16Gaudi2>},
+    {&static_name<InkAttnSm16fGaudi2>, &glue<InkAttnSm16fGaudi2>},
+    {&static_name<InkNvf4DeqBf16Gaudi2>, &glue<InkNvf4DeqBf16Gaudi2>},
+    {&static_name<InkMxfp8DeqBf16Gaudi2>, &glue<InkMxfp8DeqBf16Gaudi2>},
 };
 constexpr uint32_t kCount = sizeof(kKernels) / sizeof(kKernels[0]);
 }  // namespace
